@@ -13,29 +13,29 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true }, // 允许跨域 (Vue 开发必需)
+	CheckOrigin: func(r *http.Request) bool { return true }, // 允许跨域
 }
 
 func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// 1. 升级连接
+	// 升级连接
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("Upgrade Error:", err)
 		return
 	}
 
-	// 2. 获取房间 ID
+	// 获取房间 ID
 	roomID := r.URL.Query().Get("room")
 	if roomID == "" {
 		roomID = "public_lobby"
 	}
 	room := store.GetOrCreateRoom(roomID)
 
-	// 3. 注册并确保退出时清理
+	// 注册并确保退出时清理
 	store.AddClient(room, conn)
 	defer store.RemoveClient(room, conn)
 
-	// 4. 发送初始化数据 (Sync State)
+	// 发送初始化数据
 	initialPayload := map[string]interface{}{
 		"notes":    room.Notes,
 		"history":  room.History,
@@ -45,7 +45,7 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("User joined room [%s]", roomID)
 
-	// 5. 消息循环 (Read Loop)
+	// 消息循环
 	for {
 		var msg models.Message
 		err := conn.ReadJSON(&msg)

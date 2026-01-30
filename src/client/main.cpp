@@ -1,45 +1,18 @@
 #include <QApplication>
-#include <QSystemTrayIcon>
-#include <QMenu>
-#include <QAction>
-#include <QMessageBox>
-#include <QStyle>  // <--- 关键！之前漏了这一行
+#include <QDebug>
 
-int main(int argc, char *argv[])
-{
-    // init
-    QApplication app(argc, argv);
+#include "network/SignalingClient.h"
 
-    if (!QSystemTrayIcon::isSystemTrayAvailable()) {
-        QMessageBox::critical(nullptr, "QuicLink", "System tray is not available on this system.");
-        return 1;
-    }
+int main(int argc, char* argv[]) {
+  QApplication app(argc, argv);
 
-    QApplication::setQuitOnLastWindowClosed(false);
+  qDebug() << "🚀 QuicLink Client Starting...";
 
-    QSystemTrayIcon trayIcon;
+  SignalingClient client;
 
-    trayIcon.setIcon(app.style()->standardIcon(QStyle::SP_ComputerIcon)); 
-    trayIcon.setToolTip("QuicLink - Running");
+  QString serverUrl = "ws://yourip/ws?room=test_room";
 
-    QMenu *menu = new QMenu();
-    
-    QAction *actionConnect = new QAction("Connect to VPS", menu);
-    QObject::connect(actionConnect, &QAction::triggered, [](){
-        QMessageBox::information(nullptr, "QuicLink", "Connecting logic goes here...");
-    });
-    
-    QAction *actionQuit = new QAction("Quit", menu);
-    QObject::connect(actionQuit, &QAction::triggered, &app, &QApplication::quit);
+  client.connectToServer(serverUrl);
 
-    menu->addAction(actionConnect);
-    menu->addSeparator();
-    menu->addAction(actionQuit);
-
-    trayIcon.setContextMenu(menu);
-    trayIcon.show();
-
-    trayIcon.showMessage("QuicLink", "Client started successfully!", QSystemTrayIcon::Information, 3000);
-
-    return app.exec();
+  return app.exec();
 }

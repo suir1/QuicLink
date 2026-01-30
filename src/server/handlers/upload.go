@@ -13,10 +13,10 @@ import (
 const UploadDir = "./uploads"
 
 func HandleUpload(w http.ResponseWriter, r *http.Request) {
-	// 1. 限制上传大小 200MB
+	// 限制上传大小 200MB
 	r.ParseMultipartForm(200 << 20)
 
-	// 2. 获取文件
+	// 获取文件
 	file, handler, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "Invalid file", http.StatusBadRequest)
@@ -24,15 +24,15 @@ func HandleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// 3. 准备目录
+	// 准备目录
 	os.MkdirAll(UploadDir, os.ModePerm)
 
-	// 4. 生成唯一文件名 (时间戳_原名)
+	// 生成唯一文件名 (时间戳_原名)
 	filename := filepath.Base(handler.Filename)
 	safeName := fmt.Sprintf("%d_%s", time.Now().Unix(), filename)
 	dstPath := filepath.Join(UploadDir, safeName)
 
-	// 5. 写入磁盘
+	// 写入磁盘
 	dst, err := os.Create(dstPath)
 	if err != nil {
 		http.Error(w, "Save failed", http.StatusInternalServerError)
@@ -41,7 +41,7 @@ func HandleUpload(w http.ResponseWriter, r *http.Request) {
 	defer dst.Close()
 	io.Copy(dst, file)
 
-	// 6. 返回 JSON
+	// 返回 JSON
 	w.Header().Set("Content-Type", "application/json")
 	// 允许跨域
 	w.Header().Set("Access-Control-Allow-Origin", "*")
