@@ -1,0 +1,9 @@
+{
+    "app_mode": "public",
+    "admin_password": "",
+    "limits": {
+        "max_upload_size_mb": 10,
+        "file_retention_minutes": 10,
+        "allow_p2p_relay": false
+    }
+}

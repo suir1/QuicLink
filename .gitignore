@@ -46,3 +46,5 @@ ui_*
 .DS_Store
 
 build/
+
+config.json

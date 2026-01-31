@@ -1,8 +1,8 @@
 #include <QApplication>
 #include <QDebug>
+#include <QObject>
 
 #include "network/SignalingClient.h"
-
 int main(int argc, char* argv[]) {
   QApplication app(argc, argv);
 

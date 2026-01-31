@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"quiclink-server/config"
 	"quiclink-server/models"
 	"quiclink-server/store"
 
@@ -17,6 +18,13 @@ var upgrader = websocket.Upgrader{
 }
 
 func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	if config.Current.AppMode == "private" {
+		token := r.URL.Query().Get("token")
+		if token != config.Current.AdminPassword {
+			http.Error(w, "🔒 Forbidden: This is a private server.", http.StatusForbidden)
+			return
+		}
+	}
 	// 升级连接
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
