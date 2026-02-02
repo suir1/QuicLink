@@ -2,76 +2,180 @@ package store
 
 import (
 	"log"
-	"quiclink-server/models"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+// Room 结构体：定义一个房间的所有状态
+type Room struct {
+	ID             string
+	Password       string
+
+	// 房间内的所有客户端连接 (用于广播)
+	Clients        map[*websocket.Conn]bool
+
+	// 特殊标记：谁是 Host (C++ 客户端)
+	Host           *websocket.Conn
+	HostInfo       interface{} // 存 Host 的 IP、端口等 JSON 信息
+
+	// --- 新增：记事本功能 ---
+	Notes          map[string]*Note // 存储多标签记事本 (ID -> Note)
+	LastUpdate     time.Time        // 最后活动时间 (可用于后续清理非活跃房间)
+
+	// 读写锁：保证并发安全
+	mutex          sync.RWMutex
+}
+
+// Note 记事本单页结构
+type Note struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Content   string `json:"content"`
+	UpdatedAt int64  `json:"updatedAt"`
+}
+
 // 全局房间管理器
 var (
-	Rooms     = make(map[string]*models.RoomData)
-	RoomMutex sync.RWMutex // 读写锁
+	Rooms       = make(map[string]*Room)
+	ManagerLock sync.RWMutex
 )
 
-// 获取或创建房间
-func GetOrCreateRoom(roomId string) *models.RoomData {
-	RoomMutex.Lock()
-	defer RoomMutex.Unlock()
+// GetOrCreateRoom 获取现有房间或创建新房间
+func GetOrCreateRoom(roomId string) *Room {
+	ManagerLock.Lock()
+	defer ManagerLock.Unlock()
 
-	// 1. 如果存在，直接返回
+	// 如果房间存在，直接返回
 	if room, exists := Rooms[roomId]; exists {
 		return room
 	}
 
-	// 2. 不存在，初始化新房间
-	newRoom := &models.RoomData{
-		ID:      roomId,
-		Notes:   make([]models.Note, 0),
-		History: make([]models.ClipboardItem, 0),
-		Clients: make(map[*websocket.Conn]bool),
+	// 如果不存在，创建新房间
+	newRoom := &Room{
+		ID:         roomId,
+		Clients:    make(map[*websocket.Conn]bool),
+		Notes:      make(map[string]*Note),
+		LastUpdate: time.Now(),
 	}
 
-	// 预置一个默认便签
-	newRoom.Notes = append(newRoom.Notes, models.Note{
-		ID: "default", Title: "Quick Note", Content: "",
-	})
+	// 初始化一个默认笔记
+	defaultNote := &Note{
+		ID:        "default",
+		Title:     "默认笔记",
+		Content:   "",
+		UpdatedAt: time.Now().Unix(),
+	}
+	newRoom.Notes[defaultNote.ID] = defaultNote
 
 	Rooms[roomId] = newRoom
-	log.Printf("✨ Room Created: %s", roomId)
+	log.Printf("🏠 New Room Created: %s", roomId)
 	return newRoom
 }
 
-// 注册客户端到房间
-func AddClient(room *models.RoomData, conn *websocket.Conn) {
-	RoomMutex.Lock() // 注意：这里简单起见用全局锁，高并发可改用 Room 级锁
-	defer RoomMutex.Unlock()
-	room.Clients[conn] = true
+// GetRoom 仅获取，不创建 (用于 API 查询等)
+func GetRoom(roomId string) *Room {
+	ManagerLock.RLock()
+	defer ManagerLock.RUnlock()
+	return Rooms[roomId]
 }
 
-// 从房间移除客户端
-func RemoveClient(room *models.RoomData, conn *websocket.Conn) {
-	RoomMutex.Lock()
-	defer RoomMutex.Unlock()
-	if _, ok := room.Clients[conn]; ok {
-		delete(room.Clients, conn)
-		conn.Close()
+// Join 客户端加入房间
+func (r *Room) Join(conn *websocket.Conn) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	r.Clients[conn] = true
+	r.LastUpdate = time.Now()
+	log.Printf("➕ Client joined room [%s]. Total: %d", r.ID, len(r.Clients))
+}
+
+// Leave 客户端离开房间
+func (r *Room) Leave(conn *websocket.Conn) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	if _, ok := r.Clients[conn]; ok {
+		delete(r.Clients, conn)
+		conn.Close() // 确保连接关闭
+
+		// 如果离开的是 Host，清除 Host 标记
+		if r.Host == conn {
+			log.Printf("⚠️ Host left room [%s]", r.ID)
+			r.Host = nil
+			r.HostInfo = nil
+			// 这里可以选择广播 "host_offline" 消息
+		}
 	}
+	log.Printf("➖ Client left room [%s]. Total: %d", r.ID, len(r.Clients))
 }
 
-// 广播消息给房间内所有人
-func Broadcast(room *models.RoomData, msg models.Message) {
-	RoomMutex.RLock() // 读锁
-	defer RoomMutex.RUnlock()
+// SetHost 注册 C++ 客户端为 Host
+func (r *Room) SetHost(conn *websocket.Conn, info interface{}) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
 
-	for client := range room.Clients {
-		// 并发写 WS 需要注意，这里简单串行发送
+	r.Host = conn
+	r.HostInfo = info
+	r.LastUpdate = time.Now()
+	log.Printf("🖥️ Host registered in room [%s]", r.ID)
+}
+
+// UpdateNote 更新或创建笔记
+func (r *Room) UpdateNote(id, title, content string) *Note {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	note, exists := r.Notes[id]
+	if !exists {
+		note = &Note{ID: id}
+		r.Notes[id] = note
+	}
+
+	// 只更新非空字段 (前端可能只发局部更新，但这里简化为全量覆盖，需前端配合)
+	// 实际应用中，前端应该保证发送完整数据或我们在协议里细分
+	note.Title = title
+	note.Content = content
+	note.UpdatedAt = time.Now().Unix()
+
+	r.LastUpdate = time.Now()
+	return note
+}
+
+// DeleteNote 删除笔记
+func (r *Room) DeleteNote(id string) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	delete(r.Notes, id)
+	r.LastUpdate = time.Now()
+}
+
+// SetPassword 设置房间密码 (用于 Private 模式)
+func (r *Room) SetPassword(password string) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	r.Password = password
+}
+
+// Broadcast 向房间内所有客户端广播消息
+// sender: 可选参数。如果传入 sender，则不会向该 sender 发送消息 (避免回声)
+func (r *Room) Broadcast(msg interface{}, sender *websocket.Conn) {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	for client := range r.Clients {
+		// 如果指定了 sender，且当前 client 就是 sender，则跳过
+		if sender != nil && client == sender {
+			continue
+		}
+
 		err := client.WriteJSON(msg)
 		if err != nil {
-			log.Printf("Broadcast error: %v", err)
+			log.Printf("❌ Broadcast error: %v", err)
 			client.Close()
-			// 注意：遍历时删除可能会有问题，但在 Gorilla WS 中通常导致下一次循环错误
-			// 真正的移除操作会由 ReadLoop 的 defer 触发
+			// 注意：这里不能直接 delete，因为我们在遍历 map
+			// 实际生产中可以收集 error clients 并在循环外删除，或者依赖 Leave 机制
 		}
 	}
 }

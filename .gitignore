@@ -1,5 +1,6 @@
 # Prerequisites
 *.d
+go.work
 
 # Compiled Object files
 *.slo
@@ -36,15 +37,34 @@
 *.exe
 *.out
 *.app
+src/server/quic-server
 
-# debug information files
-*.dwo
-
-*.qrc
+# Qt Generated Files
+# *.qrc should NOT be ignored (source files)
+qrc_*.cpp
 moc_*
 ui_*
+.qmake.stash
+CMakeUserPresets.json
+
+# System
 .DS_Store
 
+# Build Directories
 build/
+dist/
+node_modules/
 
+# Config & Secrets (Privacy Protection)
 config.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+
+# User Data
+uploads/
+src/server/uploads/

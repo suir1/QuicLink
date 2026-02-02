@@ -11,14 +11,14 @@ import (
 )
 
 func main() {
-	// 1. 加载配置
+	// 加载配置
 	config.LoadConfig()
 
-	// 2. 静态文件
+	// 静态文件
 	http.Handle("/", http.FileServer(http.Dir("./dist")))
 	http.Handle("/files/", http.StripPrefix("/files/", http.FileServer(http.Dir(handlers.UploadDir))))
 
-	// 3. API
+	// API
 	http.HandleFunc("/ws", handlers.HandleWebSocket)
 	http.HandleFunc("/upload", handlers.HandleUpload)
 
@@ -31,7 +31,7 @@ func main() {
 		})
 	})
 
-	// 4. 启动
+	// 启动
 	port := "8080"
 	fmt.Printf("🚀 Server Running in [%s] mode on port %s\n", config.Current.AppMode, port)
 	err := http.ListenAndServe(":"+port, nil)

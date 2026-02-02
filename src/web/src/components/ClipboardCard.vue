@@ -1,0 +1,301 @@
+<script setup lang="ts">
+import { Close, Promotion, Refresh } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { nextTick, ref } from 'vue'
+import { useConnectionStore } from '../stores/connection'
+
+interface ClipboardItem {
+  id: number
+  text: string
+  time: string
+}
+
+const conn = useConnectionStore()
+const clipboardList = ref<ClipboardItem[]>([])
+const inputContent = ref('')
+const isSending = ref(false)
+const listContainer = ref<HTMLElement | null>(null)
+
+// 自动滚动到底部
+function scrollToBottom() {
+  nextTick(() => {
+    if (listContainer.value) {
+      listContainer.value.scrollTop = listContainer.value.scrollHeight
+    }
+  })
+}
+
+// 辅助：生成时间戳
+function getTime() {
+  const now = new Date()
+  return `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`
+}
+
+// 核心：添加一条记录
+function addBullet(text: string, fromRemote = false) {
+  if (!text) return
+
+  // 简单的去重：如果最新的一条跟这个一样，就不添加
+  const last = clipboardList.value[clipboardList.value.length - 1]
+  if (last && last.text === text) return
+
+  clipboardList.value.push({
+    id: Date.now() + Math.random(),
+    text: text,
+    time: getTime()
+  })
+
+  scrollToBottom()
+  if (fromRemote) {
+    if (text.startsWith('data:image')) {
+      ElMessage.success('收到图片消息')
+    } else {
+      ElMessage.success('收到文本消息')
+    }
+  }
+}
+
+// 处理粘贴事件 (支持图片)
+function handlePaste(event: ClipboardEvent) {
+  const items = event.clipboardData?.items
+  if (!items) return
+
+  for (const item of items) {
+    if (item.type.indexOf('image') !== -1) {
+      // 这是一个图片
+      event.preventDefault() // 阻止默认粘贴 (防止文件名进输入框)
+
+      const blob = item.getAsFile()
+      if (!blob) return
+
+      const reader = new FileReader()
+      reader.onload = (e) => {
+        const base64 = e.target?.result as string
+        if (base64) {
+          // 直接发送 Base64 图片
+          conn.sendMessage({
+            type: 'clipboard_push',
+            payload: { text: base64 }
+          })
+          addBullet(base64, false)
+        }
+      }
+      reader.readAsDataURL(blob)
+      return // 只处理第一张图
+    }
+  }
+}
+
+// 发送给 C++ Host
+function sendToHost() {
+  if (!inputContent.value) return
+  isSending.value = true
+
+  const text = inputContent.value
+
+  // 发送
+  conn.sendMessage({
+    type: 'clipboard_push',
+    payload: { text }
+  })
+
+  // 本地也加一条
+  addBullet(text, false)
+  inputContent.value = ''
+
+  setTimeout(() => isSending.value = false, 500)
+}
+
+// 从 Host 获取
+function fetchFromHost() {
+  conn.sendMessage({ type: 'clipboard_pull' })
+  ElMessage.info('正在请求 Host 剪切板...')
+}
+
+// 复制单个 Bullet (支持图片)
+async function copyItem(item: ClipboardItem) {
+  // 判断是否是 Base64 图片
+  const isImage = item.text.startsWith('data:image')
+
+  if (!navigator.clipboard) {
+    ElMessage.error('无法访问剪切板')
+    return
+  }
+
+  try {
+    if (isImage) {
+      // 复制图片
+      const response = await fetch(item.text)
+      const blob = await response.blob()
+
+      // ClipboardItem 构造函数需要 Blob
+      await navigator.clipboard.write([
+        new ClipboardItem({ [blob.type]: blob })
+      ])
+      ElMessage.success('已复制图片')
+    } else {
+      // 复制文本
+      await navigator.clipboard.writeText(item.text)
+      ElMessage.success('已复制文本')
+    }
+  } catch (e) {
+    console.error(e)
+    ElMessage.error('复制失败，请重试')
+  }
+}
+
+// 删除单个 Bullet
+function deleteItem(index: number) {
+  clipboardList.value.splice(index, 1)
+}
+
+// 暴露给父组件
+defineExpose({
+  updateText: (text: string) => {
+    addBullet(text, true)
+  }
+})
+</script>
+
+<template>
+  <el-card class="clipboard-card" body-style="display: flex; flex-direction: column; height: 100%;">
+    <template #header>
+      <div class="card-header">
+        <span>📋 剪切板历史 ({{ clipboardList.length }})</span>
+        <el-button :icon="Refresh" size="small" circle @click="fetchFromHost" title="从 Host 拉取" />
+      </div>
+    </template>
+
+    <!-- 列表区域: 让它占据剩余空间并滚动 -->
+    <div class="list-container" ref="listContainer">
+      <el-empty v-if="clipboardList.length === 0" description="暂无记录，尝试输入或从 Host 获取" image-size="60" />
+
+      <div
+        v-for="(item, index) in clipboardList"
+        :key="item.id"
+        class="bullet-item"
+        @click="copyItem(item)"
+      >
+        <div class="bullet-content">
+          <!-- 图片渲染 -->
+          <div v-if="item.text.startsWith('data:image')" class="bullet-image">
+            <img :src="item.text" alt="Clipboard Image" />
+          </div>
+          <!-- 文本渲染 -->
+          <div v-else class="bullet-text">{{ item.text }}</div>
+
+          <div class="bullet-meta">{{ item.time }}</div>
+        </div>
+        <div class="bullet-action" @click.stop="deleteItem(index)">
+          <el-icon><Close /></el-icon>
+        </div>
+      </div>
+    </div>
+
+    <!-- 底部输入区 -->
+    <div class="footer-input">
+      <el-input
+        v-model="inputContent"
+        placeholder="输入内容发送，或 Ctrl+V 粘贴图片..."
+        @keyup.enter="sendToHost"
+        @paste="handlePaste"
+      >
+        <template #append>
+          <el-button :loading="isSending" :icon="Promotion" @click="sendToHost" />
+        </template>
+      </el-input>
+    </div>
+  </el-card>
+</template>
+
+<style scoped>
+.clipboard-card {
+  height: 500px; /* 固定高度，或者根据父容器适配 */
+  display: flex;
+  flex-direction: column;
+}
+.card-header { display: flex; justify-content: space-between; align-items: center; }
+
+.list-container {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 5px;
+  background-color: #f9f9f9;
+  border-radius: 4px;
+  margin-bottom: 10px;
+}
+
+.bullet-item {
+  background: white;
+  border: 1px solid #e4e7ed;
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  cursor: pointer;
+  transition: all 0.2s;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.bullet-item:hover {
+  border-color: #409eff;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  transform: translateY(-1px);
+}
+
+.bullet-content {
+  flex: 1;
+  overflow: hidden;
+}
+
+.bullet-text {
+  font-size: 14px;
+  color: #333;
+  line-height: 1.4;
+  word-break: break-all;
+  white-space: pre-wrap;
+  /* 限制最大显示行数，防止太长 */
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 图片样式 */
+.bullet-image img {
+  max-width: 100%;
+  max-height: 200px;
+  border-radius: 4px;
+  border: 1px solid #eee;
+  object-fit: contain;
+  display: block;
+}
+
+.bullet-meta {
+  font-size: 11px;
+  color: #999;
+  margin-top: 4px;
+}
+
+.bullet-action {
+  margin-left: 10px;
+  color: #909399;
+  padding: 2px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.bullet-action:hover {
+  background-color: #fcebeb;
+  color: #f56c6c;
+}
+
+.footer-input {
+  border-top: 1px solid #eee;
+  padding-top: 10px;
+}
+</style>

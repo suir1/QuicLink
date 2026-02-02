@@ -1,136 +1,155 @@
 package handlers
 
 import (
-	"encoding/json"
 	"log"
 	"net/http"
-	"time"
-
-	"quiclink-server/config"
-	"quiclink-server/models"
-	"quiclink-server/store"
 
 	"github.com/gorilla/websocket"
+
+	"quiclink-server/config"
+	"quiclink-server/store"
 )
 
+// Message 定义前后端通信的标准 JSON 格式
+type Message struct {
+	Type    string      `json:"type"`
+	Payload interface{} `json:"payload,omitempty"`
+}
+
+// WebSocket 升级器配置 (允许跨域)
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true }, // 允许跨域
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
 func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// ---------------------------------------------------------
+	// 1. 安全鉴权 (Private Mode Check)
+	// ---------------------------------------------------------
 	if config.Current.AppMode == "private" {
 		token := r.URL.Query().Get("token")
+		// 如果 URL 里没带 token 或者 token 不对
 		if token != config.Current.AdminPassword {
-			http.Error(w, "🔒 Forbidden: This is a private server.", http.StatusForbidden)
+			log.Printf("🔒 Blocked unauthorized access from %s", r.RemoteAddr)
+			http.Error(w, "Forbidden: Private Mode needs valid token", http.StatusForbidden)
 			return
 		}
 	}
-	// 升级连接
+
+	// ---------------------------------------------------------
+	// 2. 协议升级 (HTTP -> WebSocket)
+	// ---------------------------------------------------------
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Upgrade Error:", err)
+		log.Println("❌ Upgrade error:", err)
 		return
 	}
 
-	// 获取房间 ID
-	roomID := r.URL.Query().Get("room")
-	if roomID == "" {
-		roomID = "public_lobby"
+	// ---------------------------------------------------------
+	// 3. 房间处理 (Room Management)
+	// ---------------------------------------------------------
+	// 获取房间ID，默认为 "public"
+	roomId := r.URL.Query().Get("room")
+	if roomId == "" {
+		roomId = "public"
 	}
-	room := store.GetOrCreateRoom(roomID)
 
-	// 注册并确保退出时清理
-	store.AddClient(room, conn)
-	defer store.RemoveClient(room, conn)
+	// 获取或创建房间对象
+	room := store.GetOrCreateRoom(roomId)
 
-	// 发送初始化数据
-	initialPayload := map[string]interface{}{
-		"notes":    room.Notes,
-		"history":  room.History,
-		"hostInfo": room.HostInfo,
+	// 加入房间
+	room.Join(conn)
+
+	// 退出时的清理工作
+	defer func() {
+		room.Leave(conn)
+	}()
+
+	// ---------------------------------------------------------
+	// 4. 发送初始化状态 (Init State)
+	// ---------------------------------------------------------
+	// 获取所有笔记列表
+	notesList := make([]*store.Note, 0, len(room.Notes))
+	for _, n := range room.Notes {
+		notesList = append(notesList, n)
 	}
-	conn.WriteJSON(map[string]interface{}{"type": models.MsgTypeInit, "payload": initialPayload})
 
-	log.Printf("User joined room [%s]", roomID)
+	initMsg := Message{
+		Type: "init",
+		Payload: map[string]interface{}{
+			"room_id":  roomId,
+			"hostInfo": room.HostInfo,
+			"notes":    notesList, // 发送笔记列表
+		},
+	}
+	conn.WriteJSON(initMsg)
 
-	// 消息循环
+	// ---------------------------------------------------------
+	// 5. 消息循环 (Message Loop)
+	// ---------------------------------------------------------
 	for {
-		var msg models.Message
+		var msg Message
 		err := conn.ReadJSON(&msg)
 		if err != nil {
-			break // 连接断开
-		}
-
-		// 业务逻辑路由
-		switch msg.Type {
-
-		// [PublicRoom] 更新便签
-		case models.MsgTypeNoteUpdate:
-			var note models.Note
-			if err := json.Unmarshal(msg.Payload, &note); err == nil {
-				updateRoomNote(room, note)
-				store.Broadcast(room, msg) // 广播给其他人
-			}
-
-		// [PublicRoom] 发送剪切板/文件 Bullet
-		case models.MsgTypeClipboardPush:
-			var item models.ClipboardItem
-			if err := json.Unmarshal(msg.Payload, &item); err == nil {
-				item.Timestamp = time.Now().Unix()
-				addClipboardItem(room, item)
-
-				// 广播带时间戳的新 Bullet
-				outBytes, _ := json.Marshal(item)
-				store.Broadcast(room, models.Message{
-					Type:    models.MsgTypeClipboardNew,
-					Payload: outBytes,
-				})
-			}
-
-		// [QuicRoom] 主机上线注册
-		case models.MsgTypeRegisterHost:
-			var hostInfo models.QuicHostInfo
-			if err := json.Unmarshal(msg.Payload, &hostInfo); err == nil {
-				updateHostInfo(room, &hostInfo)
-				log.Printf("🚀 Host Online: %s", hostInfo.IP)
-				// 广播告诉 Web 端
-				store.Broadcast(room, msg)
-			}
-		}
-	}
-}
-
-// --- 辅助函数 (操作 Store 数据) ---
-
-func updateRoomNote(room *models.RoomData, newNote models.Note) {
-	store.RoomMutex.Lock()
-	defer store.RoomMutex.Unlock()
-
-	found := false
-	for i, n := range room.Notes {
-		if n.ID == newNote.ID {
-			room.Notes[i] = newNote
-			found = true
 			break
 		}
-	}
-	if !found {
-		room.Notes = append(room.Notes, newNote)
-	}
-}
 
-func addClipboardItem(room *models.RoomData, item models.ClipboardItem) {
-	store.RoomMutex.Lock()
-	defer store.RoomMutex.Unlock()
-	room.History = append(room.History, item)
-	// 限制 50 条
-	if len(room.History) > 50 {
-		room.History = room.History[1:]
-	}
-}
+		switch msg.Type {
 
-func updateHostInfo(room *models.RoomData, info *models.QuicHostInfo) {
-	store.RoomMutex.Lock()
-	defer store.RoomMutex.Unlock()
-	room.HostInfo = info
+		// --- 角色注册 ---
+		case "register_host":
+			room.SetHost(conn, msg.Payload)
+			room.Broadcast(msg, conn)
+
+		// --- 记事本更新/创建 (Notepad Update) ---
+		case "notepad_update":
+			payload, ok := msg.Payload.(map[string]interface{})
+			if ok {
+				id, _ := payload["id"].(string)
+				title, _ := payload["title"].(string)
+				content, _ := payload["content"].(string)
+
+				if id != "" {
+					room.UpdateNote(id, title, content)
+					room.Broadcast(msg, conn)
+				}
+			}
+
+		// --- 记事本删除 (Notepad Delete) ---
+		case "notepad_delete":
+			payload, ok := msg.Payload.(map[string]interface{})
+			if ok {
+				id, _ := payload["id"].(string)
+				if id != "" {
+					room.DeleteNote(id)
+					room.Broadcast(msg, conn)
+				}
+			}
+
+		// --- 剪切板同步 (Clipboard) ---
+		case "clipboard_push":
+			// Web/Host 发送了新文本 -> 广播给对面
+			room.Broadcast(msg, conn)
+
+		case "clipboard_pull":
+			// Web 请求获取剪切板 -> 转发给 Host
+			// 这里简单起见直接广播，Host 收到会响应
+			room.Broadcast(msg, conn)
+
+		case "clipboard_data":
+			// Host 响应了剪切板内容 -> 广播给 Web
+			room.Broadcast(msg, conn)
+
+		// --- WebRTC 信令转发 (P2P Signaling) ---
+		// offer, answer, candidate 这些是 P2P 握手必须的消息
+		// 服务器只负责透传，不看内容
+		case "offer", "answer", "candidate":
+			room.Broadcast(msg, conn)
+
+		// --- 心跳检测 (可选) ---
+		case "ping":
+			conn.WriteJSON(Message{Type: "pong"})
+		}
+	}
 }
