@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
+    "@vueup/vue-quill": "^1.0.0-beta.11",
     "element-plus": "^2.13.2",
     "pinia": "^3.0.4",
     "qrcode.vue": "^3.7.0",

@@ -1,7 +1,5 @@
 package models
 
-import "github.com/gorilla/websocket"
-
 // 便签 (支持多便签)
 type Note struct {
 	ID      string `json:"id"`

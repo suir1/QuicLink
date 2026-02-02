@@ -4,9 +4,13 @@ import (
 	"log"
 	"sync"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
+
+// Connection 抽象接口，屏蔽 WebSocket/WebTransport 差异
+type Connection interface {
+	WriteJSON(v interface{}) error
+	Close() error
+}
 
 // Room 结构体：定义一个房间的所有状态
 type Room struct {
@@ -14,10 +18,10 @@ type Room struct {
 	Password       string
 
 	// 房间内的所有客户端连接 (用于广播)
-	Clients        map[*websocket.Conn]bool
+	Clients        map[Connection]bool
 
 	// 特殊标记：谁是 Host (C++ 客户端)
-	Host           *websocket.Conn
+	Host           Connection
 	HostInfo       interface{} // 存 Host 的 IP、端口等 JSON 信息
 
 	// --- 新增：记事本功能 ---
@@ -55,7 +59,7 @@ func GetOrCreateRoom(roomId string) *Room {
 	// 如果不存在，创建新房间
 	newRoom := &Room{
 		ID:         roomId,
-		Clients:    make(map[*websocket.Conn]bool),
+		Clients:    make(map[Connection]bool),
 		Notes:      make(map[string]*Note),
 		LastUpdate: time.Now(),
 	}
@@ -79,10 +83,11 @@ func GetRoom(roomId string) *Room {
 	ManagerLock.RLock()
 	defer ManagerLock.RUnlock()
 	return Rooms[roomId]
+	return nil // Fixed potential missing return if not found? No, map returns nil if value type is pointer or zero value. Actually GetRoom returns *Room, so ok.
 }
 
 // Join 客户端加入房间
-func (r *Room) Join(conn *websocket.Conn) {
+func (r *Room) Join(conn Connection) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -92,7 +97,7 @@ func (r *Room) Join(conn *websocket.Conn) {
 }
 
 // Leave 客户端离开房间
-func (r *Room) Leave(conn *websocket.Conn) {
+func (r *Room) Leave(conn Connection) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -112,7 +117,7 @@ func (r *Room) Leave(conn *websocket.Conn) {
 }
 
 // SetHost 注册 C++ 客户端为 Host
-func (r *Room) SetHost(conn *websocket.Conn, info interface{}) {
+func (r *Room) SetHost(conn Connection, info interface{}) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -160,7 +165,7 @@ func (r *Room) SetPassword(password string) {
 
 // Broadcast 向房间内所有客户端广播消息
 // sender: 可选参数。如果传入 sender，则不会向该 sender 发送消息 (避免回声)
-func (r *Room) Broadcast(msg interface{}, sender *websocket.Conn) {
+func (r *Room) Broadcast(msg interface{}, sender Connection) {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 

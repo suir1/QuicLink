@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Close, Promotion, Refresh } from '@element-plus/icons-vue'
+import { Close, Download, Promotion } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { nextTick, ref } from 'vue'
 import { useConnectionStore } from '../stores/connection'
@@ -86,6 +86,52 @@ function handlePaste(event: ClipboardEvent) {
   }
 }
 
+// 读取本机剪切板
+async function readLocalClipboard() {
+  if (!navigator.clipboard) {
+    ElMessage.error('当前浏览器不支持访问剪切板')
+    return
+  }
+
+  try {
+    // 1. 尝试读取富内容 (如图片)
+    try {
+      const items = await navigator.clipboard.read()
+      for (const item of items) {
+        if (item.types.includes('image/png') || item.types.includes('image/jpeg')) {
+          const blob = await item.getType(item.types.find(t => t.startsWith('image/'))!)
+          const reader = new FileReader()
+          reader.onload = (e) => {
+            const base64 = e.target?.result as string
+            if (base64) {
+              conn.sendMessage({ type: 'clipboard_push', payload: { text: base64 } })
+              addBullet(base64, false)
+            }
+          }
+          reader.readAsDataURL(blob)
+          return
+        }
+      }
+    } catch (e) {
+      console.warn('Clipboard read() failed, falling back to readText()', e)
+    }
+
+    // 2. 尝试读取纯文本
+    const text = await navigator.clipboard.readText()
+    if (text) {
+      conn.sendMessage({ type: 'clipboard_push', payload: { text } })
+      addBullet(text, false)
+      ElMessage.success('已读取本机剪切板')
+    } else {
+      ElMessage.info('剪切板为空或无法读取')
+    }
+
+  } catch (err) {
+    console.error(err)
+    ElMessage.error('读取失败，请检查浏览器权限')
+  }
+}
+
 // 发送给 C++ Host
 function sendToHost() {
   if (!inputContent.value) return
@@ -162,7 +208,7 @@ defineExpose({
     <template #header>
       <div class="card-header">
         <span>📋 剪切板历史 ({{ clipboardList.length }})</span>
-        <el-button :icon="Refresh" size="small" circle @click="fetchFromHost" title="从 Host 拉取" />
+        <el-button :icon="Download" size="small" circle @click="readLocalClipboard" title="从本机读取" />
       </div>
     </template>
 

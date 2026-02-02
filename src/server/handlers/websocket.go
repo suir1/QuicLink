@@ -69,21 +69,13 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// ---------------------------------------------------------
 	// 4. 发送初始化状态 (Init State)
 	// ---------------------------------------------------------
-	// 获取所有笔记列表
-	notesList := make([]*store.Note, 0, len(room.Notes))
-	for _, n := range room.Notes {
-		notesList = append(notesList, n)
+	// ---------------------------------------------------------
+	// 4. 发送初始化状态 (Init State)
+	// ---------------------------------------------------------
+	if err := SendInitState(room, conn, roomId); err != nil {
+		log.Println("❌ Init error:", err)
+		return
 	}
-
-	initMsg := Message{
-		Type: "init",
-		Payload: map[string]interface{}{
-			"room_id":  roomId,
-			"hostInfo": room.HostInfo,
-			"notes":    notesList, // 发送笔记列表
-		},
-	}
-	conn.WriteJSON(initMsg)
 
 	// ---------------------------------------------------------
 	// 5. 消息循环 (Message Loop)
@@ -92,64 +84,11 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		var msg Message
 		err := conn.ReadJSON(&msg)
 		if err != nil {
-			break
+			break // 连接断开
 		}
 
-		switch msg.Type {
-
-		// --- 角色注册 ---
-		case "register_host":
-			room.SetHost(conn, msg.Payload)
-			room.Broadcast(msg, conn)
-
-		// --- 记事本更新/创建 (Notepad Update) ---
-		case "notepad_update":
-			payload, ok := msg.Payload.(map[string]interface{})
-			if ok {
-				id, _ := payload["id"].(string)
-				title, _ := payload["title"].(string)
-				content, _ := payload["content"].(string)
-
-				if id != "" {
-					room.UpdateNote(id, title, content)
-					room.Broadcast(msg, conn)
-				}
-			}
-
-		// --- 记事本删除 (Notepad Delete) ---
-		case "notepad_delete":
-			payload, ok := msg.Payload.(map[string]interface{})
-			if ok {
-				id, _ := payload["id"].(string)
-				if id != "" {
-					room.DeleteNote(id)
-					room.Broadcast(msg, conn)
-				}
-			}
-
-		// --- 剪切板同步 (Clipboard) ---
-		case "clipboard_push":
-			// Web/Host 发送了新文本 -> 广播给对面
-			room.Broadcast(msg, conn)
-
-		case "clipboard_pull":
-			// Web 请求获取剪切板 -> 转发给 Host
-			// 这里简单起见直接广播，Host 收到会响应
-			room.Broadcast(msg, conn)
-
-		case "clipboard_data":
-			// Host 响应了剪切板内容 -> 广播给 Web
-			room.Broadcast(msg, conn)
-
-		// --- WebRTC 信令转发 (P2P Signaling) ---
-		// offer, answer, candidate 这些是 P2P 握手必须的消息
-		// 服务器只负责透传，不看内容
-		case "offer", "answer", "candidate":
-			room.Broadcast(msg, conn)
-
-		// --- 心跳检测 (可选) ---
-		case "ping":
-			conn.WriteJSON(Message{Type: "pong"})
+		if !ProcessMessage(room, conn, msg) {
+			break
 		}
 	}
 }
