@@ -14,22 +14,22 @@ type Connection interface {
 
 // Room 结构体：定义一个房间的所有状态
 type Room struct {
-	ID             string
-	Password       string
+	ID       string
+	Password string
 
 	// 房间内的所有客户端连接 (用于广播)
-	Clients        map[Connection]bool
+	Clients map[Connection]bool
 
 	// 特殊标记：谁是 Host (C++ 客户端)
-	Host           Connection
-	HostInfo       interface{} // 存 Host 的 IP、端口等 JSON 信息
+	Host     Connection
+	HostInfo interface{} // 存 Host 的 IP、端口等 JSON 信息
 
 	// --- 新增：记事本功能 ---
-	Notes          map[string]*Note // 存储多标签记事本 (ID -> Note)
-	LastUpdate     time.Time        // 最后活动时间 (可用于后续清理非活跃房间)
+	Notes      map[string]*Note // 存储多标签记事本 (ID -> Note)
+	LastUpdate time.Time        // 最后活动时间 (可用于后续清理非活跃房间)
 
 	// 读写锁：保证并发安全
-	mutex          sync.RWMutex
+	mutex sync.RWMutex
 }
 
 // Note 记事本单页结构
@@ -83,7 +83,6 @@ func GetRoom(roomId string) *Room {
 	ManagerLock.RLock()
 	defer ManagerLock.RUnlock()
 	return Rooms[roomId]
-	return nil // Fixed potential missing return if not found? No, map returns nil if value type is pointer or zero value. Actually GetRoom returns *Room, so ok.
 }
 
 // Join 客户端加入房间
@@ -168,6 +167,8 @@ func (r *Room) SetPassword(password string) {
 func (r *Room) Broadcast(msg interface{}, sender Connection) {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
+
+	// log.Printf("📢 Broadcasting to %d clients in room %s", len(r.Clients), r.ID)
 
 	for client := range r.Clients {
 		// 如果指定了 sender，且当前 client 就是 sender，则跳过

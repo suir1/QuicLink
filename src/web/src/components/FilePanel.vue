@@ -68,8 +68,53 @@ const handleError: UploadProps['onError'] = () => {
 </template>
 
 <style scoped>
-.card-header { display: flex; justify-content: space-between; align-items: center; }
-.file-list { margin-top: 20px; border-top: 1px solid #eee; padding-top: 10px; }
-.file-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px dashed #eee; }
-.fname { font-size: 14px; color: #333; }
+/* Dark Mode Support */
+/* Dark Mode Support handled by vars */
+.card-header { display: flex; justify-content: space-between; align-items: center; width: 100%; }
+.file-list {
+  margin-top: 20px;
+  border-top: 1px solid var(--el-border-color-light);
+  padding-top: 10px;
+}
+.file-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--el-border-color-light);
+}
+.fname {
+  font-size: 14px;
+  color: var(--el-text-color-primary);
+}
+
+/* Header Background */
+.file-card :deep(.el-card__header) {
+  background: var(--el-bg-color-overlay);
+  height: 40px;
+  padding: 0 15px;
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid var(--el-border-color-light);
+}
+
+/* Manually removed hardcoded dark mode overrides - relying on vars now */
+/*
+html.dark .file-card :deep(.el-card__header) {
+  background: #1d1e1f;
+  border-bottom: 1px solid #363637;
+}
+
+html.dark .file-list {
+  border-top-color: #363637;
+}
+html.dark .file-item {
+  border-bottom-color: #363637;
+}
+*/
+html.dark .file-list {
+  background-color: #262727;
+  padding: 10px; /* Add some padding since it now has a bg */
+  border-radius: 4px;
+}
 </style>

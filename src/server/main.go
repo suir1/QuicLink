@@ -1,10 +1,14 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -16,10 +20,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go/http3"
-
 	"quiclink-server/config"
 	"quiclink-server/handlers"
+
+	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/webtransport-go"
 )
 
 func main() {
@@ -34,6 +39,11 @@ func main() {
 		if err := generateSelfSignedCert(certFile, keyFile); err != nil {
 			log.Fatalf("Failed to generate cert: %v", err)
 		}
+	}
+
+	// 计算证书 Hash
+	if err := computeCertHash(certFile); err != nil {
+		log.Printf("⚠️ Failed to compute cert hash: %v", err)
 	}
 
 	// 静态文件
@@ -66,8 +76,9 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Add("Alt-Svc", `h3=":8080"; ma=2592000`)
 		json.NewEncoder(w).Encode(map[string]string{
-			"mode": config.Current.AppMode,
-			"proto": r.Proto, // 返回当前协议版本 (HTTP/1.1, HTTP/2, HTTP/3)
+			"mode":     config.Current.AppMode,
+			"proto":    r.Proto, // 返回当前协议版本 (HTTP/1.1, HTTP/2, HTTP/3)
+			"certHash": CertHash,
 		})
 	})
 
@@ -77,14 +88,36 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// 1. 启动 HTTP/3 (UDP)
+	// 加载 TLS 证书
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		log.Fatalf("❌ Failed to load TLS cert: %v", err)
+	}
+
+	// 配置 TLS，必须设置 NextProtos 为 "h3" 以支持 HTTP/3 ALPN 协商
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h3"}, // 关键：告诉客户端我们支持 HTTP/3
+	}
+
+	// 1. 初始化 WebTransport Server
+	// 必须在启动前设置 H3 和 Handler
+	handlers.WTServer = &webtransport.Server{
+		H3: &http3.Server{
+			Addr:            ":" + port,
+			Handler:         http.DefaultServeMux,
+			TLSConfig:       tlsConfig,
+			EnableDatagrams: true, // WebTransport 需要 HTTP/3 Datagrams 支持
+		},
+		CheckOrigin: func(r *http.Request) bool {
+			return true // 允许所有来源 (开发环境)
+		},
+	}
+
+	// 2. 启动 HTTP/3 (UDP) - 使用 WebTransport Server 的 ListenAndServeTLS
 	go func() {
 		defer wg.Done()
-		server := http3.Server{
-			Addr: ":" + port,
-			Handler: nil, // use http.DefaultServeMux
-		}
-		if err := server.ListenAndServeTLS(certFile, keyFile); err != nil {
+		if err := handlers.WTServer.ListenAndServeTLS(certFile, keyFile); err != nil {
 			log.Printf("❌ HTTP/3 Server error: %v", err)
 		}
 	}()
@@ -100,9 +133,10 @@ func main() {
 	wg.Wait()
 }
 
-// 生成自签名证书
+// 生成自签名证书 (ECDSA P-256, 用于 WebTransport serverCertificateHashes)
 func generateSelfSignedCert(certFile, keyFile string) error {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	// WebTransport 要求：必须使用 ECDSA P-256，不能用 RSA
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return err
 	}
@@ -113,7 +147,7 @@ func generateSelfSignedCert(certFile, keyFile string) error {
 			Organization: []string{"QuicLink Dev"},
 		},
 		NotBefore: time.Now(),
-		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
+		NotAfter:  time.Now().Add(10 * 24 * time.Hour), // 浏览器限制：自签名证书搭配 Hash 校验有效期不能超过 14 天
 
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
@@ -139,15 +173,39 @@ func generateSelfSignedCert(certFile, keyFile string) error {
 		return err
 	}
 
-	// 写入 key.pem
+	// 写入 key.pem (ECDSA 格式)
+	keyBytes, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		return err
+	}
 	keyOut, err := os.Create(keyFile)
 	if err != nil {
 		return err
 	}
 	defer keyOut.Close()
-	if err := pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}); err != nil {
+	if err := pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}); err != nil {
 		return err
 	}
 
 	return nil
 }
+
+// 计算证书指纹 (SHA-256)
+func computeCertHash(certFile string) error {
+	certPEM, err := os.ReadFile(certFile)
+	if err != nil {
+		return err
+	}
+
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return fmt.Errorf("failed to parse certificate PEM")
+	}
+
+	hash := sha256.Sum256(block.Bytes)
+	CertHash = base64.StdEncoding.EncodeToString(hash[:])
+	fmt.Printf("🔒 Certificate Hash: %s\n", CertHash)
+	return nil
+}
+
+var CertHash string

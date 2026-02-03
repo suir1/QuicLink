@@ -1,15 +1,21 @@
 <script setup lang="ts">
-import { CopyDocument, Loading } from '@element-plus/icons-vue'
+import { CopyDocument, Loading, Moon, Sunny } from '@element-plus/icons-vue'
+import { useDark, useToggle } from '@vueuse/core'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import QrcodeVue from 'qrcode.vue'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useConnectionStore } from '../stores/connection'
 
+// 暗黑模式
+const isDark = useDark()
+const toggleDark = useToggle(isDark)
+
 // 引入功能组件 (请确保这些文件存在于 components 目录下)
 import ClipboardCard from '../components/ClipboardCard.vue'
 import FilePanel from '../components/FilePanel.vue'
 import NotepadPanel from '../components/NotepadPanel.vue'
+import P2PFilePanel from '../components/P2PFilePanel.vue'
 
 const route = useRoute()
 const conn = useConnectionStore()
@@ -25,17 +31,33 @@ onMounted(async () => {
   conn.onClipboardData = (text) => {
     clipboardRef.value?.updateText(text)
   }
-  conn.onNotepadData = (text) => {
-    notepadRef.value?.updateContent(text)
-  }
+
 
   // 2. 检查服务器模式并加入
-  const mode = await conn.checkMode()
-
-  if (mode === 'public') {
-    joinRoom()
-  } else if (mode === 'private') {
-    promptPassword()
+  try {
+    const mode = await conn.checkMode()
+    if (mode === 'public') {
+      joinRoom()
+    } else if (mode === 'private') {
+      promptPassword()
+    }
+  } catch (e) {
+    // 如果 API 请求失败，通常是因为浏览器不信任自签名证书 or 服务器未启动
+    ElMessageBox.confirm(
+      '无法连接到服务器。如果是自签名证书，请点击下方链接并在浏览器中选择 "继续前往" 或 "信任此证书"，然后刷新本页。',
+      '连接失败',
+      {
+        confirmButtonText: '去信任证书',
+        cancelButtonText: '重试',
+        type: 'warning',
+        center: true
+      }
+    ).then(() => {
+      // 打开 API 地址
+      window.open(`${conn.HTTP_URL}/api/info`, '_blank')
+    }).catch(() => {
+      location.reload()
+    })
   }
 })
 
@@ -79,71 +101,74 @@ function copyLink() {
 <template>
   <div class="app-container">
 
-    <div class="status-bar-wrapper">
-      <el-alert
-        v-if="conn.isConnected"
-        :title="conn.serverMode === 'private' ? '🔒 私有加密隧道已建立' : `🌐 已加入公共房间: ${conn.currentRoom}`"
-        type="success"
-        effect="dark"
-        center
-        show-icon
-        :closable="false"
-      />
-      <el-alert
-        v-else
-        title="正在连接服务器..."
-        type="info"
-        center
-        show-icon
-        :closable="false"
-      />
-    </div>
+    <template v-if="conn.isConnected">
+      <!-- 统一顶部栏: 状态 + QR码 + 主机状态 + 链接 -->
+      <div class="top-toolbar">
+        <!-- 房间状态 -->
+        <div class="toolbar-item status-section">
+          <el-tag v-if="conn.serverMode === 'private'" type="warning" effect="dark" size="large">
+            🔒 私有隧道
+          </el-tag>
+          <el-tag v-else type="success" effect="dark" size="large">
+            🌐 {{ conn.currentRoom }}
+          </el-tag>
+        </div>
 
-    <el-row v-if="conn.isConnected" :gutter="20" class="main-content">
+        <!-- QR码 -->
+        <div class="toolbar-item qr-section">
+          <qrcode-vue :value="currentUrl" :size="60" level="M" background="#ffffff" foreground="#000000"/>
+          <span class="qr-label">扫码互传</span>
+        </div>
 
-      <el-col :xs="24" :md="8">
-        <el-card class="box-card info-card">
-          <div class="qr-wrapper">
-            <qrcode-vue :value="currentUrl" :size="160" level="M" background="#ffffff" foreground="#000000"/>
-            <p>手机扫码互传</p>
-          </div>
+        <!-- 主机状态 -->
+        <div class="toolbar-item host-section">
+          <span class="host-label">PC:</span>
+          <el-tag v-if="conn.hostOnline" type="success" size="small">在线</el-tag>
+          <el-tag v-else type="info" size="small">离线</el-tag>
+          <span v-if="conn.hostOnline" class="host-ip">{{ conn.hostIp }}</span>
+        </div>
 
-          <el-input v-model="currentUrl" readonly size="small">
+        <!-- 链接 -->
+        <div class="toolbar-item link-section">
+          <el-input v-model="currentUrl" readonly size="small" class="link-input">
             <template #append>
               <el-button :icon="CopyDocument" @click="copyLink" />
             </template>
           </el-input>
+        </div>
 
-          <div class="host-status">
-            <p>PC 主机状态:</p>
-            <div v-if="conn.hostOnline">
-               <el-tag type="success" effect="dark" size="large">在线</el-tag>
-               <div class="host-ip">IP: {{ conn.hostIp }}</div>
-            </div>
-            <el-tag v-else type="info" size="large">离线</el-tag>
-          </div>
-          <div class="host-hint" v-if="!conn.hostOnline">
-            <small>请打开电脑端的 QuicLink 客户端以启用剪切板同步</small>
-          </div>
-        </el-card>
-      </el-col>
+        <!-- 主题切换 -->
+        <div class="toolbar-item theme-section">
+          <el-button
+            :icon="isDark ? Moon : Sunny"
+            circle
+            size="small"
+            @click="toggleDark()"
+            :title="isDark ? '切换到亮色模式' : '切换到暗黑模式'"
+          />
+        </div>
+      </div>
 
-      <el-col :xs="24" :md="16">
-
-        <div class="feature-block">
+      <!-- 主内容区: 记事本 + 剪贴板侧栏 -->
+      <div class="main-workspace">
+        <div class="notepad-area">
           <NotepadPanel ref="notepadRef" />
         </div>
-
-        <div class="feature-block">
+        <div class="clipboard-sidebar">
           <ClipboardCard ref="clipboardRef" />
         </div>
+      </div>
 
-        <div class="feature-block">
+      <!-- 文件面板区域 (仿照上方布局: 左侧中转, 右侧直传) -->
+      <div class="file-workspace">
+        <div class="file-area">
           <FilePanel />
         </div>
-
-      </el-col>
-    </el-row>
+        <div class="p2p-sidebar">
+          <P2PFilePanel />
+        </div>
+      </div>
+    </template>
 
     <div v-else class="loading-state">
       <el-icon class="is-loading" :size="40" color="#409eff"><Loading /></el-icon>
@@ -155,69 +180,210 @@ function copyLink() {
 
 <style scoped>
 .app-container {
-  max-width: 1200px;
+  max-width: 1400px;
   margin: 0 auto;
   padding: 15px;
 }
 
-.status-bar-wrapper {
-  margin-bottom: 20px;
-}
-
-.main-content {
-  margin-top: 10px;
-}
-
-/* 左侧信息卡片 */
-.qr-wrapper {
-  text-align: center;
-  margin-bottom: 20px;
-  padding: 10px;
-  background: #f9fafe;
-  border-radius: 8px;
-}
-.qr-wrapper p {
-  font-size: 13px;
-  color: #666;
-  margin-top: 8px;
-}
-
-.host-status {
-  margin-top: 25px;
-  padding-top: 20px;
-  border-top: 1px dashed #eee;
+/* 统一顶部工具栏 */
+.top-toolbar {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  font-size: 15px;
-  color: #333;
+  gap: 20px;
+  padding: 12px 20px;
+  background: var(--toolbar-bg, linear-gradient(135deg, #f0f9eb 0%, #e8f5e9 100%));
+  border-radius: 12px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+  border: 1px solid var(--toolbar-border, #c8e6c9);
+  transition: all 0.3s;
+}
+
+/* 暗黑模式下覆盖变量 */
+html.dark .top-toolbar {
+  --toolbar-bg: var(--el-bg-color-overlay);
+  --toolbar-border: var(--el-border-color-light);
+}
+
+.toolbar-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-section {
+  flex-shrink: 0;
+}
+
+.qr-section {
+  flex-shrink: 0;
+}
+
+.qr-label {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.host-section {
+  flex-shrink: 0;
+}
+
+.host-label {
+  font-size: 14px;
+  color: var(--el-text-color-regular);
   font-weight: 500;
 }
 
 .host-ip {
   font-size: 12px;
-  color: #999;
-  text-align: right;
-  margin-top: 4px;
+  color: var(--el-text-color-secondary);
+  margin-left: 8px;
 }
 
-.host-hint {
-  margin-top: 10px;
-  color: #909399;
-  line-height: 1.4;
+.link-section {
+  flex: 1;
+  min-width: 200px;
 }
 
-/* 右侧功能块 */
-.feature-block {
+.link-input {
+  width: 100%;
+}
+
+/* 主工作区: 记事本 + 剪贴板侧栏 - 无缝连接 */
+.main-workspace {
+  display: flex;
+  gap: 0; /* 无间距，无缝连接 */
   margin-bottom: 20px;
+  height: 500px; /* 固定高度 */
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: var(--el-box-shadow-light);
 }
 
+.notepad-area {
+  flex: 2;
+  min-width: 0;
+  position: relative;
+}
+
+.clipboard-sidebar {
+  flex: 1;
+  min-width: 280px;
+  max-width: 350px;
+  border-left: 1px solid var(--el-border-color-light);
+}
+
+/* 底部文件工作区 (复用上方布局逻辑) */
+.file-workspace {
+  display: flex;
+  gap: 0;
+  height: 400px; /* 文件区域高度 */
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: var(--el-box-shadow-light);
+  margin-top: 20px;
+  background-color: var(--el-bg-color-overlay);
+}
+
+.file-area {
+  flex: 2;
+  min-width: 0;
+  position: relative;
+  /* FilePanel 内部可能有 card，需要去边框以融合 */
+}
+
+/* 强制覆盖 FilePanel 的 Card 样式以适应组合布局 */
+.file-area :deep(.el-card) {
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  height: 100%;
+}
+
+.p2p-sidebar {
+  flex: 1;
+  min-width: 280px;
+  max-width: 350px;
+  border-left: 1px solid var(--el-border-color-light);
+}
+
+/* 强制覆盖 P2PFilePanel 的 Card 样式 */
+.p2p-sidebar :deep(.el-card) {
+  border: none;
+  border-left: none; /* remove internal border if any */
+  border-radius: 0;
+  box-shadow: none;
+  height: 100%;
+}
+
+/* 暗黑模式适配 */
+html.dark .file-workspace {
+  background-color: var(--el-bg-color-overlay);
+  box-shadow: var(--el-box-shadow-dark);
+}
+
+html.dark .p2p-sidebar {
+  border-left-color: var(--el-border-color-light);
+}
+
+html.dark .clipboard-sidebar {
+  border-left-color: var(--el-border-color-light);
+}
+
+/* 加载状态 */
 .loading-state {
   text-align: center;
   margin-top: 100px;
 }
+
 .loading-state p {
   color: #606266;
   margin-top: 15px;
+}
+
+/* 响应式: 小屏幕堆叠布局 */
+@media (max-width: 768px) {
+  .top-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 15px;
+  }
+
+  .toolbar-item {
+    justify-content: center;
+  }
+
+  .main-workspace {
+    flex-direction: column;
+  }
+
+  .clipboard-sidebar, .p2p-sidebar {
+    max-width: none;
+    border-left: none;
+    border-top: 1px solid #ebeef5;
+  }
+
+  .file-workspace {
+    flex-direction: column;
+    height: auto;
+  }
+
+  .file-area {
+    height: 400px; /* 小屏幕固定高度 */
+  }
+
+  .p2p-sidebar {
+    height: 400px;
+  }
+}
+/* Dark Mode QR Code Inversion */
+html.dark .qr-section :deep(canvas) { /* qrcode-vue renders canvas */
+  filter: invert(1) hue-rotate(180deg);
+  border: 4px solid #fff; /* Ensure it has a white border for scanning contrast */
+  border-radius: 4px;
+}
+
+html.dark .qr-label {
+  color: var(--el-text-color-secondary);
 }
 </style>

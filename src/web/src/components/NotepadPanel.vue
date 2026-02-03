@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { Plus } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
 import { onMounted, ref } from 'vue'
 import { useConnectionStore } from '../stores/connection'
@@ -116,9 +117,16 @@ function handleTabsEdit(targetName: string | undefined, action: 'remove' | 'add'
 </script>
 
 <template>
-  <el-card class="notepad-card" body-style="padding: 0;">
-    <div class="header-bar">
-      <span>📝 云端记事本</span>
+  <el-card class="notepad-card" body-style="padding: 0;" shadow="never">
+    <!-- 右上角控制区：新增按钮 + 同步状态 -->
+    <div class="header-controls">
+      <el-button
+        :icon="Plus"
+        circle
+        size="small"
+        @click="handleTabsEdit(undefined, 'add')"
+        title="新建笔记"
+      />
       <el-tag size="small" type="info">{{ saveStatus }}</el-tag>
     </div>
 
@@ -136,8 +144,6 @@ function handleTabsEdit(targetName: string | undefined, action: 'remove' | 'add'
         :name="note.id"
       >
         <template #label>
-           <!-- 标题支持双击编辑 (简化版：用 el-popover 或者直接 input 替换 text? 这里简单起见只显示) -->
-           <!-- 为了体验更好，可以在 tab 内容里加一个标题编辑栏 -->
            <span>{{ note.title }}</span>
         </template>
 
@@ -165,12 +171,84 @@ function handleTabsEdit(targetName: string | undefined, action: 'remove' | 'add'
 </template>
 
 <style scoped>
-.header-bar {
-  padding: 10px 15px;
-  border-bottom: 1px solid #ebeef5;
+.notepad-card {
+  height: 100%;
+  border-radius: 8px 0 0 8px;
+  border-right: none;
+  overflow: hidden;
+}
+
+.notepad-card :deep(.el-card__body) {
+  height: 100%;
   display: flex;
-  justify-content: space-between;
+  flex-direction: column;
+  position: relative;
+}
+
+/* Header 右上角控制区 */
+.header-controls {
+  position: absolute;
+  top: 21px; /* 垂直居中于 header区域 (40px + border 1px) */
+  transform: translateY(-50%);
+  right: 15px;
+  z-index: 10;
+  display: flex;
   align-items: center;
+  gap: 12px;
+}
+
+:deep(.el-tabs) {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 让 tabs header 有灰色背景，和 Clipboard 一致 */
+/* 给 sync status 留出空间 */
+/* 给 sync status 留出空间 */
+:deep(.el-tabs__header) {
+  margin: 0;
+  background: var(--el-bg-color-overlay);
+  border-bottom: 1px solid var(--el-border-color-light);
+  height: 41px;  /* 明确高度对齐 */
+  display: flex;
+  align-items: center;
+  padding-right: 100px;
+  box-sizing: border-box;
+}
+
+/* 暗黑模式强制覆盖背景 */
+html.dark :deep(.el-tabs__header) {
+  background: #1d1e1f;
+  border-bottom: 1px solid #363637;
+}
+
+:deep(.el-tabs__nav-wrap) {
+  flex: 1;
+}
+
+/* 隐藏默认的 new-tab 按钮，使用自定义的 */
+:deep(.el-tabs__new-tab) {
+  display: none;
+}
+
+:deep(.el-tabs__content) {
+  flex: 1;
+  overflow: hidden;
+  background: var(--el-bg-color);
+}
+
+/* 暗黑模式强制覆盖背景 */
+html.dark :deep(.el-tabs__content) {
+  background: #1d1e1f;
+}
+
+:deep(.el-tab-pane) {
+  height: 100%;
+}
+
+:deep(.el-tab-pane) {
+  height: 100%;
 }
 
 .demo-tabs > :deep(.el-tabs__content) {
@@ -178,6 +256,7 @@ function handleTabsEdit(targetName: string | undefined, action: 'remove' | 'add'
 }
 
 .editor-area {
+  height: 100%; /* 占满 tab-pane 高度 */
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -185,12 +264,14 @@ function handleTabsEdit(targetName: string | undefined, action: 'remove' | 'add'
 
 .title-input {
   font-weight: bold;
+  flex-shrink: 0;
 }
 
 .quill-wrapper {
-  height: 400px; /* 给编辑器一个固定高度 */
+  flex: 1; /* 自动填充剩余高度 */
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 /* 修复 Quill 在 Element Tabs 里的样式问题 */
@@ -206,5 +287,14 @@ function handleTabsEdit(targetName: string | undefined, action: 'remove' | 'add'
 :deep(.ql-container.ql-snow) {
   border-bottom-left-radius: 4px;
   border-bottom-right-radius: 4px;
+}
+
+/* 暗黑模式适配编辑器 */
+html.dark .title-input :deep(.el-input__wrapper) {
+  background-color: transparent;
+  box-shadow: none;
+}
+html.dark .title-input :deep(.el-input__inner) {
+  color: #E5EAF3;
 }
 </style>

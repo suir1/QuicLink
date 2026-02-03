@@ -57,6 +57,11 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 	case "offer", "answer", "candidate":
 		room.Broadcast(msg, conn)
 
+	// --- P2P 文件传输信令 ---
+	case "file_offer", "file_request", "file_chunk", "file_accept", "p2p_hello":
+		// 直接广播给房间内其他人
+		room.Broadcast(msg, conn)
+
 	// --- 心跳检测 ---
 	case "ping":
 		conn.WriteJSON(Message{Type: "pong"})

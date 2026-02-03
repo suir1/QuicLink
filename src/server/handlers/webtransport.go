@@ -12,11 +12,8 @@ import (
 	"quiclink-server/store"
 )
 
-var wtServer = &webtransport.Server{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
+// WTServer 是 WebTransport 服务器实例，由 main.go 初始化
+var WTServer *webtransport.Server
 
 // WebTransportClient 封装 WT 会话和主控流，实现 Connection 接口
 type WebTransportClient struct {
@@ -40,8 +37,14 @@ func (c *WebTransportClient) ReadJSON(v interface{}) error {
 }
 
 func HandleWebTransport(w http.ResponseWriter, r *http.Request) {
+	if WTServer == nil {
+		log.Printf("❌ WebTransport Server not initialized")
+		w.WriteHeader(500)
+		return
+	}
+
 	// 1. 升级到 WebTransport
-	session, err := wtServer.Upgrade(w, r)
+	session, err := WTServer.Upgrade(w, r)
 	if err != nil {
 		log.Printf("❌ WebTransport Upgrade failed: %v", err)
 		w.WriteHeader(500)

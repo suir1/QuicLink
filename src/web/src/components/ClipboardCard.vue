@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Close, Download, Promotion } from '@element-plus/icons-vue'
+import { Close, Promotion, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { nextTick, ref } from 'vue'
 import { useConnectionStore } from '../stores/connection'
@@ -204,11 +204,11 @@ defineExpose({
 </script>
 
 <template>
-  <el-card class="clipboard-card" body-style="display: flex; flex-direction: column; height: 100%;">
+  <el-card class="clipboard-card" body-style="display: flex; flex-direction: column; height: 100%;" shadow="never">
     <template #header>
       <div class="card-header">
-        <span>📋 剪切板历史 ({{ clipboardList.length }})</span>
-        <el-button :icon="Download" size="small" circle @click="readLocalClipboard" title="从本机读取" />
+        <span class="record-count">{{ clipboardList.length }} 条</span>
+        <el-button :icon="Refresh" size="small" circle @click="readLocalClipboard" title="同步本机剪切板" />
       </div>
     </template>
 
@@ -256,24 +256,64 @@ defineExpose({
 
 <style scoped>
 .clipboard-card {
-  height: 500px; /* 固定高度，或者根据父容器适配 */
+  height: 100%;
   display: flex;
   flex-direction: column;
+  border-left: none;
+  border-radius: 0 8px 8px 0;
+  overflow: hidden;
 }
-.card-header { display: flex; justify-content: space-between; align-items: center; }
+
+.clipboard-card :deep(.el-card__body) {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Header: 暗黑模式适配 */
+/* Header: 暗黑模式适配 - Removed manual dark check, use vars */
+.clipboard-card :deep(.el-card__header) {
+  padding: 0 15px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  background: var(--el-bg-color-overlay);
+  border-bottom: 1px solid var(--el-border-color-light);
+  border-radius: 0 8px 0 0;
+  box-sizing: border-box;
+}
+
+/* 暗黑模式强制覆盖背景 - REMOVED, use vars above */
+/* html.dark .clipboard-card :deep(.el-card__header) { ... } */
+
+.card-header {
+  flex: 1;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.record-count {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
 
 .list-container {
   flex: 1;
   overflow-y: auto;
   padding: 10px 5px;
-  background-color: #f9f9f9;
-  border-radius: 4px;
+  background-color: var(--el-bg-color);
   margin-bottom: 10px;
 }
 
+html.dark .list-container {
+  background-color: #262727; /* Grayish background for list area */
+}
+
 .bullet-item {
-  background: white;
-  border: 1px solid #e4e7ed;
+  background: var(--el-bg-color-overlay);
+  border: 1px solid var(--el-border-color-light);
   border-radius: 8px;
   padding: 8px 12px;
   margin-bottom: 8px;
@@ -282,12 +322,12 @@ defineExpose({
   align-items: flex-start;
   cursor: pointer;
   transition: all 0.2s;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  box-shadow: var(--el-box-shadow-light);
 }
 
 .bullet-item:hover {
-  border-color: #409eff;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  border-color: var(--el-color-primary);
+  box-shadow: var(--el-box-shadow);
   transform: translateY(-1px);
 }
 
@@ -298,11 +338,10 @@ defineExpose({
 
 .bullet-text {
   font-size: 14px;
-  color: #333;
+  color: var(--el-text-color-primary);
   line-height: 1.4;
   word-break: break-all;
   white-space: pre-wrap;
-  /* 限制最大显示行数，防止太长 */
   display: -webkit-box;
   -webkit-line-clamp: 4;
   line-clamp: 4;
@@ -315,20 +354,20 @@ defineExpose({
   max-width: 100%;
   max-height: 200px;
   border-radius: 4px;
-  border: 1px solid #eee;
+  border: 1px solid var(--el-border-color);
   object-fit: contain;
   display: block;
 }
 
 .bullet-meta {
   font-size: 11px;
-  color: #999;
+  color: var(--el-text-color-secondary);
   margin-top: 4px;
 }
 
 .bullet-action {
   margin-left: 10px;
-  color: #909399;
+  color: var(--el-text-color-secondary);
   padding: 2px;
   border-radius: 50%;
   display: flex;
@@ -336,12 +375,12 @@ defineExpose({
   justify-content: center;
 }
 .bullet-action:hover {
-  background-color: #fcebeb;
-  color: #f56c6c;
+  background-color: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
 }
 
 .footer-input {
-  border-top: 1px solid #eee;
+  border-top: 1px solid var(--el-border-color-light);
   padding-top: 10px;
 }
 </style>
