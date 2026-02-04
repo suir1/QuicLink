@@ -95,7 +95,7 @@ jobs:
 
       - name: Build Desktop
         working-directory: src/desktop
-        run: wails build -clean
+        run: wails build -clean -tags webkit2_41
 
       # Package for each platform
       - name: Package (macOS)

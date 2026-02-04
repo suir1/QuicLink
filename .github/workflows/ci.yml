@@ -103,7 +103,7 @@ jobs:
 
       - name: Build Desktop
         working-directory: src/desktop
-        run: wails build -clean
+        run: wails build -clean -tags webkit2_41
 
       - name: Upload Desktop binary (macOS)
         if: runner.os == 'macOS'
