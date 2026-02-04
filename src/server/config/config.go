@@ -9,6 +9,8 @@ import (
 type Config struct {
 	AppMode       string `json:"app_mode"`       // "public" or "private"
 	AdminPassword string `json:"admin_password"` // 私有模式必填
+	UseHTTPS      bool   `json:"use_https"`      // 是否使用 HTTPS (默认 true)
+	Port          int    `json:"port"`           // 服务端口 (默认 8080)
 
 	Limits struct {
 		MaxUploadSizeMB      int64 `json:"max_upload_size_mb"`
@@ -41,12 +43,24 @@ func LoadConfig() {
 		log.Fatal("❌ Private mode requires 'admin_password' in config.json!")
 	}
 
-	log.Printf("⚙️  Loaded Config | Mode: %s | Upload Limit: %dMB", Current.AppMode, Current.Limits.MaxUploadSizeMB)
+	// 默认值处理
+	if Current.Port == 0 {
+		Current.Port = 8080
+	}
+
+	protocol := "HTTP"
+	if Current.UseHTTPS {
+		protocol = "HTTPS"
+	}
+	log.Printf("⚙️  Loaded Config | Mode: %s | %s | Port: %d | Upload: %dMB",
+		Current.AppMode, protocol, Current.Port, Current.Limits.MaxUploadSizeMB)
 }
 
 func createDefaultConfig() {
 	defaultCfg := Config{
-		AppMode: "public",
+		AppMode:  "public",
+		UseHTTPS: true, // 默认启用 HTTPS
+		Port:     8080,
 		Limits: struct {
 			MaxUploadSizeMB      int64 `json:"max_upload_size_mb"`
 			FileRetentionMinutes int   `json:"file_retention_minutes"`

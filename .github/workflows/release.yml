@@ -1,0 +1,187 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ==================== Build Server ====================
+  build-server:
+    name: Build Server (${{ matrix.goos }}-${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: src/server/go.sum
+
+      - name: Build Server
+        working-directory: src/server
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi
+          go build -ldflags="-s -w" -o quiclink-server-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}
+
+      - name: Upload Server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: src/server/quiclink-server-*
+
+  # ==================== Build Desktop ====================
+  build-desktop:
+    name: Build Desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: desktop-linux
+          - os: macos-latest
+            artifact: desktop-macos
+          - os: windows-latest
+            artifact: desktop-windows
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: src/desktop/go.sum
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: src/desktop/frontend/package-lock.json
+
+      - name: Install Wails
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      # Linux dependencies
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev
+
+      - name: Build Desktop
+        working-directory: src/desktop
+        run: wails build -clean
+
+      # Package for each platform
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        working-directory: src/desktop/build/bin
+        run: |
+          zip -r QuicLink-macos.zip *.app
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        working-directory: src/desktop/build/bin
+        run: |
+          tar -czvf QuicLink-linux.tar.gz QuicLink
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        working-directory: src/desktop/build/bin
+        run: |
+          Compress-Archive -Path *.exe -DestinationPath QuicLink-windows.zip
+
+      - name: Upload Desktop artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            src/desktop/build/bin/*.zip
+            src/desktop/build/bin/*.tar.gz
+
+  # ==================== Build Web ====================
+  build-web:
+    name: Build Web
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: src/web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: src/web
+        run: npm ci
+
+      - name: Build
+        working-directory: src/web
+        run: npm run build-only
+
+      - name: Package Web
+        working-directory: src/web
+        run: |
+          tar -czvf quiclink-web.tar.gz dist
+
+      - name: Upload Web artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: src/web/quiclink-web.tar.gz
+
+  # ==================== Create Release ====================
+  release:
+    name: Create Release
+    needs: [build-server, build-desktop, build-web]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure
+        run: ls -R artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
+          generate_release_notes: true
+          files: |
+            artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

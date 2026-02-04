@@ -1,0 +1,60 @@
+/* Global Quill Dark Mode Overrides */
+html.dark .ql-toolbar {
+  border-color: var(--el-border-color) !important;
+  background-color: var(--el-bg-color-overlay) !important;
+}
+
+html.dark .ql-container.ql-snow {
+  border-color: var(--el-border-color) !important;
+  background-color: var(--el-bg-color) !important;
+}
+
+html.dark .ql-editor {
+  color: var(--el-text-color-primary) !important;
+}
+
+html.dark .ql-stroke {
+  stroke: var(--el-text-color-primary) !important;
+}
+
+html.dark .ql-fill {
+  fill: var(--el-text-color-primary) !important;
+}
+
+html.dark .ql-picker {
+  color: var(--el-text-color-primary) !important;
+}
+
+html.dark .ql-picker-options {
+  background-color: var(--el-bg-color-overlay) !important;
+  color: var(--el-text-color-primary) !important;
+}
+
+/* Global Fixes for Empty State and Upload Dragger */
+html.dark .el-empty__description p {
+  color: var(--el-text-color-secondary);
+}
+
+html.dark .el-upload-dragger {
+  background-color: #262727;
+  /* Unified gray background */
+  border-color: var(--el-border-color);
+}
+
+html.dark .el-upload-dragger:hover {
+  border-color: var(--el-color-primary);
+  background-color: var(--el-fill-color-light);
+}
+
+html.dark .el-upload__text {
+  color: var(--el-text-color-regular);
+}
+
+html.dark .el-upload__text em {
+  color: var(--el-color-primary);
+}
+
+/* Clipboard Empty State Text */
+html.dark .list-container .el-empty__description p {
+  color: var(--el-text-color-secondary);
+}

@@ -28,6 +28,9 @@ type Room struct {
 	Notes      map[string]*Note // 存储多标签记事本 (ID -> Note)
 	LastUpdate time.Time        // 最后活动时间 (可用于后续清理非活跃房间)
 
+	// --- 新增：剪贴板历史 ---
+	ClipboardHistory []ClipboardItem
+
 	// 读写锁：保证并发安全
 	mutex sync.RWMutex
 }
@@ -38,6 +41,15 @@ type Note struct {
 	Title     string `json:"title"`
 	Content   string `json:"content"`
 	UpdatedAt int64  `json:"updatedAt"`
+}
+
+// ClipboardItem 剪贴板历史项
+type ClipboardItem struct {
+	ID        int64  `json:"id"`
+	Text      string `json:"text"`
+	Time      string `json:"time"`
+	Type      string `json:"type"` // "text", "image"
+	Timestamp int64  `json:"timestamp"`
 }
 
 // 全局房间管理器
@@ -58,10 +70,11 @@ func GetOrCreateRoom(roomId string) *Room {
 
 	// 如果不存在，创建新房间
 	newRoom := &Room{
-		ID:         roomId,
-		Clients:    make(map[Connection]bool),
-		Notes:      make(map[string]*Note),
-		LastUpdate: time.Now(),
+		ID:               roomId,
+		Clients:          make(map[Connection]bool),
+		Notes:            make(map[string]*Note),
+		ClipboardHistory: make([]ClipboardItem, 0),
+		LastUpdate:       time.Now(),
 	}
 
 	// 初始化一个默认笔记
@@ -184,4 +197,43 @@ func (r *Room) Broadcast(msg interface{}, sender Connection) {
 			// 实际生产中可以收集 error clients 并在循环外删除，或者依赖 Leave 机制
 		}
 	}
+}
+
+// AddClipboardItem 添加一条剪贴板记录 (保留最近 20 条)
+func (r *Room) AddClipboardItem(text string) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	// 简单的去重：如果最近的一条和新的一样，虽然时间变了，但也更新一下时间戳防止重复刷
+	if len(r.ClipboardHistory) > 0 {
+		last := r.ClipboardHistory[len(r.ClipboardHistory)-1]
+		if last.Text == text {
+			return
+		}
+	}
+
+	// 构造新 Item
+	isImage := len(text) > 10 && text[:10] == "data:image"
+	msgType := "text"
+	if isImage {
+		msgType = "image"
+	}
+
+	now := time.Now()
+	item := ClipboardItem{
+		ID:        now.UnixNano(),
+		Text:      text,
+		Time:      now.Format("15:04"),
+		Type:      msgType,
+		Timestamp: now.Unix(),
+	}
+
+	r.ClipboardHistory = append(r.ClipboardHistory, item)
+
+	// 限制长度 20
+	if len(r.ClipboardHistory) > 20 {
+		r.ClipboardHistory = r.ClipboardHistory[len(r.ClipboardHistory)-20:]
+	}
+
+	r.LastUpdate = now
 }

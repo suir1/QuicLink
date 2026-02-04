@@ -1,10 +1,12 @@
 import { ElMessage } from 'element-plus'
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import wails, { isWails } from '../utils/wails'
 
 export const useConnectionStore = defineStore('connection', () => {
     // --- 状态定义 ---
     const isConnected = ref(false)
+    const isDesktop = ref(isWails()) // Detect if running in Wails
     const transport = ref<any>(null) // WebTransport instance
     const streamWriter = ref<WritableStreamDefaultWriter | null>(null)
 
@@ -19,7 +21,7 @@ export const useConnectionStore = defineStore('connection', () => {
 
     // 环境变量处理
     const VPS_HOST = import.meta.env.VITE_VPS_HOST || 'localhost:8080'
-    // 协议跟随当前页面 (开发用 http, 生产用 https)
+    // 协议检测：跟随当前页面协议（Wails 用 http，生产用 https）
     const PROTOCOL = window.location.protocol // 'http:' or 'https:'
     const HTTP_URL = `${PROTOCOL}//${VPS_HOST}`
     const WT_URL = `https://${VPS_HOST}` // WebTransport 仍需 HTTPS
@@ -34,8 +36,65 @@ export const useConnectionStore = defineStore('connection', () => {
     const localFiles = ref<Map<string, File>>(new Map())
     const receivingFiles = ref<Map<string, { chunks: string[], total: number, received: number, name: string, type: string }>>(new Map())
 
+    // --- Desktop Wails Integration ---
+    function setupDesktopEventListeners() {
+        if (!isDesktop.value) {
+            console.log('❌ Not desktop mode, skipping Wails listeners')
+            return
+        }
+
+        console.log('🖥️ Running in Wails Desktop Mode')
+        ElMessage.info('🖥️ Wails模式已启动，正在注册事件监听器...')
+
+        // Listen for clipboard updates from Go
+        wails.on('clipboard:remote', (text: unknown) => {
+            if (typeof text === 'string' && onClipboardData.value) {
+                onClipboardData.value(text)
+            }
+        })
+
+        // Listen for P2P file offers from Go
+        wails.on('p2p:offer', (payload: unknown) => {
+            if (onP2PEvent.value) {
+                onP2PEvent.value('offer', payload as any)
+            }
+        })
+
+        // Listen for P2P messages from Go (for other message types)
+        // Listen for generic messages from Go (including init, chat, etc)
+        wails.on('p2p:message', (msg: unknown) => {
+            console.log("📥 Wails p2p:message received:", msg)
+            // Forward to main message handler logic
+            handleMessage(JSON.stringify(msg))
+        })
+
+        // Listen for clipboard history directly from Go (init handling)
+        wails.on('clipboard:history', (history: unknown) => {
+            console.log("📜 Received clipboard:history event:", history)
+            ElMessage.success(`📜 收到历史记录！共 ${Array.isArray(history) ? history.length : 0} 条`)
+            if (Array.isArray(history) && history.length > 0 && onClipboardHistory.value) {
+                console.log("Calling onClipboardHistory callback")
+                onClipboardHistory.value(history)
+            } else {
+                if (!onClipboardHistory.value) {
+                    ElMessage.warning('⚠️ onClipboardHistory 回调未注册!')
+                }
+            }
+        })
+
+        ElMessage.success('✅ Wails事件监听器注册完成')
+    }
+
     // --- 1. 检查服务器模式 ---
     async function checkMode() {
+        // 桌面端: Go 后端已处理 TLS，直接返回 public 模式
+        // 避免 WebView fetch 遇到自签名证书问题
+        if (isDesktop.value) {
+            console.log('🖥️ Desktop mode: skipping certificate check')
+            serverMode.value = 'public'
+            return 'public'
+        }
+
         try {
             const res = await fetch(`${HTTP_URL}/api/info`)
             if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -190,6 +249,16 @@ export const useConnectionStore = defineStore('connection', () => {
     async function sendMessage(data: any) {
         const jsonStr = JSON.stringify(data)
 
+        // Desktop Mode: Route through Go backend
+        if (isDesktop.value) {
+            try {
+                await wails.sendGenericMessage(data.type, data.payload || {})
+            } catch (e) {
+                console.error("Desktop Send Failed", e)
+            }
+            return
+        }
+
         // WebTransport 发送
         if (streamWriter.value) {
             try {
@@ -329,14 +398,17 @@ export const useConnectionStore = defineStore('connection', () => {
                         if (msg.type === 'register_host') ElMessage.success(`主机 [${info.ip}] 上线`)
                     }
                     if (msg.type === 'init') {
+                        console.log("📦 Processing Init Message. Payload:", msg.payload)
                         if (msg.payload.notes && onNotepadEvent.value) {
                             onNotepadEvent.value('init', msg.payload.notes)
                         }
-                        if (msg.payload.clipboardHistory && onClipboardHistory.value) {
-                            console.log('📜 Init: History received', msg.payload.clipboardHistory)
-                            onClipboardHistory.value(msg.payload.clipboardHistory)
+                        if (msg.payload.clipboardHistory) {
+                            console.log("📜 Init has history. Callback exists?", !!onClipboardHistory.value)
+                            if (onClipboardHistory.value) {
+                                onClipboardHistory.value(msg.payload.clipboardHistory)
+                            }
                         } else {
-                            console.log('📜 Init: No history in payload', msg.payload)
+                            console.log("⚠️ Init payload missing clipboardHistory")
                         }
                     }
                     break
@@ -344,6 +416,7 @@ export const useConnectionStore = defineStore('connection', () => {
                 case 'notepad_update':
                 case 'notepad_delete':
                     console.log(`📝 Store handling ${msg.type}`, msg.payload)
+                    console.log(`Callback status:`, !!onNotepadEvent.value)
                     if (onNotepadEvent.value) {
                         onNotepadEvent.value(msg.type, msg.payload)
                     } else {
@@ -411,21 +484,61 @@ export const useConnectionStore = defineStore('connection', () => {
         }
     }
 
+    // --- Desktop-specific methods ---
+    async function connectDesktop(host: string, roomId: string) {
+        if (!isDesktop.value) return
+
+        try {
+            // Connect via Go backend (WebSocket signaling)
+            await wails.connect(host, roomId)
+            isConnected.value = true
+            currentRoom.value = roomId
+
+            // Also connect P2P if available
+            try {
+                await wails.connectP2P(host, roomId)
+                console.log('✅ Desktop P2P connected')
+            } catch (e) {
+                console.warn('P2P connection failed, using signaling only', e)
+            }
+
+            ElMessage.success(`✅ 桌面端已连接: ${roomId}`)
+        } catch (e) {
+            console.error('Desktop connect failed:', e)
+            ElMessage.error('桌面端连接失败')
+        }
+    }
+
+    async function shareFileDesktop(file: File) {
+        if (!isDesktop.value) return shareFile(file)
+
+        const fileId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+        localFiles.value.set(fileId, file)
+
+        // Share via Go P2P
+        await wails.shareFileP2P(fileId, file.name, file.size, file.type)
+    }
+
     return {
         isConnected,
+        isDesktop,
         currentRoom,
         serverMode,
         hostOnline,
         hostIp,
         checkMode,
         connect,
+        connectDesktop,
         sendMessage,
         onClipboardData,
         onClipboardHistory,
         onNotepadEvent,
         onP2PEvent,
         shareFile,
+        shareFileDesktop,
         requestFile,
+        setupDesktopEventListeners,
         HTTP_URL
     }
 })
+

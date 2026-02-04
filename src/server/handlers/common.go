@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log"
 	"quiclink-server/store"
 )
 
@@ -23,6 +24,7 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 			content, _ := payload["content"].(string)
 
 			if id != "" {
+				log.Printf("📝 Notepad update received: id=%s, title=%s", id, title)
 				room.UpdateNote(id, title, content)
 				// Broadcast the original message to others
 				room.Broadcast(msg, conn)
@@ -40,9 +42,15 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 			}
 		}
 
-	// --- 剪切板同步 (Clipboard) ---
 	case "clipboard_push":
 		// Web/Host 发送了新文本 -> 广播给对面
+		if payload, ok := msg.Payload.(map[string]interface{}); ok {
+			if text, ok := payload["text"].(string); ok {
+				room.AddClipboardItem(text)
+				// Log success
+				log.Printf("💾 Saved clipboard item. History Total: %d", len(room.ClipboardHistory))
+			}
+		}
 		room.Broadcast(msg, conn)
 
 	case "clipboard_pull":
@@ -84,10 +92,12 @@ func SendInitState(room *store.Room, conn store.Connection, roomId string) error
 	initMsg := Message{
 		Type: "init",
 		Payload: map[string]interface{}{
-			"room_id":  roomId,
-			"hostInfo": room.HostInfo,
-			"notes":    notesList,
+			"room_id":          roomId,
+			"hostInfo":         room.HostInfo,
+			"notes":            notesList,
+			"clipboardHistory": room.ClipboardHistory,
 		},
 	}
+	log.Printf("📤 Sending Init State to client. History Size: %d", len(room.ClipboardHistory))
 	return conn.WriteJSON(initMsg)
 }

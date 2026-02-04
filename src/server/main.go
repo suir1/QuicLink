@@ -31,58 +31,83 @@ func main() {
 	// 加载配置
 	config.LoadConfig()
 
-	// 检查并生成证书
+	port := fmt.Sprintf("%d", config.Current.Port)
+
+	// 检查并生成证书 (仅 HTTPS 模式需要)
 	certFile := "cert.pem"
 	keyFile := "key.pem"
-	if _, err := os.Stat(certFile); os.IsNotExist(err) {
-		fmt.Println("🔒 Generating self-signed certificate...")
-		if err := generateSelfSignedCert(certFile, keyFile); err != nil {
-			log.Fatalf("Failed to generate cert: %v", err)
+	if config.Current.UseHTTPS {
+		if _, err := os.Stat(certFile); os.IsNotExist(err) {
+			fmt.Println("🔒 Generating self-signed certificate...")
+			if err := generateSelfSignedCert(certFile, keyFile); err != nil {
+				log.Fatalf("Failed to generate cert: %v", err)
+			}
 		}
-	}
 
-	// 计算证书 Hash
-	if err := computeCertHash(certFile); err != nil {
-		log.Printf("⚠️ Failed to compute cert hash: %v", err)
+		// 计算证书 Hash
+		if err := computeCertHash(certFile); err != nil {
+			log.Printf("⚠️ Failed to compute cert hash: %v", err)
+		}
 	}
 
 	// 静态文件
 	fs := http.FileServer(http.Dir("./dist"))
 	http.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 告诉浏览器支持 HTTP/3
-		w.Header().Add("Alt-Svc", `h3=":8080"; ma=2592000`)
+		if config.Current.UseHTTPS {
+			w.Header().Add("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
+		}
 		fs.ServeHTTP(w, r)
 	}))
 	http.Handle("/files/", http.StripPrefix("/files/", http.FileServer(http.Dir(handlers.UploadDir))))
 
 	// API
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Add("Alt-Svc", `h3=":8080"; ma=2592000`)
+		if config.Current.UseHTTPS {
+			w.Header().Add("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
+		}
 		handlers.HandleWebSocket(w, r)
 	})
 	http.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Add("Alt-Svc", `h3=":8080"; ma=2592000`)
+		if config.Current.UseHTTPS {
+			w.Header().Add("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
+		}
 		handlers.HandleUpload(w, r)
 	})
 
-	// WebTransport endpoint
+	// WebTransport endpoint (仅 HTTPS 模式)
 	http.HandleFunc("/wt", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Add("Alt-Svc", `h3=":8080"; ma=2592000`)
+		if !config.Current.UseHTTPS {
+			http.Error(w, "WebTransport requires HTTPS mode", http.StatusBadRequest)
+			return
+		}
+		w.Header().Add("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
 		handlers.HandleWebTransport(w, r)
 	})
 
 	http.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Add("Alt-Svc", `h3=":8080"; ma=2592000`)
-		json.NewEncoder(w).Encode(map[string]string{
+		if config.Current.UseHTTPS {
+			w.Header().Add("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
 			"mode":     config.Current.AppMode,
-			"proto":    r.Proto, // 返回当前协议版本 (HTTP/1.1, HTTP/2, HTTP/3)
+			"proto":    r.Proto,
+			"https":    config.Current.UseHTTPS,
 			"certHash": CertHash,
 		})
 	})
 
-	port := "8080"
+	// HTTP 模式 (无 TLS)
+	if !config.Current.UseHTTPS {
+		fmt.Printf("🚀 Server Running in [%s] mode on http://localhost:%s (HTTP only)\n", config.Current.AppMode, port)
+		if err := http.ListenAndServe(":"+port, nil); err != nil {
+			log.Fatalf("❌ HTTP Server error: %v", err)
+		}
+		return
+	}
+
+	// HTTPS 模式 (TLS + HTTP/3)
 	fmt.Printf("🚀 Server Running in [%s] mode on https://localhost:%s (HTTP/3 + HTTP/2)\n", config.Current.AppMode, port)
 
 	var wg sync.WaitGroup
@@ -101,20 +126,19 @@ func main() {
 	}
 
 	// 1. 初始化 WebTransport Server
-	// 必须在启动前设置 H3 和 Handler
 	handlers.WTServer = &webtransport.Server{
 		H3: &http3.Server{
 			Addr:            ":" + port,
 			Handler:         http.DefaultServeMux,
 			TLSConfig:       tlsConfig,
-			EnableDatagrams: true, // WebTransport 需要 HTTP/3 Datagrams 支持
+			EnableDatagrams: true,
 		},
 		CheckOrigin: func(r *http.Request) bool {
-			return true // 允许所有来源 (开发环境)
+			return true
 		},
 	}
 
-	// 2. 启动 HTTP/3 (UDP) - 使用 WebTransport Server 的 ListenAndServeTLS
+	// 2. 启动 HTTP/3 (UDP)
 	go func() {
 		defer wg.Done()
 		if err := handlers.WTServer.ListenAndServeTLS(certFile, keyFile); err != nil {
@@ -122,7 +146,7 @@ func main() {
 		}
 	}()
 
-	// 2. 启动 HTTPS (TCP)
+	// 3. 启动 HTTPS (TCP)
 	go func() {
 		defer wg.Done()
 		if err := http.ListenAndServeTLS(":"+port, certFile, keyFile, nil); err != nil {
