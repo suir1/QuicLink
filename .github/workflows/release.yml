@@ -108,7 +108,7 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: src/desktop/build/bin
         run: |
-          tar -czvf QuicLink-linux.tar.gz QuicLink
+          tar -czvf QuicLink-linux.tar.gz desktop
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
