@@ -5,6 +5,8 @@ QuicLink allows real-time synchronization of **Clipboard**, **Notepad**, and **F
 
 **Current Status:** Active Development (Beta).
 
+---
+
 ## ✨ Features
 
 - **Real-time Clipboard Sync**: Copy on one device, paste on another instantly.
@@ -14,34 +16,59 @@ QuicLink allows real-time synchronization of **Clipboard**, **Notepad**, and **F
     - **Web**: Access via any modern browser (Chrome/Edge recommended for HTTP/3).
     - **Desktop**: Native-like experience on Windows, macOS, and Linux (via Wails).
 
-## 🏗️ Architecture
+## 🚀 Installation & Usage
 
-The project utilizes a modern hybrid architecture:
+### 📦 Desktop Client (Windows / macOS / Linux)
 
-- **Server (`src/server`)**:
-    - **Language**: Go (Golang)
-    - **Role**: Signaling server, room management, and WebTransport gateway.
-    - **Protocol**: HTTP/3 (QUIC) + WebSocket (Fallback).
-- **Web Frontend (`src/web`)**:
-    - **Framework**: Vue 3 + TypeScript + Vite + Element Plus.
-    - **Role**: Browser-based client.
-- **Desktop Client (`src/desktop`)**:
-    - **Framework**: [Wails](https://wails.io) (Go + Vue 3).
-    - **Role**: Native desktop application with system integration (Clipboard access).
+1.  **Download**: Go to the [Releases](../../releases) page and download the client for your OS.
+    -   **Windows**: `.zip` (Extract and run `QuicLink.exe`)
+    -   **macOS**: `.zip` (Extract and run `QuicLink.app`)
+    -   **Linux**: `.tar.gz` (Extract and run `QuicLink`)
+2.  **Configuration**:
+    -   On first launch, click the **Settings (⚙️)** icon in the top toolbar to configure your server address.
+    -   Default: `localhost:8080` (If you are running your own server).
+3.  **Connection**:
+    -   **Public Mode**: Enter any room name (e.g., `my-room`) or generate a random one to join.
+    -   **Private Mode**: If the server is in private mode, you will be prompted for a password.
 
-## 📂 Project Structure
+### 🌐 Web Client
 
-```text
-QuicLink/
-├── src/
-│   ├── server/      # Go Signaling Server
-│   ├── web/         # Web Client (Vue 3)
-│   └── desktop/     # Desktop Client (Wails application)
-├── .github/         # CI/CD Workflows (GitHub Actions)
-└── go.work          # Go Workspace
-```
+1.  Access the web client via your browser: `https://your-server-domain.com`.
+2.  If running locally: `http://localhost:5173`.
+3.  **Room Access**:
+    -   Enter a room name to join.
+    -   You can also use a direct link: `https://your-server-domain.com/#/my-room`.
 
-## 🚀 Getting Started
+### 🖥️ Self-Hosting Server (Go)
+
+You can run your own QuicLink server for complete privacy and control.
+
+#### Option 1: Run from Source
+
+1.  **Prerequisites**: Go 1.21+
+2.  **Clone & Run**:
+    ```bash
+    git clone https://github.com/your-repo/QuicLink.git
+    cd QuicLink/src/server
+    go run .
+    ```
+3.  **Configuration**:
+    The server looks for `config.json` in the working directory.
+    Example `config.json`:
+    ```json
+    {
+      "host": "0.0.0.0",
+      "port": 8080,
+      "mode": "public",  // "public" or "private"
+      "password": "your-secret-password", // Required if mode is "private"
+      "cert_file": "./cert.pem", // SSL Cert (Optional for localhost, Required for Public WebTransport)
+      "key_file": "./key.pem"    // SSL Key
+    }
+    ```
+
+#### Option 2: Docker (Coming Soon)
+
+## 🛠️ Development
 
 ### Prerequisites
 
@@ -49,41 +76,32 @@ QuicLink/
 - **Node.js**: 18+
 - **Wails**: `go install github.com/wailsapp/wails/v2/cmd/wails@latest`
 
-### 1. Run Server (Go)
+### Run Locally
 
-```bash
-cd src/server
-go run .
-# Server starts on http://localhost:8080
-```
+1.  **Server**:
+    ```bash
+    cd src/server
+    go run .
+    ```
 
-### 2. Run Web Client
+2.  **Web Client**:
+    ```bash
+    cd src/web
+    npm install
+    npm run dev
+    ```
 
-```bash
-cd src/web
-npm install
-npm run dev
-# Access at http://localhost:5173
-```
+3.  **Desktop Client**:
+    ```bash
+    cd src/desktop
+    wails dev
+    ```
 
-### 3. Run Desktop Client
+## 🏗️ Architecture
 
-```bash
-cd src/desktop
-wails dev
-# Application window will open
-```
-
-## 🛠️ Build & Deploy
-
-This project uses **GitHub Actions** for automated builds:
-
-- **Web**: Built to `src/web/dist`.
-- **Desktop**: Automatically packages native binaries for Windows (`.exe`), macOS (`.app`), and Linux.
-- **Server**: Compiles binaries for multiple architectures.
-
-To trigger a build, simply push to the `main` branch.
-To create a release, push a tag starting with `v` (e.g., `v1.0.0`).
+- **Server (`src/server`)**: Go (HTTP/3 + WebSocket signaling).
+- **Web Frontend (`src/web`)**: Vue 3 + TypeScript + Element Plus.
+- **Desktop Client (`src/desktop`)**: Wails (Go + Vue 3).
 
 ## 📜 License
 
