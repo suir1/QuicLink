@@ -38,8 +38,8 @@ func main() {
 	port := fmt.Sprintf("%d", config.Current.Port)
 
 	// 检查并生成证书 (仅 HTTPS 模式需要)
-	certFile := "cert.pem"
-	keyFile := "key.pem"
+	certFile := config.Current.CertFile
+	keyFile := config.Current.KeyFile
 	if config.Current.UseHTTPS {
 		if _, err := os.Stat(certFile); os.IsNotExist(err) {
 			fmt.Println("🔒 Generating self-signed certificate...")

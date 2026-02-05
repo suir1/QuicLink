@@ -66,7 +66,45 @@ You can run your own QuicLink server for complete privacy and control.
     }
     ```
 
-#### Option 2: Docker (Coming Soon)
+#### Option 2: Deploy on VPS with Domain & SSL (Recommended)
+
+To use WebTransport over the internet, you **must** use a valid SSL certificate (browser requirement).
+
+1.  **Install Certbot** (Ubuntu/Debian):
+    ```bash
+    sudo apt update
+    sudo apt install certbot
+    ```
+
+2.  **Generate Certificate**:
+    Replace `your-domain.com` with your actual domain.
+    ```bash
+    # Stop any running server on port 80 first
+    sudo certbot certonly --standalone -d your-domain.com
+    ```
+    This will generate certificates in `/etc/letsencrypt/live/your-domain.com/`.
+
+3.  **Configure Server**:
+    Update `config.json` to point to your new certificates.
+    *Note: You may need to copy the certs to your app directory if permission issues arise, or run the server with appropriate read permissions.*
+
+    ```bash
+    # Example: Copy certs to current directory (Automation recommended for renewals)
+    sudo cp /etc/letsencrypt/live/your-domain.com/fullchain.pem ./cert.pem
+    sudo cp /etc/letsencrypt/live/your-domain.com/privkey.pem ./key.pem
+    sudo chown $USER:$USER cert.pem key.pem
+    ```
+
+    Or update `config.json` directly if permissions allow:
+    ```json
+    {
+      "port": 8080,
+      "cert_file": "/etc/letsencrypt/live/your-domain.com/fullchain.pem",
+      "key_file": "/etc/letsencrypt/live/your-domain.com/privkey.pem"
+    }
+    ```
+
+#### Option 3: Docker (Coming Soon)
 
 ## 🛠️ Development
 

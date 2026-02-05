@@ -12,6 +12,8 @@ type Config struct {
 	UseHTTPS      bool   `json:"use_https"`      // 是否使用 HTTPS (默认 true)
 	Port          int    `json:"port"`           // 服务端口 (默认 8080)
 	RoomTTLHours  int    `json:"room_ttl_hours"` // Public 模式房间存活时间 (默认 48)
+	CertFile      string `json:"cert_file"`      // TLS 证书路径 (默认 cert.pem)
+	KeyFile       string `json:"key_file"`       // TLS 私钥路径 (默认 key.pem)
 
 	Limits struct {
 		MaxUploadSizeMB      int64 `json:"max_upload_size_mb"`
@@ -51,6 +53,12 @@ func LoadConfig() {
 	if Current.RoomTTLHours == 0 {
 		Current.RoomTTLHours = 48 // 默认 2 天
 	}
+	if Current.CertFile == "" {
+		Current.CertFile = "cert.pem"
+	}
+	if Current.KeyFile == "" {
+		Current.KeyFile = "key.pem"
+	}
 
 	protocol := "HTTP"
 	if Current.UseHTTPS {
@@ -66,6 +74,8 @@ func createDefaultConfig() {
 		UseHTTPS:     true, // 默认启用 HTTPS
 		Port:         8080,
 		RoomTTLHours: 48, // 默认 2 天
+		CertFile:     "cert.pem",
+		KeyFile:      "key.pem",
 		Limits: struct {
 			MaxUploadSizeMB      int64 `json:"max_upload_size_mb"`
 			FileRetentionMinutes int   `json:"file_retention_minutes"`
