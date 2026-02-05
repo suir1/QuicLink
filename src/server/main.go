@@ -22,6 +22,7 @@ import (
 
 	"quiclink-server/config"
 	"quiclink-server/handlers"
+	"quiclink-server/store"
 
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
@@ -30,6 +31,9 @@ import (
 func main() {
 	// 加载配置
 	config.LoadConfig()
+
+	// 启动房间清理任务 (Public 模式有效)
+	store.StartCleanupLoop()
 
 	port := fmt.Sprintf("%d", config.Current.Port)
 

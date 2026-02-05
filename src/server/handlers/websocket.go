@@ -24,6 +24,7 @@ var upgrader = websocket.Upgrader{
 }
 
 func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	log.Printf("🔌 WebSocket Incoming Request from %s | Room: %s", r.RemoteAddr, r.URL.Query().Get("room"))
 	// ---------------------------------------------------------
 	// 1. 安全鉴权 (Private Mode Check)
 	// ---------------------------------------------------------
@@ -50,7 +51,14 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// 3. 房间处理 (Room Management)
 	// ---------------------------------------------------------
 	// 获取房间ID，默认为 "public"
+	// 获取房间ID，默认为 "public"
 	roomId := r.URL.Query().Get("room")
+
+	// Private 模式下强制使用单一房间
+	if config.Current.AppMode == "private" {
+		roomId = "root"
+	}
+
 	if roomId == "" {
 		roomId = "public"
 	}

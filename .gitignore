@@ -38,6 +38,9 @@ go.work
 *.out
 *.app
 src/server/quic-server
+src/server/server
+src/desktop/QuicLink
+*.log
 
 # Qt Generated Files
 # *.qrc should NOT be ignored (source files)

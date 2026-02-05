@@ -6,9 +6,10 @@ const router = createRouter({
   history: createWebHashHistory(),
   routes: [
     {
-      // Root redirects to default room
+      // Root renders HomeView directly (Lobby if no room param)
       path: '/',
-      redirect: '/public'
+      name: 'root',
+      component: HomeView
     },
     {
       // Dynamic room path

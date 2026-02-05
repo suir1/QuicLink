@@ -20,7 +20,7 @@ declare global {
                     SendClipboard(): Promise<void>
 
                     // WebSocket Signaling
-                    Connect(host: string, roomID: string, useHTTPS: boolean): Promise<void>
+                    Connect(host: string, roomID: string, password?: string): Promise<void>
                     Disconnect(): Promise<void>
                     GetConnectionStatus(): Promise<boolean>
                     SendGenericMessage(msgType: string, payload: Record<string, unknown>): Promise<void>
@@ -64,9 +64,9 @@ export const wails = {
     },
 
     // Signaling (WebSocket)
-    async connect(host: string, roomID: string, useHTTPS: boolean = false): Promise<void> {
+    async connect(host: string, roomID: string, password?: string): Promise<void> {
         if (!isWails()) return
-        return window.go.main.App.Connect(host, roomID, useHTTPS)
+        return window.go.main.App.Connect(host, roomID, password || '') // Go bindings likely expect string for now, will verify main.go
     },
 
     async disconnect(): Promise<void> {

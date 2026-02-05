@@ -48,7 +48,7 @@ You can run your own QuicLink server for complete privacy and control.
 1.  **Prerequisites**: Go 1.21+
 2.  **Clone & Run**:
     ```bash
-    git clone https://github.com/your-repo/QuicLink.git
+    git clone https://github.com/suir1/QuicLink.git
     cd QuicLink/src/server
     go run .
     ```

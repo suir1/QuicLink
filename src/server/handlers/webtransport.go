@@ -37,6 +37,7 @@ func (c *WebTransportClient) ReadJSON(v interface{}) error {
 }
 
 func HandleWebTransport(w http.ResponseWriter, r *http.Request) {
+	log.Printf("🚄 WebTransport Incoming Request from %s", r.RemoteAddr)
 	if WTServer == nil {
 		log.Printf("❌ WebTransport Server not initialized")
 		w.WriteHeader(500)
@@ -79,6 +80,12 @@ func HandleWebTransport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	roomId := r.URL.Query().Get("room")
+
+	// Private 模式下强制使用单一房间
+	if config.Current.AppMode == "private" {
+		roomId = "root"
+	}
+
 	if roomId == "" {
 		roomId = "public"
 	}
@@ -94,18 +101,23 @@ func HandleWebTransport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 6. 消息循环
+	log.Printf("📥 Starting WT Read Loop for client %s", r.RemoteAddr)
 	for {
 		var msg Message
 		err := client.ReadJSON(&msg)
 		if err != nil {
 			if err != io.EOF {
-				// log.Printf("⚠️ WT Read error: %v", err)
+				log.Printf("⚠️ WT Read error: %v", err)
+			} else {
+				log.Printf("🔌 WT Client disconnected (EOF)")
 			}
 			break
 		}
 
 		if !ProcessMessage(room, client, msg) {
+			log.Printf("🛑 ProcessMessage returned false")
 			break
 		}
 	}
+	log.Printf("👋 WT Handler Finished for %s", r.RemoteAddr)
 }

@@ -27,6 +27,7 @@ type Room struct {
 	// --- 新增：记事本功能 ---
 	Notes      map[string]*Note // 存储多标签记事本 (ID -> Note)
 	LastUpdate time.Time        // 最后活动时间 (可用于后续清理非活跃房间)
+	CreatedAt  time.Time        // 创建时间 (用于 Public 模式 TTL)
 
 	// --- 新增：剪贴板历史 ---
 	ClipboardHistory []ClipboardItem
@@ -75,6 +76,7 @@ func GetOrCreateRoom(roomId string) *Room {
 		Notes:            make(map[string]*Note),
 		ClipboardHistory: make([]ClipboardItem, 0),
 		LastUpdate:       time.Now(),
+		CreatedAt:        time.Now(),
 	}
 
 	// 初始化一个默认笔记
@@ -181,8 +183,9 @@ func (r *Room) Broadcast(msg interface{}, sender Connection) {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 
-	// log.Printf("📢 Broadcasting to %d clients in room %s", len(r.Clients), r.ID)
+	log.Printf("📢 Broadcasting [Message=%+v] to %d clients in room %s", msg, len(r.Clients), r.ID)
 
+	i := 0
 	for client := range r.Clients {
 		// 如果指定了 sender，且当前 client 就是 sender，则跳过
 		if sender != nil && client == sender {
@@ -191,11 +194,14 @@ func (r *Room) Broadcast(msg interface{}, sender Connection) {
 
 		err := client.WriteJSON(msg)
 		if err != nil {
-			log.Printf("❌ Broadcast error: %v", err)
+			log.Printf("❌ Broadcast error to client[%d]: %v", i, err)
 			client.Close()
 			// 注意：这里不能直接 delete，因为我们在遍历 map
 			// 实际生产中可以收集 error clients 并在循环外删除，或者依赖 Leave 机制
+		} else {
+			// log.Printf("✅ Broadcast success to client[%d]", i)
 		}
+		i++
 	}
 }
 

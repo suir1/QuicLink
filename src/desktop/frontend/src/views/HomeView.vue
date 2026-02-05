@@ -1,90 +1,108 @@
 <script setup lang="ts">
-import { CopyDocument, Loading, Moon, Sunny } from '@element-plus/icons-vue'
+import { CopyDocument, InfoFilled, Loading, Moon, Setting, Sunny, SwitchButton } from '@element-plus/icons-vue'
 import { useDark, useToggle } from '@vueuse/core'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import QrcodeVue from 'qrcode.vue'
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useConnectionStore } from '../stores/connection'
 
 // 暗黑模式
 const isDark = useDark()
 const toggleDark = useToggle(isDark)
 
-// 引入功能组件 (请确保这些文件存在于 components 目录下)
+// 引入功能组件
 import ClipboardCard from '../components/ClipboardCard.vue'
 import FilePanel from '../components/FilePanel.vue'
 import NotepadPanel from '../components/NotepadPanel.vue'
 import P2PFilePanel from '../components/P2PFilePanel.vue'
 
 const route = useRoute()
+const router = useRouter()
 const conn = useConnectionStore()
-const currentUrl = computed(() => window.location.href)
+// Make currentUrl reactive by depending on route.fullPath
+const currentUrl = computed(() => {
+  // Access route.fullPath to trigger reactivity
+  const _ = route.fullPath
+  // Construct the URL manually or use window.location.href (which should stay in sync with router checks)
+  // Since we use Hash mode in desktop, window.location.href is correct, but needs the trigger.
+  return window.location.href
+})
 
-// 子组件引用 (用于调用子组件的方法)
+// Server Configuration State
+const savedHost = localStorage.getItem('custom_server_host')
+const serverHost = ref(savedHost || import.meta.env.VITE_VPS_HOST || 'localhost:8080')
+const showSettings = ref(false)
+
+function saveSettings() {
+  if (!serverHost.value) {
+    ElMessage.warning('服务器地址不能为空')
+    return
+  }
+  localStorage.setItem('custom_server_host', serverHost.value)
+  showSettings.value = false
+  ElMessage.success({ message: '设置已保存，正在重连...', duration: 2000 })
+  joinRoom()
+}
+
+// 子组件引用
 const clipboardRef = ref()
 const notepadRef = ref()
 
 onMounted(async () => {
-  // 1. 注册 Store 的回调函数 -> 绑定到子组件的方法上
-  // 当 Store 收到消息时，会调用这些函数更新 UI
   conn.onClipboardData = (text) => {
     clipboardRef.value?.updateText(text)
   }
 
-  // Setup desktop event listeners if in Wails
-  conn.setupDesktopEventListeners()
-
-  // 2. 检查服务器模式并加入
+  // Check mode and join
   try {
     const mode = await conn.checkMode()
     if (mode === 'public') {
-      joinRoom()
+      // Public Mode: Join only if roomId is present (e.g. deep link?), otherwise show lobby
+      // Note: In Wails, deep links might need extra handling, but for now we rely on user input in Lobby
+      if (route.params.roomId) {
+        joinRoom()
+      } else {
+        console.log("📍 Public Lobby: Waiting for user to select room. route.params.roomId is:", route.params.roomId)
+        ElMessage.info(`Public Lobby (RoomID: ${route.params.roomId || 'None'})`)
+      }
     } else if (mode === 'private') {
+      console.log("🔒 Private Mode detected")
+      // Private Mode: Join directly (root room)
       promptPassword()
     }
   } catch (e) {
-    // 桌面端: Go 后端处理 TLS，不需要用户信任证书
-    if (conn.isDesktop) {
-      ElMessage.error('无法连接到服务器，请检查服务器是否启动')
-      return
-    }
-
-    // Web 端: 提示用户信任证书
-    ElMessageBox.confirm(
-      '无法连接到服务器。如果是自签名证书，请点击下方链接并在浏览器中选择 "继续前往" 或 "信任此证书"，然后刷新本页。',
-      '连接失败',
-      {
-        confirmButtonText: '去信任证书',
-        cancelButtonText: '重试',
-        type: 'warning',
-        center: true
-      }
-    ).then(() => {
-      // 在新标签页打开 API 地址
-      window.open(`${conn.HTTP_URL}/api/info`, '_blank')
-    }).catch(() => {
-      location.reload()
-    })
+      console.error(e)
+      ElMessage.error('无法连接到服务器')
   }
 })
 
-// 监听 URL 变化 (仅公共模式下允许随意切换房间)
-watch(() => route.params.roomId, () => {
-  if (conn.serverMode === 'public') joinRoom()
+// 监听 URL 变化
+watch(() => route.params.roomId, (newId) => {
+  if (conn.serverMode === 'public' && newId) joinRoom()
 })
 
 // 加入房间逻辑
 function joinRoom() {
   const roomId = (route.params.roomId as string) || 'public'
 
-  // Use desktop connect method if in Wails
   if (conn.isDesktop) {
-    const host = import.meta.env.VITE_VPS_HOST || 'localhost:8080'
-    conn.connectDesktop(host, roomId)
+    conn.connectDesktop(serverHost.value, roomId)
   } else {
     conn.connect(roomId)
   }
+}
+
+// Manual Join (Lobby)
+const lobbyRoomId = ref('')
+function enterLobbyRoom() {
+  if (!lobbyRoomId.value) return
+  router.push(`/${lobbyRoomId.value}`)
+}
+
+function enterRandomRoom() {
+  const randomId = Math.random().toString(36).substring(2, 8)
+  router.push(`/${randomId}`)
 }
 
 // 密码输入弹窗 (私有模式)
@@ -98,13 +116,30 @@ function promptPassword() {
     showCancelButton: false
   })
   .then((data: any) => {
-    // 私有模式下房间名不重要，统一用 'root'
-    conn.connect('root', data.value)
+    // Desktop or Web connection handled in connect/connectDesktop
+    if (conn.isDesktop) {
+        conn.connectDesktop(serverHost.value, 'root', data.value)
+    } else {
+        conn.connect('root', data.value)
+    }
   })
   .catch(() => {
     ElMessage.warning('必须输入密码才能使用')
   })
 }
+
+// 退出房间
+function leaveRoom() {
+  conn.disconnect()
+  // conn.currentRoom is cleared by disconnect/closeConnection logic inside store?
+  // Actually check stored: closeConnection sets isConnected=false, but currentRoom might persist.
+  // Ideally reset it. But store doesn't export setter. 'currentRoom' is ref, so it's mutable if returned.
+  // Checking store return... Yes, currentRoom is returned as ref.
+  conn.currentRoom = ''
+  router.push('/')
+}
+
+
 
 // 复制当前页面链接
 function copyLink() {
@@ -129,6 +164,13 @@ function copyLink() {
           </el-tag>
         </div>
 
+        <!-- Setting Button -->
+        <div class="toolbar-item settings-section">
+           <el-tooltip content="服务器设置" placement="bottom">
+             <el-button :icon="Setting" circle size="small" @click="showSettings = true" />
+           </el-tooltip>
+        </div>
+
         <!-- QR码 -->
         <div class="toolbar-item qr-section">
           <qrcode-vue :value="currentUrl" :size="60" level="M" background="#ffffff" foreground="#000000"/>
@@ -151,6 +193,13 @@ function copyLink() {
             </template>
           </el-input>
         </div>
+
+        <!-- 退出房间 (仅在连接状态且在桌面端或公共模式下显示) -->
+        <div class="toolbar-item exit-section" v-if="conn.isConnected">
+          <el-button type="danger" :icon="SwitchButton" circle size="small" @click="leaveRoom" title="退出房间/断开连接" />
+        </div>
+
+
 
         <!-- 主题切换 -->
         <div class="toolbar-item theme-section">
@@ -185,10 +234,59 @@ function copyLink() {
       </div>
     </template>
 
+    <!-- Lobby UI (Public Mode, No Room Selected) -->
+    <div v-else-if="conn.serverMode === 'public' && !route.params.roomId" class="lobby-state">
+      <h2>🌐 QuicLink Public Server</h2>
+      <p>Create or join a temporary room to start sharing.</p>
+
+      <div class="lobby-actions">
+        <el-input
+          v-model="lobbyRoomId"
+          placeholder="Enter Room Name..."
+          class="lobby-input"
+          @keyup.enter="enterLobbyRoom"
+        >
+          <template #append>
+            <el-button @click="enterLobbyRoom">Enter</el-button>
+          </template>
+        </el-input>
+
+        <div class="divider">OR</div>
+
+        <el-button type="primary" size="large" round @click="enterRandomRoom">
+          🎲 Create Random Room
+        </el-button>
+      </div>
+
+      <div class="lobby-footer">
+        <el-icon><InfoFilled /></el-icon>
+        Rooms are ephemeral and will be destroyed after 48h of inactivity.
+      </div>
+    </div>
+
     <div v-else class="loading-state">
       <el-icon class="is-loading" :size="40" color="#409eff"><Loading /></el-icon>
       <p>正在尝试连接服务器...</p>
     </div>
+
+    <!-- Settings Dialog -->
+    <el-dialog v-model="showSettings" title="服务器设置" width="400px" append-to-body>
+      <el-form label-position="top">
+        <el-form-item label="服务器地址">
+          <el-input v-model="serverHost" placeholder="例如: 192.168.1.100:8080 或 example.com" @keyup.enter="saveSettings">
+          </el-input>
+          <div style="font-size: 12px; color: #909399; margin-top: 5px;">
+             支持 IP:Port 或域名。客户端会自动适配 HTTP/HTTPS。
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <span class="dialog-footer">
+          <el-button @click="showSettings = false">取消</el-button>
+          <el-button type="primary" @click="saveSettings">保存并重连</el-button>
+        </span>
+      </template>
+    </el-dialog>
 
   </div>
 </template>
@@ -400,5 +498,68 @@ html.dark .qr-section :deep(canvas) { /* qrcode-vue renders canvas */
 
 html.dark .qr-label {
   color: var(--el-text-color-secondary);
+}
+
+/* Lobby Styles */
+.lobby-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 80vh;
+  text-align: center;
+}
+
+.lobby-state h2 {
+  font-size: 2rem;
+  margin-bottom: 10px;
+  background: linear-gradient(120deg, #409eff, #00c6ff);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.lobby-state p {
+  color: var(--el-text-color-secondary);
+  margin-bottom: 40px;
+}
+
+.lobby-actions {
+  width: 100%;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.lobby-input .el-input__wrapper {
+  padding: 5px 15px;
+  border-radius: 20px 0 0 20px;
+}
+
+.divider {
+  color: var(--el-text-color-placeholder);
+  font-size: 14px;
+  position: relative;
+  margin: 10px 0;
+}
+.divider::before, .divider::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  width: 45%;
+  height: 1px;
+  background: var(--el-border-color-light);
+}
+.divider::before { left: 0; }
+.divider::after { right: 0; }
+
+.lobby-footer {
+  margin-top: 60px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  opacity: 0.8;
 }
 </style>

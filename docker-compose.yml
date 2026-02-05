@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  quiclink:
+    container_name: quiclink-server
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      # Map host port 8080 to container port 8080
+      # Change the left number to expose a different port (e.g., "9000:8080")
+      - "8080:8080"
+      - "443:443"
+    volumes:
+      # Mount config file for easy editing (HTTP/HTTPS toggle)
+      - ./src/server/config.json:/app/config.json
+      # Persist uploads
+      - ./uploads:/app/uploads
+    environment:
+      - TZ=Asia/Shanghai

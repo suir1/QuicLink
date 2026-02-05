@@ -8,18 +8,16 @@ import (
 	"io"
 	"log"
 	"sync"
-	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/webtransport-go"
 )
 
 // Node represents a P2P WebTransport client node
 type Node struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
-	conn       *quic.Conn
-	stream     *quic.Stream // Pointer type as returned by OpenStreamSync
+	session    *webtransport.Session
+	stream     *webtransport.Stream
 	mu         sync.Mutex
 	serverHost string
 	roomID     string
@@ -42,37 +40,34 @@ func (n *Node) Connect(host, roomID string) error {
 	n.ctx, n.cancel = context.WithCancel(context.Background())
 
 	// WebTransport URL
-	url := fmt.Sprintf("https://%s/webtransport?room=%s", host, roomID)
+	url := fmt.Sprintf("https://%s/wt?room=%s", host, roomID)
 	log.Printf("🔌 P2P Connecting to: %s", url)
 
-	// TLS config (InsecureSkipVerify for self-signed certs in dev)
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{http3.NextProtoH3},
+	// Configure Dialer with HTTP/3 support
+	// webtransport.Dialer uses TLSClientConfig directly
+	dialer := webtransport.Dialer{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // For self-signed certs in dev
+		},
 	}
 
-	// QUIC config
-	quicConf := &quic.Config{
-		MaxIdleTimeout:  time.Second * 30,
-		KeepAlivePeriod: time.Second * 10,
-	}
-
-	// Dial QUIC connection
-	conn, err := quic.DialAddr(n.ctx, host, tlsConf, quicConf)
+	// Dial WebTransport
+	_, session, err := dialer.Dial(n.ctx, url, nil)
 	if err != nil {
-		return fmt.Errorf("quic dial failed: %w", err)
+		return fmt.Errorf("webtransport dial failed: %w", err)
 	}
-	n.conn = conn
+	n.session = session
 
-	// Open bidirectional stream for signaling
-	stream, err := conn.OpenStreamSync(n.ctx)
+	// Open bidirectional stream for signaling (Control Stream)
+	stream, err := session.OpenStreamSync(n.ctx)
 	if err != nil {
+		session.CloseWithError(0, "stream open failed")
 		return fmt.Errorf("open stream failed: %w", err)
 	}
 	n.stream = stream
 	n.connected = true
 
-	log.Printf("✅ P2P Connected to room: %s", roomID)
+	log.Printf("✅ P2P Connected to room: %s via WebTransport", roomID)
 
 	// Start reading messages
 	go n.readLoop()
@@ -90,22 +85,25 @@ func (n *Node) readLoop() {
 		return
 	}
 
+	defer n.Disconnect()
+
 	decoder := json.NewDecoder(stream)
 	for {
 		var msg map[string]interface{}
 		if err := decoder.Decode(&msg); err != nil {
 			if err == io.EOF {
-				log.Println("🔌 P2P Stream closed")
+				log.Println("🔌 P2P Stream closed (EOF)")
 				return
 			}
+			// Ignore simple close errors
 			log.Printf("❌ P2P Read error: %v", err)
 			return
 		}
 
+		log.Printf("📝 Recevied Message: %+v", msg)
+
 		msgType, _ := msg["type"].(string)
 		payload, _ := msg["payload"].(map[string]interface{})
-
-		log.Printf("📩 P2P Message: %s", msgType)
 
 		if n.onMessage != nil {
 			n.onMessage(msgType, payload)
@@ -127,6 +125,9 @@ func (n *Node) SendMessage(msg interface{}) error {
 		return err
 	}
 
+	// Append newline for Go's decoder if needed, or just write raw JSON
+	// The server's json.Decoder handles stream of JSON objects fine handling whitespace
+	// But adding a newline is a safe delimiter practice
 	_, err = n.stream.Write(append(data, '\n'))
 	return err
 }
@@ -162,21 +163,21 @@ func (n *Node) Disconnect() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	if !n.connected {
+		return
+	}
 	n.connected = false
 
 	if n.cancel != nil {
 		n.cancel()
 	}
 
-	if n.stream != nil {
-		n.stream.Close()
-		n.stream = nil
+	if n.session != nil {
+		n.session.CloseWithError(0, "client disconnected")
+		n.session = nil
 	}
+	n.stream = nil
 
-	if n.conn != nil {
-		n.conn.CloseWithError(0, "closed")
-		n.conn = nil
-	}
 	log.Println("🔌 P2P Disconnected")
 }
 

@@ -11,6 +11,7 @@ type Config struct {
 	AdminPassword string `json:"admin_password"` // 私有模式必填
 	UseHTTPS      bool   `json:"use_https"`      // 是否使用 HTTPS (默认 true)
 	Port          int    `json:"port"`           // 服务端口 (默认 8080)
+	RoomTTLHours  int    `json:"room_ttl_hours"` // Public 模式房间存活时间 (默认 48)
 
 	Limits struct {
 		MaxUploadSizeMB      int64 `json:"max_upload_size_mb"`
@@ -47,20 +48,24 @@ func LoadConfig() {
 	if Current.Port == 0 {
 		Current.Port = 8080
 	}
+	if Current.RoomTTLHours == 0 {
+		Current.RoomTTLHours = 48 // 默认 2 天
+	}
 
 	protocol := "HTTP"
 	if Current.UseHTTPS {
 		protocol = "HTTPS"
 	}
-	log.Printf("⚙️  Loaded Config | Mode: %s | %s | Port: %d | Upload: %dMB",
-		Current.AppMode, protocol, Current.Port, Current.Limits.MaxUploadSizeMB)
+	log.Printf("⚙️  Loaded Config | Mode: %s | %s | Port: %d | Upload: %dMB | RoomTTL: %dh",
+		Current.AppMode, protocol, Current.Port, Current.Limits.MaxUploadSizeMB, Current.RoomTTLHours)
 }
 
 func createDefaultConfig() {
 	defaultCfg := Config{
-		AppMode:  "public",
-		UseHTTPS: true, // 默认启用 HTTPS
-		Port:     8080,
+		AppMode:      "public",
+		UseHTTPS:     true, // 默认启用 HTTPS
+		Port:         8080,
+		RoomTTLHours: 48, // 默认 2 天
 		Limits: struct {
 			MaxUploadSizeMB      int64 `json:"max_upload_size_mb"`
 			FileRetentionMinutes int   `json:"file_retention_minutes"`

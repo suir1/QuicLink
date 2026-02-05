@@ -38,7 +38,8 @@ type RoomData struct {
 	History []ClipboardItem `json:"history"`
 
 	// --- Quic Room 数据 (信令转发) ---
-	HostInfo *QuicHostInfo `json:"hostInfo,omitempty"`
+	HostInfo  *QuicHostInfo `json:"hostInfo,omitempty"`
+	CreatedAt int64         `json:"createdAt"` // 创建时间戳
 
 	// --- 内部连接管理 (不导出到 JSON) ---
 	Clients map[*websocket.Conn]bool `json:"-"`

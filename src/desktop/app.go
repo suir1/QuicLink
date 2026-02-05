@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/url"
 	"sync"
@@ -18,20 +19,22 @@ import (
 
 // App struct
 type App struct {
-	ctx          context.Context
-	conn         *websocket.Conn
-	connMu       sync.Mutex
-	roomID       string
-	serverHost   string
-	lastClipText string
-	p2pNode      *p2p.Node
+	ctx           context.Context
+	conn          *websocket.Conn
+	connMu        sync.Mutex
+	roomID        string
+	serverHost    string
+	lastClipText  string
+	p2pNode       *p2p.Node
+	transportMode string // "ws" or "wt"
 }
 
 // NewApp creates a new App application struct
 func NewApp() *App {
 	return &App{
-		serverHost: "localhost:8080", // Default, can be configured
-		p2pNode:    p2p.NewNode(),
+		serverHost:    "localhost:8080", // Default, can be configured
+		p2pNode:       p2p.NewNode(),
+		transportMode: "none",
 	}
 }
 
@@ -98,57 +101,136 @@ func (a *App) SetClipboard(text string) {
 
 // --- Signaling Module ---
 
-// Connect establishes WebSocket connection to signaling server
-// useHTTPS: true for wss://, false for ws://
-func (a *App) Connect(host, roomID string, useHTTPS bool) error {
+// Connect establishes connection to signaling server (Adaptive: WT -> WSS -> WS)
+func (a *App) Connect(host, roomID, password string) error {
 	a.connMu.Lock()
 	defer a.connMu.Unlock()
 
-	if a.conn != nil {
-		a.conn.Close()
+	// Reset valid connection check
+	if a.transportMode != "none" {
+		a.Disconnect()
 	}
 
 	a.serverHost = host
 	a.roomID = roomID
 
+	// 1. Attempt WebTransport (HTTP/3) - Best Performance
+	log.Printf("🚀 Attempting WebTransport connection to %s...", host)
+	// TODO: Pass password to p2pNode.Connect if supported. For now, we focus on WS fallback or assume header auth?
+	// The current p2p/node.go might need updates too, but let's stick to URL params for consistency.
+	// Assuming p2pNode.Connect handles URL construction internally or we need to pass full URL?
+	// Let's check p2pNode.Connect signature first or just update it here if simple.
+	// Actually, looking at previous steps, we construct WT URL in frontend. In backend Go, p2pNode.Connect(host, room) likely builds it.
+	// For now, let's just update the signature and pass password to WS fallback which we control directly here.
+	err := a.p2pNode.Connect(host, roomID)
+	if err == nil {
+		a.transportMode = "wt"
+		log.Printf("✅ Connected via WebTransport (HTTP/3)")
+
+		// Setup generic message handler
+		a.p2pNode.OnMessage(func(msgType string, payload map[string]interface{}) {
+			a.handleIncomingMessage(msgType, payload)
+		})
+		return nil
+	}
+	log.Printf("⚠️ WebTransport failed: %v", err)
+
+	// 2. Attempt WebSocket Secure (WSS) - HTTPS Fallback
+	log.Printf("🔄 Falling back: Attempting WSS (Secure WebSocket)...")
+	if err := a.connectWebSocket(host, roomID, password, true); err == nil {
+		return nil
+	}
+	log.Printf("⚠️ WSS failed. Falling back to WS...")
+
+	// 3. Attempt WebSocket (WS) - HTTP Fallback
+	log.Printf("🔄 Falling back: Attempting WS (Plain WebSocket)...")
+	if err := a.connectWebSocket(host, roomID, password, false); err == nil {
+		return nil
+	}
+
+	return fmt.Errorf("all connection methods failed")
+}
+
+// Helper: Connect via WebSocket
+func (a *App) connectWebSocket(host, roomID, password string, secure bool) error {
 	scheme := "ws"
-	if useHTTPS {
+	if secure {
 		scheme = "wss"
 	}
 
-	u := url.URL{Scheme: scheme, Host: host, Path: "/ws", RawQuery: "room=" + roomID}
+	query := "room=" + roomID
+	if password != "" {
+		query += "&token=" + password
+	}
+
+	u := url.URL{Scheme: scheme, Host: host, Path: "/ws", RawQuery: query}
 	log.Printf("🔌 Connecting to %s", u.String())
 
-	dialer := websocket.Dialer{}
-	if useHTTPS {
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 5 * time.Second,
+	}
+	if secure {
 		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // Dev only
 	}
 
 	conn, _, err := dialer.Dial(u.String(), nil)
 	if err != nil {
-		log.Printf("❌ WebSocket dial failed: %v", err)
+		log.Printf("❌ %s dial failed: %v", scheme, err)
 		return err
 	}
 
 	a.conn = conn
-	log.Printf("✅ Connected to room: %s", roomID)
+	a.transportMode = "ws"
+	log.Printf("✅ Connected to room (WebSocket %s): %s", scheme, roomID)
 
 	// Start reading messages
 	go a.readMessages()
-
 	return nil
 }
 
-// Disconnect closes the WebSocket connection
+// Disconnect closes the active connection
 func (a *App) Disconnect() {
-	a.connMu.Lock()
-	defer a.connMu.Unlock()
+	// a.connMu.Lock() // Avoid deadlock if called from internal
+	// defer a.connMu.Unlock()
 
-	if a.conn != nil {
+	if a.transportMode == "wt" {
+		a.p2pNode.Disconnect()
+	} else if a.transportMode == "ws" && a.conn != nil {
 		a.conn.Close()
 		a.conn = nil
 	}
+	a.transportMode = "none"
 	log.Println("🔌 Disconnected")
+}
+
+// handleIncomingMessage processes messages from any transport
+func (a *App) handleIncomingMessage(msgType string, payload map[string]interface{}) {
+	switch msgType {
+	case "clipboard_push":
+		if content, ok := payload["text"].(string); ok {
+			log.Printf("📋 Received clipboard: %s", truncate(content, 50))
+			a.SetClipboard(content)
+			runtime.EventsEmit(a.ctx, "clipboard:remote", content)
+		}
+	case "file_offer":
+		// Forward to frontend for display
+		runtime.EventsEmit(a.ctx, "p2p:offer", payload)
+	case "init":
+		// Handle init message - extract and emit clipboard history directly
+		log.Printf("📥 Received init message from server")
+		if history, ok := payload["clipboardHistory"].([]interface{}); ok && len(history) > 0 {
+			log.Printf("📜 Emitting clipboard history to frontend (%d items)", len(history))
+			runtime.EventsEmit(a.ctx, "clipboard:history", history)
+		} else {
+			log.Printf("⚠️ Init payload has no clipboardHistory or it's empty")
+		}
+		// Also forward the whole init for other handlers (notes, hostInfo etc)
+		runtime.EventsEmit(a.ctx, "p2p:message", map[string]interface{}{"type": msgType, "payload": payload})
+	default:
+		// Forward generic messages (init, chat, etc) to frontend
+		log.Printf("📤 Forwarding message to frontend: type=%s", msgType)
+		runtime.EventsEmit(a.ctx, "p2p:message", map[string]interface{}{"type": msgType, "payload": payload})
+	}
 }
 
 // readMessages handles incoming WebSocket messages
@@ -158,7 +240,7 @@ func (a *App) readMessages() {
 		conn := a.conn
 		a.connMu.Unlock()
 
-		if conn == nil {
+		if conn == nil || a.transportMode != "ws" {
 			return
 		}
 
@@ -177,37 +259,20 @@ func (a *App) readMessages() {
 		msgType, _ := msg["type"].(string)
 		payload, _ := msg["payload"].(map[string]interface{})
 
-		switch msgType {
-		case "clipboard_push":
-			if content, ok := payload["text"].(string); ok {
-				log.Printf("📋 Received clipboard: %s", truncate(content, 50))
-				a.SetClipboard(content)
-				runtime.EventsEmit(a.ctx, "clipboard:remote", content)
-			}
-		case "file_offer":
-			// Forward to frontend for display
-			runtime.EventsEmit(a.ctx, "p2p:offer", payload)
-		case "init":
-			// Handle init message - extract and emit clipboard history directly
-			log.Printf("📥 Received init message from server")
-			if history, ok := payload["clipboardHistory"].([]interface{}); ok && len(history) > 0 {
-				log.Printf("📜 Emitting clipboard history to frontend (%d items)", len(history))
-				runtime.EventsEmit(a.ctx, "clipboard:history", history)
-			} else {
-				log.Printf("⚠️ Init payload has no clipboardHistory or it's empty")
-			}
-			// Also forward the whole init for other handlers (notes, hostInfo etc)
-			runtime.EventsEmit(a.ctx, "p2p:message", msg)
-		default:
-			// Forward generic messages (init, chat, etc) to frontend
-			log.Printf("📤 Forwarding message to frontend: type=%s", msgType)
-			runtime.EventsEmit(a.ctx, "p2p:message", msg)
-		}
+		a.handleIncomingMessage(msgType, payload)
 	}
 }
 
-// sendMessage sends a JSON message over WebSocket
+// sendMessage sends a JSON message over the active transport
 func (a *App) sendMessage(msg interface{}) {
+	if a.transportMode == "wt" {
+		if err := a.p2pNode.SendMessage(msg); err != nil {
+			log.Printf("❌ WT Send error: %v", err)
+		}
+		return
+	}
+
+	// Fallback WS
 	a.connMu.Lock()
 	defer a.connMu.Unlock()
 
@@ -217,11 +282,11 @@ func (a *App) sendMessage(msg interface{}) {
 
 	data, _ := json.Marshal(msg)
 	if err := a.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-		log.Printf("❌ Send error: %v", err)
+		log.Printf("❌ WS Send error: %v", err)
 	}
 }
 
-// SendGenericMessage is an exported method for frontend to send any message type through WebSocket
+// SendGenericMessage is an exported method for frontend to send any message type
 func (a *App) SendGenericMessage(msgType string, payload map[string]interface{}) {
 	log.Printf("📤 Frontend sending: %s", msgType)
 	a.sendMessage(map[string]interface{}{
@@ -254,43 +319,36 @@ func truncate(s string, maxLen int) string {
 
 // GetConnectionStatus returns connection state
 func (a *App) GetConnectionStatus() bool {
-	a.connMu.Lock()
-	defer a.connMu.Unlock()
-	return a.conn != nil
+	return a.transportMode != "none"
 }
 
-// Greet is a sample method (can be removed later)
+// Greet is a sample method
 func (a *App) Greet(name string) string {
 	return "Hello " + name + ", Welcome to QuicLink Desktop!"
 }
 
-// --- P2P Module ---
+// --- P2P Module (Legacy Wrapper) ---
 
 // ConnectP2P establishes a WebTransport P2P connection
+// Deprecated: Logic moved to Connect()
 func (a *App) ConnectP2P(host, roomID string) error {
-	// Setup message callback to emit events to frontend
-	a.p2pNode.OnMessage(func(msgType string, payload map[string]interface{}) {
-		runtime.EventsEmit(a.ctx, "p2p:message", map[string]interface{}{
-			"type":    msgType,
-			"payload": payload,
-		})
-	})
-
-	return a.p2pNode.Connect(host, roomID)
+	log.Println("⚠️ ConnectP2P called but is now managed by Connect()")
+	return nil
 }
 
 // DisconnectP2P closes the P2P connection
 func (a *App) DisconnectP2P() {
-	a.p2pNode.Disconnect()
+	// No-op, managed by Disconnect
 }
 
 // GetP2PStatus returns P2P connection status
 func (a *App) GetP2PStatus() bool {
-	return a.p2pNode.IsConnected()
+	return a.transportMode == "wt"
 }
 
 // ShareFileP2P announces a file to other peers
 func (a *App) ShareFileP2P(id, name string, size int64, mimeType string) error {
+	// Pass through sendMessage which handles routing
 	return a.p2pNode.ShareFile(id, name, size, mimeType)
 }
 
@@ -302,14 +360,11 @@ func (a *App) SendP2PHello() error {
 // shutdown is called when the app is closing
 func (a *App) shutdown(ctx context.Context) {
 	a.Disconnect()
-	a.p2pNode.Disconnect()
 }
 
 // beforeClose is called before the app closes
 func (a *App) beforeClose(ctx context.Context) (prevent bool) {
-	// Perform cleanup
 	a.Disconnect()
-	a.p2pNode.Disconnect()
 	time.Sleep(100 * time.Millisecond) // Allow graceful close
 	return false
 }

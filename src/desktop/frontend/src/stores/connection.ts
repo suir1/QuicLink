@@ -46,12 +46,15 @@ export const useConnectionStore = defineStore('connection', () => {
         console.log('🖥️ Running in Wails Desktop Mode')
         ElMessage.info('🖥️ Wails模式已启动，正在注册事件监听器...')
 
-        // Listen for clipboard updates from Go
-        wails.on('clipboard:remote', (text: unknown) => {
+        // Listen for clipboard updates from Go (Remote & Local)
+        const handleClipboardUpdate = (text: unknown) => {
             if (typeof text === 'string' && onClipboardData.value) {
                 onClipboardData.value(text)
             }
-        })
+        }
+
+        wails.on('clipboard:remote', handleClipboardUpdate)
+        wails.on('clipboard:local', handleClipboardUpdate)
 
         // Listen for P2P file offers from Go
         wails.on('p2p:offer', (payload: unknown) => {
@@ -485,22 +488,23 @@ export const useConnectionStore = defineStore('connection', () => {
     }
 
     // --- Desktop-specific methods ---
-    async function connectDesktop(host: string, roomId: string) {
+    async function connectDesktop(host: string, roomId: string, password?: string) {
         if (!isDesktop.value) return
 
         try {
-            // Connect via Go backend (WebSocket signaling)
-            await wails.connect(host, roomId)
+            // Connect via Go backend (Adaptive: WT -> WSS -> WS)
+            await wails.connect(host, roomId, password)
             isConnected.value = true
             currentRoom.value = roomId
 
             // Also connect P2P if available
-            try {
-                await wails.connectP2P(host, roomId)
-                console.log('✅ Desktop P2P connected')
-            } catch (e) {
-                console.warn('P2P connection failed, using signaling only', e)
-            }
+            // Refactor: Logic moved to unified Connect() in app.go
+            // try {
+            //     await wails.connectP2P(host, roomId)
+            //     console.log('✅ Desktop P2P connected')
+            // } catch (e) {
+            //     console.warn('P2P connection failed, using signaling only', e)
+            // }
 
             ElMessage.success(`✅ 桌面端已连接: ${roomId}`)
         } catch (e) {
@@ -538,6 +542,7 @@ export const useConnectionStore = defineStore('connection', () => {
         shareFileDesktop,
         requestFile,
         setupDesktopEventListeners,
+        disconnect: closeConnection, // Export disconnect
         HTTP_URL
     }
 })

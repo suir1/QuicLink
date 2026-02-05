@@ -1,6 +1,6 @@
 import { ElMessage } from 'element-plus'
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 
 export const useConnectionStore = defineStore('connection', () => {
     // --- 状态定义 ---
@@ -19,10 +19,14 @@ export const useConnectionStore = defineStore('connection', () => {
 
     // 环境变量处理
     const VPS_HOST = import.meta.env.VITE_VPS_HOST || 'localhost:8080'
-    // 协议跟随当前页面 (开发用 http, 生产用 https)
-    const PROTOCOL = window.location.protocol // 'http:' or 'https:'
-    const HTTP_URL = `${PROTOCOL}//${VPS_HOST}`
-    const WT_URL = `https://${VPS_HOST}` // WebTransport 仍需 HTTPS
+
+    // 协议判定 (Reactive Auto-Detection)
+    const protocol = ref(window.location.protocol) // Default to current
+    const PROTOCOL = computed(() => protocol.value)
+
+    // Computed URLs based on detected protocol
+    const HTTP_URL = computed(() => `${protocol.value}//${VPS_HOST}`)
+    const WT_URL = computed(() => `https://${VPS_HOST}`) // WebTransport always requires HTTPS/QUIC
 
     // --- 回调函数钩子 ---
     const onClipboardData = ref<((text: string) => void) | null>(null)
@@ -34,10 +38,40 @@ export const useConnectionStore = defineStore('connection', () => {
     const localFiles = ref<Map<string, File>>(new Map())
     const receivingFiles = ref<Map<string, { chunks: string[], total: number, received: number, name: string, type: string }>>(new Map())
 
+    // --- Auto-Detect Protocol ---
+    async function detectProtocol() {
+        const testHosts = [
+            { proto: 'https:', url: `https://${VPS_HOST}/api/info` },
+            { proto: 'http:', url: `http://${VPS_HOST}/api/info` }
+        ]
+
+        console.log("🕵️ Probing server protocol...")
+        for (const test of testHosts) {
+            try {
+                const controller = new AbortController()
+                const timeoutId = setTimeout(() => controller.abort(), 2000)
+
+                const res = await fetch(test.url, { method: 'HEAD', signal: controller.signal })
+                clearTimeout(timeoutId)
+
+                if (res.ok || res.status === 405) { // 405 Method Not Allowed is fine (server is reachable)
+                    console.log(`✅ Detected Server Protocol: ${test.proto}`)
+                    protocol.value = test.proto
+                    return
+                }
+            } catch (e) {
+                // Ignore and try next
+            }
+        }
+        console.warn("⚠️ Protocol detection failed, keeping default:", protocol.value)
+    }
+
     // --- 1. 检查服务器模式 ---
     async function checkMode() {
+        await detectProtocol() // Probe first
+
         try {
-            const res = await fetch(`${HTTP_URL}/api/info`)
+            const res = await fetch(`${HTTP_URL.value}/api/info`)
             if (!res.ok) throw new Error(`HTTP ${res.status}`)
 
             const data = await res.json()
@@ -62,7 +96,7 @@ export const useConnectionStore = defineStore('connection', () => {
         if ('WebTransport' in window) {
             try {
                 console.log(`🚀 Attempting WebTransport to [${roomId}]...`)
-                let url = `${WT_URL}/wt?room=${roomId}`
+                let url = `${WT_URL.value}/wt?room=${roomId}`
                 if (password) url += `&token=${password}`
 
                 const options: any = {}
@@ -121,7 +155,7 @@ export const useConnectionStore = defineStore('connection', () => {
     }
 
     function connectWebSocket(roomId: string, password?: string) {
-        let url = `${HTTP_URL.replace('http', 'ws')}/ws?room=${roomId}`
+        let url = `${HTTP_URL.value.replace('http', 'ws')}/ws?room=${roomId}`
         if (password) url += `&token=${password}`
 
         console.log(`🔄 Attempting WebSocket to [${roomId}]...`)

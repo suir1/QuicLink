@@ -4,13 +4,14 @@ go 1.24
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/quic-go/quic-go v0.59.0
+	github.com/quic-go/webtransport-go v0.10.0
 	github.com/wailsapp/wails/v2 v2.11.0
 	golang.design/x/clipboard v0.7.1
 )
 
 require (
 	github.com/bep/debounce v1.2.1 // indirect
+	github.com/dunglas/httpsfv v1.1.0 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -26,6 +27,7 @@ require (
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
+	github.com/quic-go/quic-go v0.59.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/samber/lo v1.49.1 // indirect
 	github.com/tkrajina/go-reflector v0.5.8 // indirect

@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { CopyDocument, Loading, Moon, Sunny } from '@element-plus/icons-vue'
+import { CopyDocument, InfoFilled, Loading, Moon, Sunny } from '@element-plus/icons-vue'
 import { useDark, useToggle } from '@vueuse/core'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import QrcodeVue from 'qrcode.vue'
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useConnectionStore } from '../stores/connection'
 
 // 暗黑模式
@@ -18,6 +18,7 @@ import NotepadPanel from '../components/NotepadPanel.vue'
 import P2PFilePanel from '../components/P2PFilePanel.vue'
 
 const route = useRoute()
+const router = useRouter()
 const conn = useConnectionStore()
 const currentUrl = computed(() => window.location.href)
 
@@ -37,8 +38,14 @@ onMounted(async () => {
   try {
     const mode = await conn.checkMode()
     if (mode === 'public') {
-      joinRoom()
+      // 公共模式：如果有房间号，直接加入；否则显示大厅
+      if (route.params.roomId) {
+        joinRoom()
+      } else {
+        console.log("📍 Public Lobby: Waiting for user to select room")
+      }
     } else if (mode === 'private') {
+      // 私有模式：不需要房间号，直接加入
       promptPassword()
     }
   } catch (e) {
@@ -62,14 +69,26 @@ onMounted(async () => {
 })
 
 // 监听 URL 变化 (仅公共模式下允许随意切换房间)
-watch(() => route.params.roomId, () => {
-  if (conn.serverMode === 'public') joinRoom()
+watch(() => route.params.roomId, (newId) => {
+  if (conn.serverMode === 'public' && newId) joinRoom()
 })
 
 // 加入房间逻辑
 function joinRoom() {
   const roomId = (route.params.roomId as string) || 'public'
   conn.connect(roomId)
+}
+
+// Manual Join (Lobby)
+const lobbyRoomId = ref('')
+function enterLobbyRoom() {
+  if (!lobbyRoomId.value) return
+  router.push(`/${lobbyRoomId.value}`)
+}
+
+function enterRandomRoom() {
+  const randomId = Math.random().toString(36).substring(2, 8)
+  router.push(`/${randomId}`)
 }
 
 // 密码输入弹窗 (私有模式)
@@ -169,6 +188,38 @@ function copyLink() {
         </div>
       </div>
     </template>
+
+
+
+    <!-- Lobby UI (Public Mode, No Room Selected) -->
+    <div v-else-if="conn.serverMode === 'public' && !route.params.roomId" class="lobby-state">
+      <h2>🌐 QuicLink Public Server</h2>
+      <p>Create or join a temporary room to start sharing.</p>
+
+      <div class="lobby-actions">
+        <el-input
+          v-model="lobbyRoomId"
+          placeholder="Enter Room Name..."
+          class="lobby-input"
+          @keyup.enter="enterLobbyRoom"
+        >
+          <template #append>
+            <el-button @click="enterLobbyRoom">Enter</el-button>
+          </template>
+        </el-input>
+
+        <div class="divider">OR</div>
+
+        <el-button type="primary" size="large" round @click="enterRandomRoom">
+          🎲 Create Random Room
+        </el-button>
+      </div>
+
+      <div class="lobby-footer">
+        <el-icon><InfoFilled /></el-icon>
+        Rooms are ephemeral and will be destroyed after 48h of inactivity.
+      </div>
+    </div>
 
     <div v-else class="loading-state">
       <el-icon class="is-loading" :size="40" color="#409eff"><Loading /></el-icon>
@@ -385,5 +436,68 @@ html.dark .qr-section :deep(canvas) { /* qrcode-vue renders canvas */
 
 html.dark .qr-label {
   color: var(--el-text-color-secondary);
+}
+
+/* Lobby Styles */
+.lobby-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 80vh;
+  text-align: center;
+}
+
+.lobby-state h2 {
+  font-size: 2rem;
+  margin-bottom: 10px;
+  background: linear-gradient(120deg, #409eff, #00c6ff);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.lobby-state p {
+  color: var(--el-text-color-secondary);
+  margin-bottom: 40px;
+}
+
+.lobby-actions {
+  width: 100%;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.lobby-input .el-input__wrapper {
+  padding: 5px 15px;
+  border-radius: 20px 0 0 20px;
+}
+
+.divider {
+  color: var(--el-text-color-placeholder);
+  font-size: 14px;
+  position: relative;
+  margin: 10px 0;
+}
+.divider::before, .divider::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  width: 45%;
+  height: 1px;
+  background: var(--el-border-color-light);
+}
+.divider::before { left: 0; }
+.divider::after { right: 0; }
+
+.lobby-footer {
+  margin-top: 60px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  opacity: 0.8;
 }
 </style>

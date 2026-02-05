@@ -96,6 +96,7 @@ func SendInitState(room *store.Room, conn store.Connection, roomId string) error
 			"hostInfo":         room.HostInfo,
 			"notes":            notesList,
 			"clipboardHistory": room.ClipboardHistory,
+			"createdAt":        room.CreatedAt.Unix(),
 		},
 	}
 	log.Printf("📤 Sending Init State to client. History Size: %d", len(room.ClipboardHistory))
