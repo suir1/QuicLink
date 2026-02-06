@@ -46,7 +46,10 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 		// Web/Host 发送了新文本 -> 广播给对面 (包括发送者自己，以同步 Server ID)
 		if payload, ok := msg.Payload.(map[string]interface{}); ok {
 			if text, ok := payload["text"].(string); ok {
-				item := room.AddClipboardItem(text)
+				// Try to get client-provided ID
+				id, _ := payload["id"].(string)
+
+				item := room.AddClipboardItem(text, id)
 				if item != nil {
 					// Encode item to map for broadcast
 					broadcastPayload := map[string]interface{}{

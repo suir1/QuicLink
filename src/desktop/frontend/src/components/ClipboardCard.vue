@@ -93,16 +93,42 @@ function getTime() {
   return `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`
 }
 
+// 发送给 C++ Host
+function sendToHost() {
+  if (!inputContent.value) return
+  isSending.value = true
+
+  const text = inputContent.value
+  const id = Date.now().toString() // Use local timestamp as ID base
+
+  // 发送
+  conn.sendMessage({
+    type: 'clipboard_push',
+    payload: {
+      text,
+      id
+    }
+  })
+
+  // 本地也加一条 (Pass ID explicitly)
+  addBullet(text, false, id)
+  inputContent.value = ''
+
+  setTimeout(() => isSending.value = false, 500)
+}
+
 // 核心：添加一条记录
-function addBullet(text: string, fromRemote = false) {
+function addBullet(text: string, fromRemote = false, customId?: string) {
   if (!text) return
 
   // 简单的去重：如果最新的一条跟这个一样，就不添加
   const last = clipboardList.value[clipboardList.value.length - 1]
   if (last && last.text === text) return
 
+  const finalId = customId || Date.now().toString() + Math.random().toString().substr(2, 5)
+
   clipboardList.value.push({
-    id: Date.now().toString() + Math.random().toString().substr(2, 5),
+    id: finalId,
     text: text,
     time: getTime()
   })
@@ -134,12 +160,13 @@ function handlePaste(event: ClipboardEvent) {
       reader.onload = (e) => {
         const base64 = e.target?.result as string
         if (base64) {
+          const id = Date.now().toString()
           // 直接发送 Base64 图片
           conn.sendMessage({
             type: 'clipboard_push',
-            payload: { text: base64 }
+            payload: { text: base64, id }
           })
-          addBullet(base64, false)
+          addBullet(base64, false, id)
         }
       }
       reader.readAsDataURL(blob)
@@ -166,8 +193,9 @@ async function readLocalClipboard() {
           reader.onload = (e) => {
             const base64 = e.target?.result as string
             if (base64) {
-              conn.sendMessage({ type: 'clipboard_push', payload: { text: base64 } })
-              addBullet(base64, false)
+              const id = Date.now().toString()
+              conn.sendMessage({ type: 'clipboard_push', payload: { text: base64, id } })
+              addBullet(base64, false, id)
             }
           }
           reader.readAsDataURL(blob)
@@ -181,8 +209,9 @@ async function readLocalClipboard() {
     // 2. 尝试读取纯文本
     const text = await navigator.clipboard.readText()
     if (text) {
-      conn.sendMessage({ type: 'clipboard_push', payload: { text } })
-      addBullet(text, false)
+      const id = Date.now().toString()
+      conn.sendMessage({ type: 'clipboard_push', payload: { text, id } })
+      addBullet(text, false, id)
       ElMessage.success('已读取本机剪切板')
     } else {
       ElMessage.info('剪切板为空或无法读取')
@@ -192,26 +221,6 @@ async function readLocalClipboard() {
     console.error(err)
     ElMessage.error('读取失败，请检查浏览器权限')
   }
-}
-
-// 发送给 C++ Host
-function sendToHost() {
-  if (!inputContent.value) return
-  isSending.value = true
-
-  const text = inputContent.value
-
-  // 发送
-  conn.sendMessage({
-    type: 'clipboard_push',
-    payload: { text }
-  })
-
-  // 本地也加一条
-  addBullet(text, false)
-  inputContent.value = ''
-
-  setTimeout(() => isSending.value = false, 500)
 }
 
 // 从 Host 获取

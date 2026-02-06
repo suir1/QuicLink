@@ -207,7 +207,7 @@ func (r *Room) Broadcast(msg interface{}, sender Connection) {
 }
 
 // AddClipboardItem 添加一条剪贴板记录 (保留最近 20 条)
-func (r *Room) AddClipboardItem(text string) *ClipboardItem {
+func (r *Room) AddClipboardItem(text string, customID string) *ClipboardItem {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -227,9 +227,12 @@ func (r *Room) AddClipboardItem(text string) *ClipboardItem {
 	}
 
 	now := time.Now()
-	// Fix: Use String ID to avoid JS number precision loss with int64 UnixNano
-	// UnixNano (19 digits) > 2^53 (JS MAX_SAFE_INTEGER)
-	id := strconv.FormatInt(now.UnixNano(), 10)
+
+	id := customID
+	if id == "" {
+		// Fallback: Use String ID to avoid JS precision loss
+		id = strconv.FormatInt(now.UnixNano(), 10)
+	}
 
 	item := ClipboardItem{
 		ID:        id,
