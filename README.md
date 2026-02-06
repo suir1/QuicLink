@@ -26,7 +26,7 @@ QuicLink allows real-time synchronization of **Clipboard**, **Notepad**, and **F
     -   **Linux**: `.tar.gz` (Extract and run `QuicLink`)
 2.  **Configuration**:
     -   On first launch, click the **Settings (⚙️)** icon in the top toolbar to configure your server address.
-    -   Default: `localhost:8080` (If you are running your own server).
+    -   Default: `localhost:3100` (If you are running your own server).
 3.  **Connection**:
     -   **Public Mode**: Enter any room name (e.g., `my-room`) or generate a random one to join.
     -   **Private Mode**: If the server is in private mode, you will be prompted for a password.
@@ -34,7 +34,7 @@ QuicLink allows real-time synchronization of **Clipboard**, **Notepad**, and **F
 ### 🌐 Web Client
 
 1.  Access the web client via your browser: `https://your-server-domain.com`.
-2.  If running locally: `http://localhost:5173`.
+2.  If running locally: `http://localhost:3100`.
 3.  **Room Access**:
     -   Enter a room name to join.
     -   You can also use a direct link: `https://your-server-domain.com/#/my-room`.
@@ -45,7 +45,7 @@ You can run your own QuicLink server for complete privacy and control.
 
 #### Option 1: Run from Source
 
-1.  **Prerequisites**: Go 1.21+
+1.  **Prerequisites**: Go 1.24+
 2.  **Clone & Run**:
     ```bash
     git clone https://github.com/suir1/QuicLink.git
@@ -58,7 +58,7 @@ You can run your own QuicLink server for complete privacy and control.
     ```json
     {
       "host": "0.0.0.0",
-      "port": 8080,
+      "port": 3100,
       "mode": "public",  // "public" or "private"
       "password": "your-secret-password", // Required if mode is "private"
       "cert_file": "./cert.pem", // SSL Cert (Optional for localhost, Required for Public WebTransport)
@@ -98,7 +98,7 @@ To use WebTransport over the internet, you **must** use a valid SSL certificate 
     Or update `config.json` directly if permissions allow:
     ```json
     {
-      "port": 8080,
+      "port": 3100,
       "cert_file": "/etc/letsencrypt/live/your-domain.com/fullchain.pem",
       "key_file": "/etc/letsencrypt/live/your-domain.com/privkey.pem"
     }
@@ -132,11 +132,13 @@ docker-compose up -d --build
         container_name: quiclink-server
         restart: unless-stopped
         ports:
-          - "8080:8080"
-          - "443:443"
+          - "443:3100"  # HTTPS (Main App)
+          - "80:3101"   # HTTP -> HTTPS Redirect
         volumes:
-          - ./config.json:/app/config.json
+          - ./src/server/config.json:/app/config.json
           - ./uploads:/app/uploads
+          - ./cert.pem:/app/cert.pem
+          - ./key.pem:/app/key.pem
     ```
 
     Then run:
