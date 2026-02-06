@@ -110,7 +110,7 @@ Deploy the full stack (Server + Web) using Docker Compose.
 
 1.  **Clone Repo**:
     ```bash
-    git clone https://github.com/your-repo/QuicLink.git
+    git clone https://github.com/suir1/QuicLink.git
     cd QuicLink
     ```
 
