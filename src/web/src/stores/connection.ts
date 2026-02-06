@@ -33,6 +33,7 @@ export const useConnectionStore = defineStore('connection', () => {
     // --- 回调函数钩子 ---
     const onClipboardData = ref<((text: string) => void) | null>(null)
     const onClipboardHistory = ref<((items: any[]) => void) | null>(null)
+    const onClipboardDelete = ref<((id: number) => void) | null>(null) // New Callback
     const onNotepadEvent = ref<((type: string, data: any) => void) | null>(null)
     const onP2PEvent = ref<((type: string, data: any) => void) | null>(null)
 
@@ -395,6 +396,12 @@ export const useConnectionStore = defineStore('connection', () => {
                     }
                     break
 
+                case 'clipboard_delete':
+                    if (msg.payload && msg.payload.id && onClipboardDelete.value) {
+                        onClipboardDelete.value(msg.payload.id)
+                    }
+                    break
+
                 case 'offer':
                 case 'answer':
                 case 'candidate':
@@ -458,6 +465,7 @@ export const useConnectionStore = defineStore('connection', () => {
         sendMessage,
         onClipboardData,
         onClipboardHistory,
+        onClipboardDelete, // Export new callback
         onNotepadEvent,
         onP2PEvent,
         shareFile,

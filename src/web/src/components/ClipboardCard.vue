@@ -25,6 +25,16 @@ conn.onClipboardHistory = (history: any[]) => {
     ElMessage.success(`已同步 ${history.length} 条已保存记录`)
   }
 }
+
+// 监听实时删除
+conn.onClipboardDelete = (id: number) => {
+  const index = clipboardList.value.findIndex(item => item.id === id)
+  if (index !== -1) {
+    clipboardList.value.splice(index, 1)
+    console.log(`🗑️ Synced delete: ${id}`)
+  }
+}
+
 const inputContent = ref('')
 const isSending = ref(false)
 const listContainer = ref<HTMLElement | null>(null)
