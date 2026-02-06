@@ -4,8 +4,8 @@
     "use_https": true,
     "port": 8080,
     "room_ttl_hours": 48,
-    "cert_file": "cert.pem",
-    "key_file": "key.pem",
+    "cert_file": "/app/cert.pem",
+    "key_file": "/app/key.pem",
     "limits": {
         "max_upload_size_mb": 10,
         "file_retention_minutes": 10,

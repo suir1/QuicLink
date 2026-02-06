@@ -11,5 +11,8 @@ services:
     volumes:
       - ./src/server/config.json:/app/config.json
       - ./uploads:/app/uploads
+      # Mount SSL certificates (optional, required if using HTTPS)
+      - ./cert.pem:/app/cert.pem
+      - ./key.pem:/app/key.pem
     environment:
       - TZ=Asia/Shanghai
