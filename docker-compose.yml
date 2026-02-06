@@ -8,10 +8,10 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      # Map host port 8080 to container port 8080
-      # Change the left number to expose a different port (e.g., "9000:8080")
-      - "8080:8080"
-      - "443:8080"
+      # Map host port 3100 to container port 3100
+      # Change the left number to expose a different port (e.g., "9000:3100")
+      - "3100:3100"
+      - "443:3100"
     volumes:
       # Mount config file for easy editing (HTTP/HTTPS toggle)
       - ./src/server/config.json:/app/config.json

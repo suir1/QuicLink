@@ -22,7 +22,7 @@ export const useConnectionStore = defineStore('connection', () => {
     // 环境变量处理
     // 环境变量处理
     // 优先使用环境变量，否则尝试使用 window.location.host (如果是在浏览器环境中)
-    const VPS_HOST = import.meta.env.VITE_VPS_HOST || (window.location.protocol.startsWith('http') ? window.location.host : 'localhost:8080')
+    const VPS_HOST = import.meta.env.VITE_VPS_HOST || (window.location.protocol.startsWith('http') ? window.location.host : 'localhost:3100')
     // 协议检测：跟随当前页面协议（Wails 用 http，生产用 https）
     const PROTOCOL = window.location.protocol // 'http:' or 'https:'
     const HTTP_URL = `${PROTOCOL}//${VPS_HOST}`

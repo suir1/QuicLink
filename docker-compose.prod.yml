@@ -6,9 +6,9 @@ services:
     container_name: quiclink-server
     restart: unless-stopped
     ports:
-      # - "8080:8080" # Optional: You can remove this if using 443
-      - "443:8080"
-      - "80:8081" # HTTP -> HTTPS Redirect
+      # - "3100:3100" # Optional: You can remove this if using 443
+      - "443:3100"
+      - "80:3101" # HTTP -> HTTPS Redirect
     volumes:
       - ./src/server/config.json:/app/config.json
       - ./uploads:/app/uploads

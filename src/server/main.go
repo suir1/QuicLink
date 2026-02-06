@@ -166,10 +166,10 @@ func main() {
 		}
 	}()
 
-	// 4. 启动 HTTP -> HTTPS 重定向服务 (端口 8081)
-	// 用户需在 Docker 中映射 80:8081
+	// 4. 启动 HTTP -> HTTPS 重定向服务 (端口 3101)
+	// 用户需在 Docker 中映射 80:3101
 	go func() {
-		redirectPort := "8081"
+		redirectPort := "3101"
 		fmt.Printf("🔀 Redirect Server running on :%s (HTTP -> HTTPS)\n", redirectPort)
 		http.ListenAndServe(":"+redirectPort, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			target := "https://" + r.Host + r.URL.Path

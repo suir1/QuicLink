@@ -31,7 +31,7 @@ const currentUrl = computed(() => {
 
 // Server Configuration State
 const savedHost = localStorage.getItem('custom_server_host')
-const serverHost = ref(savedHost || import.meta.env.VITE_VPS_HOST || (window.location.protocol.startsWith('http') ? window.location.host : 'localhost:8080'))
+const serverHost = ref(savedHost || import.meta.env.VITE_VPS_HOST || (window.location.protocol.startsWith('http') ? window.location.host : 'localhost:3100'))
 const showSettings = ref(false)
 
 function saveSettings() {

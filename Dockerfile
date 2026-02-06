@@ -41,8 +41,8 @@ RUN mkdir uploads
 
 # Expose ports
 # Expose ports
-EXPOSE 8080
-EXPOSE 8081
+EXPOSE 3100
+EXPOSE 3101
 EXPOSE 443
 
 # Run
