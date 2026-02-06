@@ -56,9 +56,17 @@ func main() {
 
 	// 静态文件
 	fs := http.FileServer(http.Dir("./dist"))
+	// SPA Handler: Serves index.html for unknown paths
 	http.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if config.Current.UseHTTPS {
 			w.Header().Add("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
+		}
+
+		path := "./dist" + r.URL.Path
+		// Check if file exists, otherwise serve index.html
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			http.ServeFile(w, r, "./dist/index.html")
+			return
 		}
 		fs.ServeHTTP(w, r)
 	}))
