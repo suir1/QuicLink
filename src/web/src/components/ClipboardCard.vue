@@ -204,8 +204,15 @@ async function copyItem(item: ClipboardItem) {
 }
 
 // 删除单个 Bullet
-function deleteItem(index: number) {
+function deleteItem(index: number, item: ClipboardItem) {
+  // 乐观更新 (Local Optimistic Update)
   clipboardList.value.splice(index, 1)
+
+  // Send delete request to server
+  conn.sendMessage({
+    type: 'clipboard_delete',
+    payload: { id: item.id }
+  })
 }
 
 // 暴露给父组件
@@ -245,7 +252,7 @@ defineExpose({
 
           <div class="bullet-meta">{{ item.time }}</div>
         </div>
-        <div class="bullet-action" @click.stop="deleteItem(index)">
+        <div class="bullet-action" @click.stop="deleteItem(index, item)">
           <el-icon><Close /></el-icon>
         </div>
       </div>

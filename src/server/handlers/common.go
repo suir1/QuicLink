@@ -61,6 +61,18 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 		// Host 响应了剪切板内容 -> 广播给 Web
 		room.Broadcast(msg, conn)
 
+	// --- 剪切板删除 ---
+	case "clipboard_delete":
+		if payload, ok := msg.Payload.(map[string]interface{}); ok {
+			// JSON generic unmarshal numbers to float64
+			if idFloat, ok := payload["id"].(float64); ok {
+				id := int64(idFloat)
+				room.DeleteClipboardItem(id)
+				room.Broadcast(msg, conn) // Broadcast to sync deletion
+				log.Printf("🗑️ Deleted clipboard item: %d. Remaining: %d", id, len(room.ClipboardHistory))
+			}
+		}
+
 	// --- WebRTC 信令转发 (P2P Signaling) ---
 	case "offer", "answer", "candidate":
 		room.Broadcast(msg, conn)

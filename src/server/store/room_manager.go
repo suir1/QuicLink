@@ -243,3 +243,18 @@ func (r *Room) AddClipboardItem(text string) {
 
 	r.LastUpdate = now
 }
+
+// DeleteClipboardItem 删除指定 ID 的剪贴板记录
+func (r *Room) DeleteClipboardItem(id int64) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	newHistory := make([]ClipboardItem, 0, len(r.ClipboardHistory))
+	for _, item := range r.ClipboardHistory {
+		if item.ID != id {
+			newHistory = append(newHistory, item)
+		}
+	}
+	r.ClipboardHistory = newHistory
+	r.LastUpdate = time.Now()
+}
