@@ -40,7 +40,9 @@ COPY src/server/config.example.json ./config.json
 RUN mkdir uploads
 
 # Expose ports
+# Expose ports
 EXPOSE 8080
+EXPOSE 8081
 EXPOSE 443
 
 # Run

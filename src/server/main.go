@@ -166,6 +166,20 @@ func main() {
 		}
 	}()
 
+	// 4. 启动 HTTP -> HTTPS 重定向服务 (端口 8081)
+	// 用户需在 Docker 中映射 80:8081
+	go func() {
+		redirectPort := "8081"
+		fmt.Printf("🔀 Redirect Server running on :%s (HTTP -> HTTPS)\n", redirectPort)
+		http.ListenAndServe(":"+redirectPort, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			target := "https://" + r.Host + r.URL.Path
+			if len(r.URL.RawQuery) > 0 {
+				target += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
+		}))
+	}()
+
 	wg.Wait()
 }
 
