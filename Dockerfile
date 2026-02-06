@@ -7,7 +7,7 @@ COPY src/web/ .
 RUN npm run build
 
 # Stage 2: Build Go Backend
-FROM golang:1.23-alpine AS backend-builder
+FROM golang:1.24-alpine AS backend-builder
 WORKDIR /app/server
 COPY src/server/go.mod src/server/go.sum ./
 # Install git for fetching private modules (common issue) and set Proxy
