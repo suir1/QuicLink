@@ -207,7 +207,7 @@ func (r *Room) Broadcast(msg interface{}, sender Connection) {
 }
 
 // AddClipboardItem 添加一条剪贴板记录 (保留最近 20 条)
-func (r *Room) AddClipboardItem(text string) {
+func (r *Room) AddClipboardItem(text string) *ClipboardItem {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -215,7 +215,7 @@ func (r *Room) AddClipboardItem(text string) {
 	if len(r.ClipboardHistory) > 0 {
 		last := r.ClipboardHistory[len(r.ClipboardHistory)-1]
 		if last.Text == text {
-			return
+			return &last
 		}
 	}
 
@@ -247,6 +247,7 @@ func (r *Room) AddClipboardItem(text string) {
 	}
 
 	r.LastUpdate = now
+	return &item
 }
 
 // DeleteClipboardItem 删除指定 ID 的剪贴板记录

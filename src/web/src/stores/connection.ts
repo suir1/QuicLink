@@ -31,7 +31,7 @@ export const useConnectionStore = defineStore('connection', () => {
     const WT_URL = computed(() => `https://${VPS_HOST}`) // WebTransport always requires HTTPS/QUIC
 
     // --- 回调函数钩子 ---
-    const onClipboardData = ref<((text: string) => void) | null>(null)
+    const onClipboardData = ref<((data: any) => void) | null>(null)
     const onClipboardHistory = ref<((items: any[]) => void) | null>(null)
     const onClipboardDelete = ref<((id: number | string) => void) | null>(null) // New Callback
     const onNotepadEvent = ref<((type: string, data: any) => void) | null>(null)

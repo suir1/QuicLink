@@ -43,15 +43,30 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 		}
 
 	case "clipboard_push":
-		// Web/Host 发送了新文本 -> 广播给对面
+		// Web/Host 发送了新文本 -> 广播给对面 (包括发送者自己，以同步 Server ID)
 		if payload, ok := msg.Payload.(map[string]interface{}); ok {
 			if text, ok := payload["text"].(string); ok {
-				room.AddClipboardItem(text)
-				// Log success
-				log.Printf("💾 Saved clipboard item. History Total: %d", len(room.ClipboardHistory))
+				item := room.AddClipboardItem(text)
+				if item != nil {
+					// Encode item to map for broadcast
+					broadcastPayload := map[string]interface{}{
+						"id":   item.ID,
+						"text": item.Text,
+						"time": item.Time,
+						"type": item.Type,
+					}
+					// Broadcast 'clipboard_data' to ALL clients (including sender)
+					room.Broadcast(Message{
+						Type:    "clipboard_data",
+						Payload: broadcastPayload,
+					}, nil) // nil sender means broadcast to all
+
+					log.Printf("💾 Saved clipboard item [%s]. Broadcasted to all.", item.ID)
+				}
 			}
 		}
-		room.Broadcast(msg, conn)
+		// Notice: We do NOT broadcast the original 'clipboard_push' anymore,
+		// because we replaced it with 'clipboard_data' containing the ID.
 
 	case "clipboard_pull":
 		// Web 请求获取剪切板 -> 转发给 Host

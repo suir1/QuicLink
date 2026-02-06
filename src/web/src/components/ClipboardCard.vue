@@ -26,6 +26,44 @@ conn.onClipboardHistory = (history: any[]) => {
   }
 }
 
+// 监听单条数据 (实时同步) - Changed to accept Object
+conn.onClipboardData = (data: any) => {
+  // Check if it's a full item object or just text string (legacy/direct)
+  let text = ''
+  let id = ''
+  let time = ''
+
+  if (typeof data === 'string') {
+     text = data
+  } else if (typeof data === 'object' && data.text) {
+     text = data.text
+     id = data.id
+     time = data.time
+  }
+
+  if (!text) return
+
+  // Check duplicate
+  const lastIndex = clipboardList.value.findIndex(item => item.text === text)
+  if (lastIndex !== -1) {
+      // If we found a match (text same), update its ID to Server ID!
+      if (id) {
+          clipboardList.value[lastIndex].id = id
+          console.log(`🔄 Updated local item ID to Server ID: ${id}`)
+      }
+      return
+  }
+
+  // If new, push it
+  clipboardList.value.push({
+    id: id || Date.now().toString() + Math.random().toString().substr(2, 5),
+    text: text,
+    time: time || getTime()
+  })
+
+  scrollToBottom()
+}
+
 // 监听实时删除
 conn.onClipboardDelete = (id: number | string) => {
   // 兼容旧版 number ID
