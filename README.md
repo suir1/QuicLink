@@ -104,33 +104,45 @@ To use WebTransport over the internet, you **must** use a valid SSL certificate 
     }
     ```
 
-#### Option 3: Docker Deployment (Fastest)
+#### Option 3: Docker Deployment
 
-Deploy the full stack (Server + Web) using Docker Compose.
+You can either build the image locally on your VPS (Option A) or use the pre-built image from GitHub Container Registry (Option B).
 
-1.  **Clone Repo**:
+**Option A: Build Locally (Recommended for dev)**
+As described above:
+```bash
+docker-compose up -d --build
+```
+
+**Option B: Use Pre-built Image (Fastest for prod)**
+
+1.  **Pull Image**:
     ```bash
-    git clone https://github.com/suir1/QuicLink.git
-    cd QuicLink
+    # Replace 'suir1' with your username if you forked
+    docker pull ghcr.io/suir1/quiclink:latest
     ```
 
-2.  **Configure**:
-    *   `docker-compose.yml` mounts `src/server/config.json`.
-    *   Copy example config and edit it (Enable HTTPS and set cert paths if deploying to public).
-    ```bash
-    cp src/server/config.example.json src/server/config.json
-    nano src/server/config.json
+2.  **Run with Docker Compose**:
+    Create a `docker-compose.yml`:
+    ```yaml
+    version: '3.8'
+    services:
+      quiclink:
+        image: ghcr.io/suir1/quiclink:latest
+        container_name: quiclink-server
+        restart: unless-stopped
+        ports:
+          - "8080:8080"
+          - "443:443"
+        volumes:
+          - ./config.json:/app/config.json
+          - ./uploads:/app/uploads
     ```
 
-3.  **Run**:
+    Then run:
     ```bash
-    docker-compose up -d --build
+    docker-compose up -d
     ```
-    *   This will build and start the server and web client in the background.
-    *   Server on port `8080` (HTTPS/HTTP3).
-    *   Web Client (if served separately, though current Dockerfile builds static assets to server) -> The server serves the web client at `/`.
-
-    *Note: The Dockerfile uses multi-stage builds. It compiles everything inside the container, so you don't need Go or Node.js installed on your host.*
 
 ## 🛠️ Development
 
