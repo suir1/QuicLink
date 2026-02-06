@@ -236,6 +236,18 @@ function copyLink() {
 
     <!-- Lobby UI (Public Mode, No Room Selected) -->
     <div v-else-if="conn.serverMode === 'public' && !route.params.roomId" class="lobby-state">
+      <div class="lobby-header-controls">
+           <el-tooltip content="服务器设置" placement="bottom">
+             <el-button :icon="Setting" circle size="large" @click="showSettings = true" />
+           </el-tooltip>
+          <el-button
+            :icon="isDark ? Moon : Sunny"
+            circle
+            size="large"
+            @click="toggleDark()"
+            :title="isDark ? '切换到亮色模式' : '切换到暗黑模式'"
+          />
+      </div>
       <h2>🌐 QuicLink Public Server</h2>
       <p>Create or join a temporary room to start sharing.</p>
 
@@ -508,6 +520,15 @@ html.dark .qr-label {
   justify-content: center;
   height: 80vh;
   text-align: center;
+  position: relative;
+}
+
+.lobby-header-controls {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  display: flex;
+  gap: 10px;
 }
 
 .lobby-state h2 {
