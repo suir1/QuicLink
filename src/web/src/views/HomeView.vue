@@ -132,6 +132,13 @@ function copyLink() {
           <el-tag v-else type="success" effect="dark" size="large">
             🌐 {{ conn.currentRoom }}
           </el-tag>
+          <!-- 协议指示器 -->
+          <el-tag v-if="conn.transport" type="success" size="large" effect="plain" round>
+            🚀 HTTP/3
+          </el-tag>
+          <el-tag v-else-if="conn.isConnected" type="warning" size="large" effect="plain" round>
+            🔌 WebSocket
+          </el-tag>
         </div>
 
         <!-- QR码 -->
