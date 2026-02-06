@@ -2,7 +2,7 @@
     "app_mode": "public",
     "admin_password": "",
     "use_https": true,
-    "port": 8080,
+    "port": 8080, // Internal container port. Map this to any external port (e.g., 3100:8080) in docker-compose.
     "room_ttl_hours": 48,
     "cert_file": "/app/cert.pem",
     "key_file": "/app/key.pem",

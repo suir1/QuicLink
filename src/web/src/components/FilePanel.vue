@@ -7,19 +7,17 @@ import { useConnectionStore } from '../stores/connection'
 const conn = useConnectionStore()
 const fileList = ref<any[]>([])
 
-// 计算上传接口地址 (根据环境变量或默认值)
+// 计算上传接口地址 (从 connection store 获取动态 HTTP_URL)
 const uploadUrl = computed(() => {
-  const host = import.meta.env.VITE_VPS_HOST || 'localhost:8080'
-  return `http://${host}/upload`
+  return `${conn.HTTP_URL}/upload`
 })
 
 // 上传成功回调
 const handleSuccess: UploadProps['onSuccess'] = (response, uploadFile) => {
   // response 是 Go 后端返回的 JSON: { url: "/files/...", name: "..." }
   if (response.url) {
-    // 修正 URL (加上 host)
-    const host = import.meta.env.VITE_VPS_HOST || 'localhost:8080'
-    uploadFile.url = `http://${host}${response.url}`
+    // 修正 URL (使用 store 中的 HTTP_URL)
+    uploadFile.url = `${conn.HTTP_URL}${response.url}`
     ElMessage.success('上传成功')
   }
 }
