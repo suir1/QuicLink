@@ -104,7 +104,33 @@ To use WebTransport over the internet, you **must** use a valid SSL certificate 
     }
     ```
 
-#### Option 3: Docker (Coming Soon)
+#### Option 3: Docker Deployment (Fastest)
+
+Deploy the full stack (Server + Web) using Docker Compose.
+
+1.  **Clone Repo**:
+    ```bash
+    git clone https://github.com/your-repo/QuicLink.git
+    cd QuicLink
+    ```
+
+2.  **Configure**:
+    *   `docker-compose.yml` mounts `src/server/config.json`.
+    *   Copy example config and edit it (Enable HTTPS and set cert paths if deploying to public).
+    ```bash
+    cp src/server/config.example.json src/server/config.json
+    nano src/server/config.json
+    ```
+
+3.  **Run**:
+    ```bash
+    # Build and start in background
+    docker-compose up -d --build
+    ```
+    *   Server on port `8080` (HTTPS/HTTP3).
+    *   Web Client (if served separately, though current Dockerfile builds static assets to server) -> The server serves the web client at `/`.
+
+    *Note: The Dockerfile uses multi-stage builds. It compiles everything inside the container, so you don't need Go or Node.js installed on your host.*
 
 ## 🛠️ Development
 
