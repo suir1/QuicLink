@@ -124,9 +124,9 @@ Deploy the full stack (Server + Web) using Docker Compose.
 
 3.  **Run**:
     ```bash
-    # Build and start in background
     docker-compose up -d --build
     ```
+    *   This will build and start the server and web client in the background.
     *   Server on port `8080` (HTTPS/HTTP3).
     *   Web Client (if served separately, though current Dockerfile builds static assets to server) -> The server serves the web client at `/`.
 

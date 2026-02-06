@@ -10,6 +10,9 @@ RUN npm run build
 FROM golang:1.23-alpine AS backend-builder
 WORKDIR /app/server
 COPY src/server/go.mod src/server/go.sum ./
+# Install git for fetching private modules (common issue) and set Proxy
+RUN apk add --no-cache git
+ENV GOPROXY=https://goproxy.io,direct
 RUN go mod download
 COPY src/server/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -o quiclink-server .
