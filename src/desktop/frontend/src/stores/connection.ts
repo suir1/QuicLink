@@ -129,23 +129,41 @@ export const useConnectionStore = defineStore('connection', () => {
                 let url = `${WT_URL}/wt?room=${roomId}`
                 if (password) url += `&token=${password}`
 
-                const options: any = {}
-                if (certHash.value) {
-                    // Base64 -> Uint8Array
-                    const binaryString = atob(certHash.value)
-                    const bytes = new Uint8Array(binaryString.length)
-                    for (let i = 0; i < binaryString.length; i++) {
-                        bytes[i] = binaryString.charCodeAt(i)
+                let wt: WebTransport
+
+                // 策略 1: 优先尝试标准 CA 验证 (适用于 Let's Encrypt 等公网证书)
+                try {
+                    console.log("🚀 [Strategy 1] Attempting WebTransport with Standard CA verification...")
+                    wt = new WebTransport(url)
+                    await wt.ready
+                    console.log("✅ [Strategy 1] Standard CA Connected!")
+                } catch (caError) {
+                    console.warn("⚠️ [Strategy 1] Failed:", caError)
+
+                    // 策略 2: 如果失败且有证书指纹，尝试自签名指纹验证
+                    if (certHash.value) {
+                        console.log("🔄 [Strategy 2] Attempting WebTransport with Certificate Hash...")
+                        const binaryString = atob(certHash.value)
+                        const bytes = new Uint8Array(binaryString.length)
+                        for (let i = 0; i < binaryString.length; i++) {
+                            bytes[i] = binaryString.charCodeAt(i)
+                        }
+
+                        const options = {
+                            serverCertificateHashes: [{
+                                algorithm: 'sha-256',
+                                value: bytes
+                            }]
+                        }
+
+                        wt = new WebTransport(url, options)
+                        await wt.ready
+                        console.log("✅ [Strategy 2] Hash Verified Connected!")
+                    } else {
+                        // 没指纹也没法验证，抛出原始错误
+                        throw caError
                     }
-
-                    options.serverCertificateHashes = [{
-                        algorithm: 'sha-256',
-                        value: bytes
-                    }]
                 }
-
-                const wt = new WebTransport(url, options)
-                await wt.ready
 
                 // 成功连接 WT
                 transport.value = wt
