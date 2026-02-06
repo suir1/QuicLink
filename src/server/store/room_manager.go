@@ -211,15 +211,7 @@ func (r *Room) AddClipboardItem(text string, customID string) *ClipboardItem {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	// 简单的去重：如果最近的一条和新的一样，虽然时间变了，但也更新一下时间戳防止重复刷
-	if len(r.ClipboardHistory) > 0 {
-		last := r.ClipboardHistory[len(r.ClipboardHistory)-1]
-		if last.Text == text {
-			return &last
-		}
-	}
-
-	// 构造新 Item
+	// 1. 构造新 Item
 	isImage := len(text) > 10 && text[:10] == "data:image"
 	msgType := "text"
 	if isImage {
@@ -227,14 +219,12 @@ func (r *Room) AddClipboardItem(text string, customID string) *ClipboardItem {
 	}
 
 	now := time.Now()
-
 	id := customID
 	if id == "" {
-		// Fallback: Use String ID to avoid JS precision loss
 		id = strconv.FormatInt(now.UnixNano(), 10)
 	}
 
-	item := ClipboardItem{
+	newItem := ClipboardItem{
 		ID:        id,
 		Text:      text,
 		Time:      now.Format("15:04"),
@@ -242,15 +232,29 @@ func (r *Room) AddClipboardItem(text string, customID string) *ClipboardItem {
 		Timestamp: now.Unix(),
 	}
 
-	r.ClipboardHistory = append(r.ClipboardHistory, item)
+	// 2. 去重策略：Move to Front (Bump)
+	// 如果由于某种原因 ID 冲突，或者内容重复，我们都移除旧的，把新的放到最后
+	newHistory := make([]ClipboardItem, 0, len(r.ClipboardHistory)+1)
 
-	// 限制长度 20
-	if len(r.ClipboardHistory) > 20 {
-		r.ClipboardHistory = r.ClipboardHistory[len(r.ClipboardHistory)-20:]
+	for _, item := range r.ClipboardHistory {
+		// 移除 ID 相同 或者 内容相同 的旧记录 (不管是最后一条还是中间的，都顶上来)
+		if item.ID != id && item.Text != text {
+			newHistory = append(newHistory, item)
+		}
 	}
 
+	// 3. 追加新记录
+	newHistory = append(newHistory, newItem)
+
+	// 4. 限制长度 20
+	if len(newHistory) > 20 {
+		newHistory = newHistory[len(newHistory)-20:]
+	}
+
+	r.ClipboardHistory = newHistory
 	r.LastUpdate = now
-	return &item
+
+	return &newItem
 }
 
 // DeleteClipboardItem 删除指定 ID 的剪贴板记录
