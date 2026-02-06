@@ -5,7 +5,7 @@ import { nextTick, ref } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 
 interface ClipboardItem {
-  id: number
+  id: string
   text: string
   time: string
 }
@@ -17,7 +17,7 @@ const clipboardList = ref<ClipboardItem[]>([])
 conn.onClipboardHistory = (history: any[]) => {
   if (history && history.length > 0) {
     clipboardList.value = history.map(item => ({
-      id: item.id || Date.now() + Math.random(),
+      id: item.id || Date.now().toString() + Math.random().toString().substr(2, 5),
       text: item.text,
       time: item.time || getTime()
     }))
@@ -27,8 +27,9 @@ conn.onClipboardHistory = (history: any[]) => {
 }
 
 // 监听实时删除
-conn.onClipboardDelete = (id: number) => {
-  const index = clipboardList.value.findIndex(item => item.id === id)
+conn.onClipboardDelete = (id: number | string) => {
+  // 兼容旧版 number ID
+  const index = clipboardList.value.findIndex(item => item.id == id.toString())
   if (index !== -1) {
     clipboardList.value.splice(index, 1)
     console.log(`🗑️ Synced delete: ${id}`)
@@ -63,7 +64,7 @@ function addBullet(text: string, fromRemote = false) {
   if (last && last.text === text) return
 
   clipboardList.value.push({
-    id: Date.now() + Math.random(),
+    id: Date.now().toString() + Math.random().toString().substr(2, 5),
     text: text,
     time: getTime()
   })
@@ -214,8 +215,15 @@ async function copyItem(item: ClipboardItem) {
 }
 
 // 删除单个 Bullet
-function deleteItem(index: number) {
+function deleteItem(index: number, item: ClipboardItem) {
+  // 乐观更新 (Local Optimistic Update)
   clipboardList.value.splice(index, 1)
+
+  // Send delete request to server
+  conn.sendMessage({
+    type: 'clipboard_delete',
+    payload: { id: item.id }
+  })
 }
 
 // 暴露给父组件
@@ -255,7 +263,7 @@ defineExpose({
 
           <div class="bullet-meta">{{ item.time }}</div>
         </div>
-        <div class="bullet-action" @click.stop="deleteItem(index)">
+        <div class="bullet-action" @click.stop="deleteItem(index, item)">
           <el-icon><Close /></el-icon>
         </div>
       </div>

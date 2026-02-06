@@ -2,6 +2,7 @@ package store
 
 import (
 	"log"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -46,7 +47,7 @@ type Note struct {
 
 // ClipboardItem 剪贴板历史项
 type ClipboardItem struct {
-	ID        int64  `json:"id"`
+	ID        string `json:"id"`
 	Text      string `json:"text"`
 	Time      string `json:"time"`
 	Type      string `json:"type"` // "text", "image"
@@ -226,8 +227,12 @@ func (r *Room) AddClipboardItem(text string) {
 	}
 
 	now := time.Now()
+	// Fix: Use String ID to avoid JS number precision loss with int64 UnixNano
+	// UnixNano (19 digits) > 2^53 (JS MAX_SAFE_INTEGER)
+	id := strconv.FormatInt(now.UnixNano(), 10)
+
 	item := ClipboardItem{
-		ID:        now.UnixNano(),
+		ID:        id,
 		Text:      text,
 		Time:      now.Format("15:04"),
 		Type:      msgType,
@@ -245,7 +250,7 @@ func (r *Room) AddClipboardItem(text string) {
 }
 
 // DeleteClipboardItem 删除指定 ID 的剪贴板记录
-func (r *Room) DeleteClipboardItem(id int64) {
+func (r *Room) DeleteClipboardItem(id string) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 

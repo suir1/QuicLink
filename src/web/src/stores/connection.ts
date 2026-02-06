@@ -33,7 +33,7 @@ export const useConnectionStore = defineStore('connection', () => {
     // --- 回调函数钩子 ---
     const onClipboardData = ref<((text: string) => void) | null>(null)
     const onClipboardHistory = ref<((items: any[]) => void) | null>(null)
-    const onClipboardDelete = ref<((id: number) => void) | null>(null) // New Callback
+    const onClipboardDelete = ref<((id: number | string) => void) | null>(null) // New Callback
     const onNotepadEvent = ref<((type: string, data: any) => void) | null>(null)
     const onP2PEvent = ref<((type: string, data: any) => void) | null>(null)
 

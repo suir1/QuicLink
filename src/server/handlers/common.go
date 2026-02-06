@@ -64,12 +64,11 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 	// --- 剪切板删除 ---
 	case "clipboard_delete":
 		if payload, ok := msg.Payload.(map[string]interface{}); ok {
-			// JSON generic unmarshal numbers to float64
-			if idFloat, ok := payload["id"].(float64); ok {
-				id := int64(idFloat)
+			// ID is now string to avoid precision loss
+			if id, ok := payload["id"].(string); ok {
 				room.DeleteClipboardItem(id)
 				room.Broadcast(msg, conn) // Broadcast to sync deletion
-				log.Printf("🗑️ Deleted clipboard item: %d. Remaining: %d", id, len(room.ClipboardHistory))
+				log.Printf("🗑️ Deleted clipboard item: %s. Remaining: %d", id, len(room.ClipboardHistory))
 			}
 		}
 
