@@ -18,7 +18,9 @@ export const useConnectionStore = defineStore('connection', () => {
     const certHash = ref('')         // 服务器证书指纹
 
     // 环境变量处理
-    const VPS_HOST = import.meta.env.VITE_VPS_HOST || 'localhost:8080'
+    // 环境变量处理
+    // 优先使用环境变量，否则使用当前浏览器地址栏的 Host (自动适配域名/IP)
+    const VPS_HOST = import.meta.env.VITE_VPS_HOST || window.location.host
 
     // 协议判定 (Reactive Auto-Detection)
     const protocol = ref(window.location.protocol) // Default to current

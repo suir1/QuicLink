@@ -61,6 +61,7 @@ onMounted(async () => {
       }
     ).then(() => {
       // 打开 API 地址
+      // 打开 API 地址 (使用 store 计算出的 HTTP_URL，它已经包含了正确的 host)
       window.open(`${conn.HTTP_URL}/api/info`, '_blank')
     }).catch(() => {
       location.reload()
