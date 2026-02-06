@@ -456,6 +456,8 @@ export const useConnectionStore = defineStore('connection', () => {
 
     return {
         isConnected,
+        isDesktop: ref(false), // Web client is never desktop
+        transport, // Export for UI state check
         currentRoom,
         serverMode,
         hostOnline,
