@@ -59,7 +59,7 @@ func main() {
 	// SPA Handler: Serves index.html for unknown paths
 	http.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if config.Current.UseHTTPS {
-			w.Header().Add("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
+			w.Header().Add("Alt-Svc", `h3=":443"; ma=2592000`)
 		}
 
 		path := "./dist" + r.URL.Path
@@ -75,13 +75,13 @@ func main() {
 	// API
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		if config.Current.UseHTTPS {
-			w.Header().Add("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
+			w.Header().Add("Alt-Svc", `h3=":443"; ma=2592000`)
 		}
 		handlers.HandleWebSocket(w, r)
 	})
 	http.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
 		if config.Current.UseHTTPS {
-			w.Header().Add("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
+			w.Header().Add("Alt-Svc", `h3=":443"; ma=2592000`)
 		}
 		handlers.HandleUpload(w, r)
 	})
@@ -92,7 +92,7 @@ func main() {
 			http.Error(w, "WebTransport requires HTTPS mode", http.StatusBadRequest)
 			return
 		}
-		w.Header().Add("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
+		w.Header().Add("Alt-Svc", `h3=":443"; ma=2592000`)
 		handlers.HandleWebTransport(w, r)
 	})
 
@@ -100,7 +100,8 @@ func main() {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Content-Type", "application/json")
 		if config.Current.UseHTTPS {
-			w.Header().Add("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
+			// Advertise external port 443 for HTTP/3, not internal port 3100
+			w.Header().Add("Alt-Svc", `h3=":443"; ma=2592000`)
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"mode":     config.Current.AppMode,

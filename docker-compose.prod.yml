@@ -7,7 +7,8 @@ services:
     restart: unless-stopped
     ports:
       # - "3100:3100" # Optional: You can remove this if using 443
-      - "443:3100"
+      - "443:3100/tcp" # HTTPS (TCP)
+      - "443:3100/udp" # HTTP/3 (QUIC/UDP)
       - "80:3101" # HTTP -> HTTPS Redirect
     volumes:
       - ./src/server/config.json:/app/config.json
