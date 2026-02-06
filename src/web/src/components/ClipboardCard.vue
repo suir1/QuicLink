@@ -47,7 +47,7 @@ conn.onClipboardData = (data: any) => {
   const lastIndex = clipboardList.value.findIndex(item => item.text === text)
   if (lastIndex !== -1) {
       // If we found a match (text same), update its ID to Server ID!
-      if (id) {
+      if (id && clipboardList.value[lastIndex]) {
           clipboardList.value[lastIndex].id = id
           console.log(`🔄 Updated local item ID to Server ID: ${id}`)
       }
