@@ -4,6 +4,8 @@ WORKDIR /app/web
 COPY src/web/package*.json ./
 RUN npm install
 COPY src/web/ .
+# Remove local .env file to prevent baking in VITE_VPS_HOST
+RUN rm -f .env
 RUN npm run build
 
 # Stage 2: Build Go Backend
