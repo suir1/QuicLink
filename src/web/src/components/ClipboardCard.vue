@@ -66,11 +66,21 @@ conn.onClipboardData = (data: any) => {
 
 // 监听实时删除
 conn.onClipboardDelete = (id: number | string) => {
+  console.log(`🗑️ Received delete request for ID: ${id} (Type: ${typeof id})`)
+
   // 兼容旧版 number ID
-  const index = clipboardList.value.findIndex(item => item.id == id.toString())
+  const index = clipboardList.value.findIndex(item => {
+      // String comparison is safest
+      const match = item.id.toString() === id.toString()
+      if (match) console.log(`✅ Found match at index ${index}:`, item)
+      return match
+  })
+
   if (index !== -1) {
     clipboardList.value.splice(index, 1)
-    console.log(`🗑️ Synced delete: ${id}`)
+    console.log(`🗑️ Synced delete success: ${id}`)
+  } else {
+    console.warn(`⚠️ Delete failed: Item ${id} not found in local list.`, clipboardList.value.map(i => i.id))
   }
 }
 
