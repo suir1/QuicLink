@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,8 +46,14 @@ func (n *Node) Connect(host, roomID string, token ...string) error {
 	n.ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
 	n.cancel = cancel
 
+	// Ensure host has port (webtransport requires explicit port)
+	hostWithPort := host
+	if !strings.Contains(host, ":") {
+		hostWithPort = host + ":443"
+	}
+
 	// WebTransport URL with optional token
-	url := fmt.Sprintf("https://%s/wt?room=%s", host, roomID)
+	url := fmt.Sprintf("https://%s/wt?room=%s", hostWithPort, roomID)
 	if len(token) > 0 && token[0] != "" {
 		url += "&token=" + token[0]
 	}
@@ -82,12 +89,49 @@ func (n *Node) Connect(host, roomID string, token ...string) error {
 	n.stream = stream
 	n.connected = true
 
+	// Replace timeout context with a cancellable one for long-lived connection
+	n.ctx, n.cancel = context.WithCancel(context.Background())
+
 	log.Printf("✅ P2P Connected to room: %s via WebTransport", roomID)
 
 	// Start reading messages
 	go n.readLoop()
 
+	// Start keep-alive heartbeat (prevent idle timeout)
+	go n.keepAlive()
+
 	return nil
+}
+
+// keepAlive sends periodic ping messages to prevent idle timeout
+func (n *Node) keepAlive() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			n.mu.Lock()
+			connected := n.connected
+			n.mu.Unlock()
+
+			if !connected {
+				return
+			}
+
+			// Send a ping message
+			err := n.SendMessage(map[string]interface{}{
+				"type":    "ping",
+				"payload": map[string]interface{}{},
+			})
+			if err != nil {
+				log.Printf("⚠️ Keep-alive ping failed: %v", err)
+				return
+			}
+		case <-n.ctx.Done():
+			return
+		}
+	}
 }
 
 // readLoop handles incoming messages from the WebTransport stream

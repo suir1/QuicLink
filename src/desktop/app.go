@@ -91,6 +91,11 @@ func (a *App) watchClipboard() {
 	}
 }
 
+// GetTransportMode returns current transport mode ("ws", "wt", or "none")
+func (a *App) GetTransportMode() string {
+	return a.transportMode
+}
+
 // GetClipboard returns current clipboard text
 func (a *App) GetClipboard() string {
 	return string(clipboard.Read(clipboard.FmtText))

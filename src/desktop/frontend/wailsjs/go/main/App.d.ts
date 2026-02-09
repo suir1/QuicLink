@@ -15,6 +15,8 @@ export function GetConnectionStatus():Promise<boolean>;
 
 export function GetP2PStatus():Promise<boolean>;
 
+export function GetTransportMode():Promise<string>;
+
 export function Greet(arg1:string):Promise<string>;
 
 export function SendClipboard():Promise<void>;

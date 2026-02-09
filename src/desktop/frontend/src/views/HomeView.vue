@@ -34,6 +34,20 @@ const savedHost = localStorage.getItem('custom_server_host')
 const serverHost = ref(savedHost || import.meta.env.VITE_VPS_HOST || (window.location.protocol.startsWith('http') ? window.location.host : 'localhost:3100'))
 const showSettings = ref(false)
 
+// Transport Mode (桌面端专用: ws/wt/none)
+const transportMode = ref('')
+
+// 获取传输模式 (仅桌面端)
+async function updateTransportMode() {
+  if (conn.isDesktop && (window as any).go?.main?.App?.GetTransportMode) {
+    try {
+      transportMode.value = await (window as any).go.main.App.GetTransportMode()
+    } catch (e) {
+      console.error('Failed to get transport mode:', e)
+    }
+  }
+}
+
 function saveSettings() {
   if (!serverHost.value) {
     ElMessage.warning('服务器地址不能为空')
@@ -88,11 +102,13 @@ watch(() => route.params.roomId, (newId) => {
 })
 
 // 加入房间逻辑
-function joinRoom() {
+async function joinRoom() {
   const roomId = (route.params.roomId as string) || 'public'
 
   if (conn.isDesktop) {
-    conn.connectDesktop(serverHost.value, roomId)
+    await conn.connectDesktop(serverHost.value, roomId)
+    // 连接后获取传输模式
+    setTimeout(updateTransportMode, 500) // 延迟一点等连接稳定
   } else {
     conn.connect(roomId)
   }
@@ -120,10 +136,11 @@ function promptPassword() {
     closeOnPressEscape: false,
     showCancelButton: false
   })
-  .then((data: any) => {
+  .then(async (data: any) => {
     // Desktop or Web connection handled in connect/connectDesktop
     if (conn.isDesktop) {
-        conn.connectDesktop(serverHost.value, 'root', data.value)
+        await conn.connectDesktop(serverHost.value, 'root', data.value)
+        setTimeout(updateTransportMode, 500)
     } else {
         conn.connect('root', data.value)
     }
@@ -166,6 +183,10 @@ function copyLink() {
           </el-tag>
           <el-tag v-else type="success" effect="dark" size="large">
             🌐 {{ conn.currentRoom }}
+          </el-tag>
+          <!-- 传输模式状态 (仅桌面端显示) -->
+          <el-tag v-if="conn.isDesktop && transportMode" :type="transportMode === 'wt' ? 'success' : 'info'" size="small" effect="plain">
+            {{ transportMode === 'wt' ? '⚡ HTTP/3' : '🔌 WebSocket' }}
           </el-tag>
         </div>
 

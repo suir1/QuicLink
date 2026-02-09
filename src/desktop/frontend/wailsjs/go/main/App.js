@@ -30,6 +30,10 @@ export function GetP2PStatus() {
   return window['go']['main']['App']['GetP2PStatus']();
 }
 
+export function GetTransportMode() {
+  return window['go']['main']['App']['GetTransportMode']();
+}
+
 export function Greet(arg1) {
   return window['go']['main']['App']['Greet'](arg1);
 }
