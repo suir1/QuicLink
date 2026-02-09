@@ -103,6 +103,12 @@ func main() {
 		}
 		handlers.HandleUpload(w, r)
 	})
+	http.HandleFunc("/api/files", func(w http.ResponseWriter, r *http.Request) {
+		if config.Current.UseHTTPS {
+			w.Header().Add("Alt-Svc", `h3=":443"; ma=2592000`)
+		}
+		handlers.HandleListFiles(w, r)
+	})
 
 	// WebTransport endpoint (仅 HTTPS 模式)
 	http.HandleFunc("/wt", func(w http.ResponseWriter, r *http.Request) {

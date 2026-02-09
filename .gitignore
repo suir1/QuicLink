@@ -71,3 +71,6 @@ config.json
 # User Data
 uploads/
 src/server/uploads/
+bin/
+desktop_bin
+server_bin

@@ -26,6 +26,10 @@ export function GetConnectionStatus() {
   return window['go']['main']['App']['GetConnectionStatus']();
 }
 
+export function GetDownloadDir() {
+  return window['go']['main']['App']['GetDownloadDir']();
+}
+
 export function GetP2PStatus() {
   return window['go']['main']['App']['GetP2PStatus']();
 }
@@ -36,6 +40,14 @@ export function GetTransportMode() {
 
 export function Greet(arg1) {
   return window['go']['main']['App']['Greet'](arg1);
+}
+
+export function OpenDownloadDir() {
+  return window['go']['main']['App']['OpenDownloadDir']();
+}
+
+export function SelectDownloadDir() {
+  return window['go']['main']['App']['SelectDownloadDir']();
 }
 
 export function SendClipboard() {

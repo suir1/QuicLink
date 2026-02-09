@@ -13,6 +13,8 @@ interface P2PFile {
   type: string
   fromSelf: boolean
   progress?: number
+  isLan?: boolean // Phase 2: LAN Flag
+  baseUrl?: string // Phase 5: Multi-Host URL
 }
 
 const fileList = ref<P2PFile[]>([])
@@ -55,8 +57,8 @@ function processFiles(files: FileList) {
       ElMessage.warning(`文件 ${file.name} 过大 (暂限10MB)，建议使用上方文件中转`)
       continue
     }
-    // 调用 Store 发送
-    conn.shareFile(file)
+    // 调用 Store Smart Send
+    conn.smartSendFile(file)
     addFileToList({
       id: 'local-' + Date.now(),
       name: file.name,
@@ -78,6 +80,16 @@ function addFileToList(file: P2PFile) {
 
 function handleDownload(file: P2PFile) {
   if (file.fromSelf) return
+
+  // Phase 2: LAN Download
+  if (file.isLan) {
+      const baseUrl = file.baseUrl || conn.lanServerUrl
+      if (baseUrl) {
+          window.open(`${baseUrl}/api/lan/download/${file.id}`, '_blank')
+          return
+      }
+  }
+
   ElMessage.info('开始请求下载...')
   conn.requestFile(file.id)
 }
@@ -94,7 +106,9 @@ onMounted(() => {
         name: payload.name,
         size: payload.size,
         type: payload.type,
-        fromSelf: false
+        fromSelf: false,
+        isLan: payload.isLan, // Phase 2
+        baseUrl: payload.baseUrl // Phase 5
       })
     } else if (type === 'progress') {
       // payload: { id, received, total }
@@ -151,6 +165,7 @@ function deleteFile(index: number) {
           <div class="file-meta">
             <span>{{ formatSize(file.size) }}</span>
             <span v-if="file.fromSelf" class="tag-me">我发送的</span>
+            <span v-else-if="file.isLan" class="tag-lan">LAN加速</span>
             <span v-else class="tag-peer">来自伙伴</span>
           </div>
           <el-progress
@@ -272,7 +287,12 @@ html.dark .p2p-list {
 
 .tag-peer {
   background: var(--el-color-success-light-9);
-  color: var(--el-color-success);
+  border-radius: 4px;
+}
+
+.tag-lan {
+  background: var(--el-color-warning-light-9);
+  color: var(--el-color-warning);
   padding: 1px 4px;
   border-radius: 4px;
 }

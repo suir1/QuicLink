@@ -114,6 +114,10 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 		// 直接广播给房间内其他人
 		room.Broadcast(msg, conn)
 
+	// --- LAN Discovery ---
+	case "lan_info":
+		room.Broadcast(msg, conn)
+
 	// --- 心跳检测 ---
 	case "ping":
 		conn.WriteJSON(Message{Type: "pong"})

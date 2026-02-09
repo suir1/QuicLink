@@ -6,14 +6,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
 	"QuicLink/p2p"
+	"QuicLink/server"
 
+	"QuicLink/config"
+
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/wailsapp/wails/v2/pkg/runtime"
+	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 	"golang.design/x/clipboard"
 )
 
@@ -27,6 +36,9 @@ type App struct {
 	lastClipText  string
 	p2pNode       *p2p.Node
 	transportMode string // "ws" or "wt"
+	localServer   *server.LocalServer
+	lanServerInfo *server.ServerInfo // LAN Server info (ports, cert hash)
+	deviceID      string
 }
 
 // NewApp creates a new App application struct
@@ -35,6 +47,8 @@ func NewApp() *App {
 		serverHost:    "localhost:3100", // Default, can be configured
 		p2pNode:       p2p.NewNode(),
 		transportMode: "none",
+		localServer:   server.NewLocalServer(),
+		deviceID:      uuid.New().String(),
 	}
 }
 
@@ -50,6 +64,84 @@ func (a *App) startup(ctx context.Context) {
 
 	// Start clipboard watcher in background
 	go a.watchClipboard()
+
+	// Load Config
+	config.LoadConfig()
+	a.localServer.SetUploadDir(config.Current.DownloadDir)
+
+	// Start Local LAN Server (HTTP + HTTP/3)
+	info, err := a.localServer.Start()
+	if err != nil {
+		log.Printf("❌ Failed to start local server: %v", err)
+	} else {
+		a.lanServerInfo = info
+		log.Printf("🚀 LAN Server: HTTP=%d, HTTP/3=%d", info.HTTPPort, info.H3Port)
+		// Broadcast LAN info periodically
+		go a.broadcastLanInfo()
+	}
+}
+
+// broadcastLanInfo periodically sends local IP/Port to signaling server
+func (a *App) broadcastLanInfo() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	// Send immediately once
+	time.AfterFunc(2*time.Second, func() {
+		a.sendLanInfo()
+	})
+
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-ticker.C:
+			a.sendLanInfo()
+		}
+	}
+}
+
+func (a *App) sendLanInfo() {
+	if !a.GetConnectionStatus() || a.lanServerInfo == nil {
+		return
+	}
+
+	ip := a.getLocalIP()
+	if ip == "" {
+		return
+	}
+
+	hostname, _ := os.Hostname()
+
+	// Payload sent to other clients (dual protocol info)
+	payload := map[string]interface{}{
+		"id":       a.deviceID, // Unique ID per desktop instance
+		"ip":       ip,
+		"httpPort": a.lanServerInfo.HTTPPort, // HTTP fallback
+		"h3Port":   a.lanServerInfo.H3Port,   // HTTP/3 + WebTransport
+		"certHash": a.lanServerInfo.CertHash, // For browser WebTransport
+		"name":     hostname,                 // Friendly name
+	}
+	a.sendMessage(map[string]interface{}{
+		"type":    "lan_info",
+		"payload": payload,
+	})
+}
+
+func (a *App) getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, address := range addrs {
+		// Check for IPv4 and not loopback
+		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+	return ""
 }
 
 // --- Clipboard Module ---
@@ -86,7 +178,7 @@ func (a *App) watchClipboard() {
 			})
 
 			// Emit event to frontend
-			runtime.EventsEmit(a.ctx, "clipboard:local", text)
+			wailsRuntime.EventsEmit(a.ctx, "clipboard:local", text)
 		}
 	}
 }
@@ -215,7 +307,7 @@ func (a *App) handleIncomingMessage(msgType string, payload map[string]interface
 		if content, ok := payload["text"].(string); ok {
 			log.Printf("📋 Received clipboard_push (legacy): %s", truncate(content, 50))
 			a.SetClipboard(content)
-			runtime.EventsEmit(a.ctx, "clipboard:remote", content)
+			wailsRuntime.EventsEmit(a.ctx, "clipboard:remote", content)
 		}
 	case "clipboard_data":
 		// New Protocol: Server broadcasts clipboard_data with ID
@@ -227,29 +319,29 @@ func (a *App) handleIncomingMessage(msgType string, payload map[string]interface
 
 			// Optional: Write to system clipboard if 'Auto Sync' is desired
 			// For now, we just emit to frontend to update UI
-			runtime.EventsEmit(a.ctx, "clipboard:remote", payload)
+			wailsRuntime.EventsEmit(a.ctx, "clipboard:remote", payload)
 
 			// If we wanted to auto-sync to system clipboard:
 			// a.SetClipboard(content)
 		}
 	case "file_offer":
 		// Forward to frontend for display
-		runtime.EventsEmit(a.ctx, "p2p:offer", payload)
+		wailsRuntime.EventsEmit(a.ctx, "p2p:offer", payload)
 	case "init":
 		// Handle init message - extract and emit clipboard history directly
 		log.Printf("📥 Received init message from server")
 		if history, ok := payload["clipboardHistory"].([]interface{}); ok && len(history) > 0 {
 			log.Printf("📜 Emitting clipboard history to frontend (%d items)", len(history))
-			runtime.EventsEmit(a.ctx, "clipboard:history", history)
+			wailsRuntime.EventsEmit(a.ctx, "clipboard:history", history)
 		} else {
 			log.Printf("⚠️ Init payload has no clipboardHistory or it's empty")
 		}
 		// Also forward the whole init for other handlers (notes, hostInfo etc)
-		runtime.EventsEmit(a.ctx, "p2p:message", map[string]interface{}{"type": msgType, "payload": payload})
+		wailsRuntime.EventsEmit(a.ctx, "p2p:message", map[string]interface{}{"type": msgType, "payload": payload})
 	default:
 		// Forward generic messages (init, chat, etc) to frontend
 		log.Printf("📤 Forwarding message to frontend: type=%s", msgType)
-		runtime.EventsEmit(a.ctx, "p2p:message", map[string]interface{}{"type": msgType, "payload": payload})
+		wailsRuntime.EventsEmit(a.ctx, "p2p:message", map[string]interface{}{"type": msgType, "payload": payload})
 	}
 }
 
@@ -379,7 +471,66 @@ func (a *App) SendP2PHello() error {
 
 // shutdown is called when the app is closing
 func (a *App) shutdown(ctx context.Context) {
+	if a.localServer != nil {
+		a.localServer.Stop()
+	}
 	a.Disconnect()
+}
+
+// OpenDownloadDir opens the local download directory
+func (a *App) OpenDownloadDir() {
+	path := config.Current.DownloadDir
+	if path == "" {
+		home, _ := os.UserHomeDir()
+		path = filepath.Join(home, "Downloads", "QuicLink")
+	}
+
+	// Create if not exists
+	os.MkdirAll(path, 0755)
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("explorer", path)
+	case "darwin":
+		cmd = exec.Command("open", path)
+	case "linux":
+		cmd = exec.Command("xdg-open", path)
+	default:
+		log.Printf("❌ Unsupported OS for OpenDownloadDir")
+		return
+	}
+
+	cmd.Start()
+}
+
+// SelectDownloadDir opens a dialog for the user to select the download directory
+func (a *App) SelectDownloadDir() string {
+	selection, err := wailsRuntime.OpenDirectoryDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		Title: "Select Download Directory",
+	})
+
+	if err != nil || selection == "" {
+		return ""
+	}
+
+	// Update Config
+	if err := config.SetDownloadDir(selection); err != nil {
+		log.Printf("❌ Failed to save config: %v", err)
+		return ""
+	}
+
+	// Update Local Server
+	a.localServer.SetUploadDir(selection)
+	return selection
+}
+
+// GetDownloadDir returns the current download directory
+func (a *App) GetDownloadDir() string {
+	if config.Current == nil {
+		return ""
+	}
+	return config.Current.DownloadDir
 }
 
 // beforeClose is called before the app closes

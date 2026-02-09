@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"quiclink-server/config" // 引入配置
@@ -65,4 +66,58 @@ func HandleUpload(w http.ResponseWriter, r *http.Request) {
 		"url":    "/files/" + safeName,
 		"name":   filename,
 	})
+}
+
+type FileInfo struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Size      int64  `json:"size"`
+	Url       string `json:"url"`
+	CreatedAt int64  `json:"createdAt"`
+}
+
+func HandleListFiles(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+
+	entries, err := os.ReadDir(UploadDir)
+	if err != nil {
+		json.NewEncoder(w).Encode([]FileInfo{})
+		return
+	}
+
+	var files = []FileInfo{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		// Parse original name from "timestamp_filename"
+		// If parsing fails, just use the full name
+		originalName := entry.Name()
+		// simple heuristic: if it starts with digits and has underscore
+		// 1739..._filename.ext
+		if len(entry.Name()) > 11 && entry.Name()[10] == '_' {
+			// Assuming timestamp is usually 10 digits (Unix seconds), checking index 10
+			// But simple split is safer
+			parts := strings.SplitN(entry.Name(), "_", 2)
+			if len(parts) == 2 {
+				originalName = parts[1]
+			}
+		}
+
+		files = append(files, FileInfo{
+			ID:        entry.Name(), // Use disk filename as ID
+			Name:      originalName,
+			Size:      info.Size(),
+			Url:       "/files/" + entry.Name(),
+			CreatedAt: info.ModTime().Unix(),
+		})
+	}
+
+	json.NewEncoder(w).Encode(files)
 }

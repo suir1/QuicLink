@@ -5,6 +5,7 @@ import { computed, ref } from 'vue'
 export const useConnectionStore = defineStore('connection', () => {
     // --- 状态定义 ---
     const isConnected = ref(false)
+    const isDesktop = ref(!!(window as any).runtime) // Detect Wails
     const transport = ref<any>(null) // WebTransport instance
     const streamWriter = ref<WritableStreamDefaultWriter | null>(null)
 
@@ -16,6 +17,17 @@ export const useConnectionStore = defineStore('connection', () => {
     const hostOnline = ref(false)    // C++ Host 是否在线
     const hostIp = ref('')           // C++ Host 的局域网 IP
     const certHash = ref('')         // 服务器证书指纹
+    const lanServerUrl = ref('')     // Active Desktop LAN Server URL (HTTP fallback)
+    // Map<id, LanServerInfo>
+    interface LanServerInfo {
+        id: string
+        name: string
+        ip: string
+        httpPort: number
+        h3Port?: number
+        certHash?: string
+    }
+    const lanServers = ref<Map<string, LanServerInfo>>(new Map())
 
     // 环境变量处理
     // 环境变量处理
@@ -40,6 +52,16 @@ export const useConnectionStore = defineStore('connection', () => {
     // P2P State
     const localFiles = ref<Map<string, File>>(new Map())
     const receivingFiles = ref<Map<string, { chunks: string[], total: number, received: number, name: string, type: string }>>(new Map())
+
+    // WebRTC State (Phase 2b)
+    // Key: remote peer id (or temporary just "peer" for 1-on-1 simplicity in demo)
+    // In multi-user room, we need map<userId, RTCPeerConnection>. For now assuming 1 peer for simplicity or broadcast.
+    // Let's use a single peer for the "Partner" model or just loop if needed.
+    // For V1, let's keep it simple: We allow *one* P2P connection at a time or handle via map.
+    // Given the room structure, let's try to be smart.
+    const peerConnection = ref<RTCPeerConnection | null>(null)
+    const dataChannel = ref<RTCDataChannel | null>(null)
+    const isP2PConnected = ref(false)
 
     // --- Auto-Detect Protocol ---
     async function detectProtocol() {
@@ -195,6 +217,205 @@ export const useConnectionStore = defineStore('connection', () => {
     function handleClose() {
         isConnected.value = false
         hostOnline.value = false
+        // Close WebRTC
+        if (peerConnection.value) {
+            peerConnection.value.close()
+            peerConnection.value = null
+        }
+        dataChannel.value = null
+        isP2PConnected.value = false
+    }
+
+    // --- WebRTC Logic (Phase 2b) ---
+    const rtcConfig = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:global.stun.twilio.com:3478' }
+        ]
+    }
+
+    function setupPeerConnection() {
+        if (peerConnection.value) return peerConnection.value
+
+        const pc = new RTCPeerConnection(rtcConfig)
+
+        pc.onicecandidate = (event) => {
+            if (event.candidate) {
+                sendMessage({ type: 'candidate', payload: event.candidate })
+            }
+        }
+
+        pc.onconnectionstatechange = () => {
+            console.log('RTC State:', pc.connectionState)
+            if (pc.connectionState === 'connected') {
+                isP2PConnected.value = true
+                ElMessage.success('⚡ P2P 直接连接已建立')
+            } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+                isP2PConnected.value = false
+            }
+        }
+
+        pc.ondatachannel = (event) => {
+            setupDataChannel(event.channel)
+        }
+
+        peerConnection.value = pc
+        return pc
+    }
+
+    function setupDataChannel(dc: RTCDataChannel) {
+        dc.onopen = () => {
+            console.log('RTC DataChannel OPEN')
+            dataChannel.value = dc
+        }
+        dc.onmessage = (e) => {
+            // Handle P2P messages (files)
+            handleP2PMessage(e.data)
+        }
+    }
+
+    async function startP2P() {
+        // Initiator
+        console.log("⚡ Starting P2P Handshake...")
+        const pc = setupPeerConnection()!
+        const dc = pc.createDataChannel("file-transfer")
+        setupDataChannel(dc)
+
+        const offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        sendMessage({ type: 'offer', payload: offer })
+    }
+
+    async function handleOffer(offer: RTCSessionDescriptionInit) {
+        console.log("⚡ Received Offer, answering...")
+        const pc = setupPeerConnection()!
+        await pc.setRemoteDescription(new RTCSessionDescription(offer))
+        const answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        sendMessage({ type: 'answer', payload: answer })
+    }
+
+    async function handleAnswer(answer: RTCSessionDescriptionInit) {
+        console.log("⚡ Received Answer")
+        const pc = peerConnection.value
+        if (pc) {
+            await pc.setRemoteDescription(new RTCSessionDescription(answer))
+        }
+    }
+
+    async function handleCandidate(candidate: RTCIceCandidateInit) {
+        const pc = peerConnection.value
+        if (pc) {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate))
+        }
+    }
+
+    // P2P File Sending (Stream via Chunking over DC)
+    async function sendFileP2P(file: File) {
+        if (!dataChannel.value || dataChannel.value.readyState !== 'open') throw new Error("No Data Channel")
+
+        // 1. Send Meta
+        const id = `${Date.now()}-${file.name}`
+        const meta = JSON.stringify({
+            type: 'meta',
+            id,
+            name: file.name,
+            size: file.size,
+            mime: file.type
+        })
+        dataChannel.value.send(meta)
+
+        // 2. Send Chunks
+        const CHUNK_SIZE = 16 * 1024 // Safe MTU
+        const total = Math.ceil(file.size / CHUNK_SIZE)
+
+        let sent = 0
+        for (let i = 0; i < total; i++) {
+            const start = i * CHUNK_SIZE
+            const end = Math.min(start + CHUNK_SIZE, file.size)
+            const chunk = file.slice(start, end)
+            const buffer = await chunk.arrayBuffer()
+
+            // Check buffer level to avoid flooding
+            while (dataChannel.value.bufferedAmount > 10 * 1024 * 1024) {
+                await new Promise(r => setTimeout(r, 50))
+            }
+
+            dataChannel.value.send(buffer)
+            sent++
+
+            // Optional: Send progress event locally or via channel?
+            // For now, assume receiver tracks it
+        }
+
+        console.log(`✅ P2P Send Complete: ${file.name}`)
+    }
+
+    // Handle Incoming P2P Data
+    // We need a state machine because messages are ordered on DC
+    let incomingFile: {
+        id: string, name: string, size: number, received: number, buffer: Blob[]
+    } | null = null
+
+    function handleP2PMessage(data: any) {
+        if (typeof data === 'string') {
+            try {
+                const msg = JSON.parse(data)
+                if (msg.type === 'meta') {
+                    // Start new file
+                    incomingFile = {
+                        id: msg.id,
+                        name: msg.name,
+                        size: msg.size,
+                        received: 0,
+                        buffer: []
+                    }
+                    console.log(`📥 P2P Incoming File: ${msg.name}`)
+
+                    if (onP2PEvent.value) {
+                        onP2PEvent.value('offer', {
+                            id: msg.id,
+                            name: msg.name,
+                            size: msg.size,
+                            type: msg.mime,
+                            isLan: false, // It's P2P
+                            isP2P: true
+                        })
+                    }
+                }
+            } catch (e) { }
+        } else if (data instanceof ArrayBuffer) {
+            // Binary Chunk
+            if (!incomingFile) return
+
+            incomingFile.buffer.push(new Blob([data]))
+            incomingFile.received += data.byteLength
+
+            // Update UI Progress
+            if (onP2PEvent.value) {
+                onP2PEvent.value('progress', {
+                    id: incomingFile.id,
+                    received: incomingFile.received,
+                    total: incomingFile.size
+                })
+            }
+
+            // Check Complete
+            if (incomingFile.received >= incomingFile.size) {
+                const blob = new Blob(incomingFile.buffer)
+                const url = URL.createObjectURL(blob)
+                // Auto download or let UI handle?
+                // For now, simple auto download trigger
+                const a = document.createElement('a')
+                a.href = url
+                a.download = incomingFile.name
+                a.click()
+                URL.revokeObjectURL(url)
+
+                incomingFile = null
+                ElMessage.success('WebRTC P2P 传输完成! 🚀')
+            }
+        }
     }
 
     // --- 3. 读取循环 (处理粘包/分包) ---
@@ -266,6 +487,133 @@ export const useConnectionStore = defineStore('connection', () => {
                 type: file.type
             }
         })
+    }
+
+    // Phase 2: Smart Send (LAN WebTransport -> HTTP -> P2P -> VPS)
+    async function smartSendFile(file: File) {
+        // Find active LAN server with full info
+        const activeLanServer = Array.from(lanServers.value.values())[0]
+
+        // Priority 1: LAN WebTransport (HTTP/3)
+        if (activeLanServer?.h3Port && activeLanServer?.certHash) {
+            console.log("🚀 Smart Send: Trying LAN WebTransport (HTTP/3)...")
+            try {
+                const result = await sendViaLanWebTransport(file, activeLanServer)
+                if (result) {
+                    ElMessage.success('⚡ 已通过 LAN HTTP/3 极速分享')
+                    return
+                }
+            } catch (e) {
+                console.warn("LAN WebTransport failed, falling back to HTTP", e)
+            }
+        }
+
+        // Priority 2: LAN HTTP Fallback
+        if (activeLanServer?.httpPort) {
+            console.log("🔄 Smart Send: Trying LAN HTTP fallback...")
+            try {
+                const httpUrl = `http://${activeLanServer.ip}:${activeLanServer.httpPort}`
+                const formData = new FormData()
+                formData.append('file', file)
+
+                const res = await fetch(`${httpUrl}/api/lan/upload`, {
+                    method: 'POST',
+                    body: formData
+                })
+
+                if (res.ok) {
+                    const data = await res.json()
+                    sendMessage({
+                        type: 'lan_file_shared',
+                        payload: {
+                            id: data.id,
+                            name: data.name,
+                            size: data.size,
+                            ip: activeLanServer.ip,
+                            baseUrl: httpUrl
+                        }
+                    })
+                    ElMessage.success('⚡ 已通过局域网 HTTP 分享')
+                    return
+                }
+            } catch (e) {
+                console.warn("LAN HTTP failed, falling back to P2P/VPS", e)
+            }
+        }
+
+        // Priority 3: WebRTC P2P
+        if (isP2PConnected.value) {
+            console.log("🚀 Smart Send: Using WebRTC P2P...")
+            try {
+                await sendFileP2P(file)
+                return
+            } catch (e) {
+                console.warn("P2P Send failed", e)
+            }
+        }
+
+        // Priority 4: Fallback to VPS Relay
+        console.log("🔄 Smart Send: Falling back to VPS Relay")
+        shareFile(file)
+    }
+
+    // Send file via LAN WebTransport (HTTP/3)
+    async function sendViaLanWebTransport(file: File, server: LanServerInfo): Promise<boolean> {
+        const url = `https://${server.ip}:${server.h3Port}/wt`
+
+        // Decode base64 cert hash to ArrayBuffer
+        const hashBytes = Uint8Array.from(atob(server.certHash!), c => c.charCodeAt(0))
+
+        const wt = new WebTransport(url, {
+            serverCertificateHashes: [{
+                algorithm: 'sha-256',
+                value: hashBytes.buffer
+            }]
+        })
+
+        await wt.ready
+        console.log("✅ LAN WebTransport connected")
+
+        const stream = await wt.createBidirectionalStream()
+        const writer = stream.writable.getWriter()
+        const reader = stream.readable.getReader()
+
+        // Send command
+        const cmd = JSON.stringify({
+            action: 'upload',
+            name: file.name,
+            size: file.size
+        }) + '\n'
+        await writer.write(new TextEncoder().encode(cmd))
+
+        // Send file content
+        const arrayBuffer = await file.arrayBuffer()
+        await writer.write(new Uint8Array(arrayBuffer))
+        await writer.close()
+
+        // Read response
+        const { value } = await reader.read()
+        if (value) {
+            const response = JSON.parse(new TextDecoder().decode(value))
+            if (response.status === 'ok') {
+                // Broadcast to room
+                sendMessage({
+                    type: 'lan_file_shared',
+                    payload: {
+                        id: response.file.id,
+                        name: response.file.name,
+                        size: response.file.size,
+                        ip: server.ip,
+                        baseUrl: `http://${server.ip}:${server.httpPort}` // HTTP download fallback
+                    }
+                })
+                wt.close()
+                return true
+            }
+        }
+
+        wt.close()
+        return false
     }
 
     async function requestFile(fileId: string) {
@@ -413,9 +761,13 @@ export const useConnectionStore = defineStore('connection', () => {
                     break
 
                 case 'offer':
+                    handleOffer(msg.payload)
+                    break
                 case 'answer':
+                    handleAnswer(msg.payload)
+                    break
                 case 'candidate':
-                    // WebRTC 信令，暂不处理或交给专用的 store
+                    handleCandidate(msg.payload)
                     break
 
                 // --- P2P File Handling ---
@@ -425,6 +777,14 @@ export const useConnectionStore = defineStore('connection', () => {
 
                 case 'p2p_hello':
                     console.log('👋 Received p2p_hello from new peer')
+
+                    // Trigger P2P Handshake if we are "older" or just random?
+                    // Simple: Both try, WebRTC handles glare using 'polite' peer pattern, or just let Initiator be the one sending file?
+                    // Better: Auto-connect mesh.
+                    if (!peerConnection.value) {
+                        startP2P()
+                    }
+
                     // A new peer joined. Re-broadcast my files.
                     // Loop localFiles and send offer
                     if (localFiles.value.size > 0) {
@@ -458,6 +818,51 @@ export const useConnectionStore = defineStore('connection', () => {
                         total: msg.payload.total
                     })
                     break
+
+                // --- LAN Discovery ---
+                case 'lan_info':
+                    if (msg.payload && msg.payload.ip && (msg.payload.httpPort || msg.payload.port)) {
+                        const id = msg.payload.id || `${msg.payload.ip}`
+                        const name = msg.payload.name || msg.payload.host || msg.payload.ip
+                        const httpPort = msg.payload.httpPort || msg.payload.port
+                        const h3Port = msg.payload.h3Port
+                        const certHashVal = msg.payload.certHash
+
+                        const lanInfo: LanServerInfo = {
+                            id,
+                            name,
+                            ip: msg.payload.ip,
+                            httpPort,
+                            h3Port,
+                            certHash: certHashVal
+                        }
+
+                        // Update Map
+                        if (!lanServers.value.has(id)) {
+                            ElMessage.success(`⚡ 已发现局域网主机: ${name}`)
+                        }
+                        lanServers.value.set(id, lanInfo)
+
+                        // Auto-select if none active (use HTTP URL as default)
+                        if (!lanServerUrl.value) {
+                            lanServerUrl.value = `http://${msg.payload.ip}:${httpPort}`
+                            console.log(`📡 LAN Server: HTTP=${httpPort}, H3=${h3Port || 'N/A'}`)
+                        }
+                    }
+                    break
+
+                // --- P2P Smart Send Support ---
+                case 'lan_file_shared':
+                    // Treat it like a file offer, but mark it as LAN
+                    if (onP2PEvent.value) {
+                        onP2PEvent.value('offer', {
+                            ...msg.payload,
+                            isLan: true,
+                            // specific download URL construction handled by UI or store helper?
+                            // For simplicity, let's keep it in UI for now
+                        })
+                    }
+                    break
             }
         } catch (e) {
             console.error("消息解析失败", e, jsonStr)
@@ -466,12 +871,13 @@ export const useConnectionStore = defineStore('connection', () => {
 
     return {
         isConnected,
-        isDesktop: ref(false), // Web client is never desktop
+        isDesktop, // Export detected flag
         transport, // Export for UI state check
         currentRoom,
         serverMode,
         hostOnline,
         hostIp,
+        lanServerUrl, // Export
         checkMode,
         connect,
         sendMessage,
@@ -483,6 +889,15 @@ export const useConnectionStore = defineStore('connection', () => {
         shareFile,
         requestFile,
         HTTP_URL,
-        disconnect: closeConnection
+        disconnect: closeConnection,
+        lanServers, // Export
+        switchLanHost: (id: string) => {
+            const s = lanServers.value.get(id)
+            if (s) {
+                lanServerUrl.value = `http://${s.ip}:${s.httpPort}`
+                ElMessage.info(`已切换到主机: ${s.name}`)
+            }
+        },
+        smartSendFile, // Export
     }
 })

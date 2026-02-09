@@ -13,11 +13,17 @@ export function GetClipboard():Promise<string>;
 
 export function GetConnectionStatus():Promise<boolean>;
 
+export function GetDownloadDir():Promise<string>;
+
 export function GetP2PStatus():Promise<boolean>;
 
 export function GetTransportMode():Promise<string>;
 
 export function Greet(arg1:string):Promise<string>;
+
+export function OpenDownloadDir():Promise<void>;
+
+export function SelectDownloadDir():Promise<string>;
 
 export function SendClipboard():Promise<void>;
 
