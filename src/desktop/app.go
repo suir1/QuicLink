@@ -119,13 +119,8 @@ func (a *App) Connect(host, roomID, password string) error {
 
 	// 1. Attempt WebTransport (HTTP/3) - Best Performance
 	log.Printf("🚀 Attempting WebTransport connection to %s...", host)
-	// TODO: Pass password to p2pNode.Connect if supported. For now, we focus on WS fallback or assume header auth?
-	// The current p2p/node.go might need updates too, but let's stick to URL params for consistency.
-	// Assuming p2pNode.Connect handles URL construction internally or we need to pass full URL?
-	// Let's check p2pNode.Connect signature first or just update it here if simple.
-	// Actually, looking at previous steps, we construct WT URL in frontend. In backend Go, p2pNode.Connect(host, room) likely builds it.
-	// For now, let's just update the signature and pass password to WS fallback which we control directly here.
-	err := a.p2pNode.Connect(host, roomID)
+	// Pass password to enable authentication in private mode
+	err := a.p2pNode.Connect(host, roomID, password)
 	if err == nil {
 		a.transportMode = "wt"
 		log.Printf("✅ Connected via WebTransport (HTTP/3)")

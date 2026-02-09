@@ -7,13 +7,14 @@ import (
 )
 
 type Config struct {
-	AppMode       string `json:"app_mode"`       // "public" or "private"
-	AdminPassword string `json:"admin_password"` // 私有模式必填
-	UseHTTPS      bool   `json:"use_https"`      // 是否使用 HTTPS (默认 true)
-	Port          int    `json:"port"`           // 服务端口 (默认 8080)
-	RoomTTLHours  int    `json:"room_ttl_hours"` // Public 模式房间存活时间 (默认 48)
-	CertFile      string `json:"cert_file"`      // TLS 证书路径 (默认 cert.pem)
-	KeyFile       string `json:"key_file"`       // TLS 私钥路径 (默认 key.pem)
+	AppMode       string `json:"app_mode"`        // "public" or "private"
+	AdminPassword string `json:"admin_password"`  // 私有模式必填
+	UseHTTPS      bool   `json:"use_https"`       // 是否使用 HTTPS (默认 true)
+	Port          int    `json:"port"`            // 服务端口 (默认 8080)
+	RoomTTLHours  int    `json:"room_ttl_hours"`  // Public 模式房间存活时间 (默认 48)
+	CertFile      string `json:"cert_file"`       // TLS 证书路径 (默认 cert.pem)
+	KeyFile       string `json:"key_file"`        // TLS 私钥路径 (默认 key.pem)
+	ForceCertHash bool   `json:"force_cert_hash"` // 是否强制计算证书 Hash (自签名证书必须为 true，正规证书设为 false)
 
 	Limits struct {
 		MaxUploadSizeMB      int64 `json:"max_upload_size_mb"`

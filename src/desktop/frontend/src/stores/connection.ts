@@ -1,6 +1,7 @@
 import { ElMessage } from 'element-plus'
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
+import { isWails } from '../utils/wails'
 
 export const useConnectionStore = defineStore('connection', () => {
     // --- 状态定义 ---
@@ -72,6 +73,13 @@ export const useConnectionStore = defineStore('connection', () => {
 
     // --- 1. 检查服务器模式 ---
     async function checkMode() {
+        // Desktop check: Skip frontend network probe which is unreliable in WebView
+        if (isDesktop.value) {
+            console.log('🖥️ Desktop mode: skipping protocol detection')
+            serverMode.value = 'public'
+            return 'public'
+        }
+
         await detectProtocol() // Probe first
 
         try {
@@ -149,7 +157,11 @@ export const useConnectionStore = defineStore('connection', () => {
                 return
 
             } catch (e) {
-                console.warn("❌ WebTransport failed, falling back to WebSocket", e)
+                console.warn("❌ WebTransport failed, falling back to WebSocket")
+                console.error("WebTransport Error Details:", e)
+                if (e instanceof Error) {
+                    console.error("Error Name:", e.name, "| Message:", e.message)
+                }
                 ElMessage.warning("HTTP/3 连接失败，正在尝试降级 WebSocket...")
             }
         }
@@ -532,7 +544,7 @@ export const useConnectionStore = defineStore('connection', () => {
     }
 
     // Initialize isDesktop
-    if (window.navigator.userAgent.includes('Wails')) {
+    if (isWails()) {
         isDesktop.value = true
     }
 

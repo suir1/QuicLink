@@ -28,6 +28,17 @@ import (
 	"github.com/quic-go/webtransport-go"
 )
 
+// Wrapper to capture status code
+type responseWriterWrapper struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *responseWriterWrapper) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
 func main() {
 	// 加载配置
 	config.LoadConfig()
@@ -41,16 +52,23 @@ func main() {
 	certFile := config.Current.CertFile
 	keyFile := config.Current.KeyFile
 	if config.Current.UseHTTPS {
+		// 自动判断：如果证书不存在，则生成自签名证书，并强制启用 Hash
 		if _, err := os.Stat(certFile); os.IsNotExist(err) {
 			fmt.Println("🔒 Generating self-signed certificate...")
 			if err := generateSelfSignedCert(certFile, keyFile); err != nil {
 				log.Fatalf("Failed to generate cert: %v", err)
 			}
+			// 自签名证书必须启用 Hash
+			config.Current.ForceCertHash = true
 		}
 
-		// 计算证书 Hash
-		if err := computeCertHash(certFile); err != nil {
-			log.Printf("⚠️ Failed to compute cert hash: %v", err)
+		// 计算证书 Hash (仅在强制启用时)
+		if config.Current.ForceCertHash {
+			if err := computeCertHash(certFile); err != nil {
+				log.Printf("⚠️ Failed to compute cert hash: %v", err)
+			}
+		} else {
+			fmt.Println("🔒 Loaded external certificate (Hash Validation Disabled)")
 		}
 	}
 
@@ -139,13 +157,46 @@ func main() {
 	}
 
 	// 1. 初始化 WebTransport Server
+	// Wrap DefaultServeMux with logging
+	// 注意：对于 WebTransport CONNECT 请求，不能使用 wrapper，因为 http3.Settingser 接口需要原始 ResponseWriter
+	loggingHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("🔍 [%s] Request: %s %s from %s", r.Proto, r.Method, r.URL.Path, r.RemoteAddr)
+
+		// 对于 WebTransport CONNECT 请求，直接使用原始 ResponseWriter
+		// 因为 webtransport.Server.Upgrade() 需要类型断言到 http3.Settingser
+		if r.Method == http.MethodConnect && r.URL.Path == "/wt" {
+			http.DefaultServeMux.ServeHTTP(w, r)
+			log.Printf("🔍 [%s] Response: WebTransport for %s %s", r.Proto, r.Method, r.URL.Path)
+			return
+		}
+
+		// 其他请求使用 wrapper 来记录状态码
+		rw := &responseWriterWrapper{ResponseWriter: w, status: 200}
+		http.DefaultServeMux.ServeHTTP(rw, r)
+		log.Printf("🔍 [%s] Response: %d for %s %s", r.Proto, rw.status, r.Method, r.URL.Path)
+	})
+
+	// 初始化 HTTP/3 Server
+	// 注意：webtransport.ConfigureHTTP3Server 会设置 AdditionalSettings 和 EnableDatagrams
+	// 所以我们先创建基础配置，再调用它来配置 WebTransport 支持
+	h3Server := &http3.Server{
+		Addr:      ":" + port,
+		Handler:   loggingHandler,
+		TLSConfig: tlsConfig,
+	}
+
+	// 关键！使用 webtransport.ConfigureHTTP3Server 来正确配置 HTTP/3 服务器
+	// 这个函数会：
+	// 1. 设置 AdditionalSettings[settingsEnableWebtransport] = 1 (HTTP/3 层支持 WebTransport)
+	// 2. 设置 EnableDatagrams = true (支持 HTTP/3 Datagrams)
+	// 3. 设置 ConnContext 回调，在每个连接的 context 中注入 QUIC 连接
+	webtransport.ConfigureHTTP3Server(h3Server)
+
+	log.Printf("🔧 HTTP/3 Server configured: EnableDatagrams=%v, AdditionalSettings=%v",
+		h3Server.EnableDatagrams, h3Server.AdditionalSettings)
+
 	handlers.WTServer = &webtransport.Server{
-		H3: &http3.Server{
-			Addr:            ":" + port,
-			Handler:         http.DefaultServeMux,
-			TLSConfig:       tlsConfig,
-			EnableDatagrams: true,
-		},
+		H3: h3Server,
 		CheckOrigin: func(r *http.Request) bool {
 			return true
 		},
@@ -154,6 +205,9 @@ func main() {
 	// 2. 启动 HTTP/3 (UDP)
 	go func() {
 		defer wg.Done()
+		log.Printf("🔊 Starting HTTP/3 (QUIC) server on UDP :%s...", port)
+		// 使用 webtransport-go 的 ListenAndServeTLS，让它处理必要的握手细节
+		// 但我们提前配置了 settings，希望能被正确合并/使用
 		if err := handlers.WTServer.ListenAndServeTLS(certFile, keyFile); err != nil {
 			log.Printf("❌ HTTP/3 Server error: %v", err)
 		}

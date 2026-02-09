@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/quic-go/webtransport-go"
 )
@@ -31,16 +32,24 @@ func NewNode() *Node {
 }
 
 // Connect establishes a WebTransport connection to the signaling server
-func (n *Node) Connect(host, roomID string) error {
+// token is optional, used for authentication in private mode
+func (n *Node) Connect(host, roomID string, token ...string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	n.serverHost = host
 	n.roomID = roomID
-	n.ctx, n.cancel = context.WithCancel(context.Background())
 
-	// WebTransport URL
+	// Create context with timeout for connection
+	var cancel context.CancelFunc
+	n.ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+	n.cancel = cancel
+
+	// WebTransport URL with optional token
 	url := fmt.Sprintf("https://%s/wt?room=%s", host, roomID)
+	if len(token) > 0 && token[0] != "" {
+		url += "&token=" + token[0]
+	}
 	log.Printf("🔌 P2P Connecting to: %s", url)
 
 	// Configure Dialer with HTTP/3 support
@@ -52,15 +61,21 @@ func (n *Node) Connect(host, roomID string) error {
 	}
 
 	// Dial WebTransport
+	log.Printf("🔍 Starting QUIC/WebTransport dial...")
 	_, session, err := dialer.Dial(n.ctx, url, nil)
 	if err != nil {
+		log.Printf("❌ WebTransport dial error details: %v", err)
+		log.Printf("   Host: %s, Room: %s", host, roomID)
 		return fmt.Errorf("webtransport dial failed: %w", err)
 	}
 	n.session = session
+	log.Printf("✅ WebTransport session established")
 
 	// Open bidirectional stream for signaling (Control Stream)
+	log.Printf("🔍 Opening bidirectional stream...")
 	stream, err := session.OpenStreamSync(n.ctx)
 	if err != nil {
+		log.Printf("❌ Stream open error: %v", err)
 		session.CloseWithError(0, "stream open failed")
 		return fmt.Errorf("open stream failed: %w", err)
 	}

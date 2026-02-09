@@ -148,7 +148,11 @@ export const useConnectionStore = defineStore('connection', () => {
                 return
 
             } catch (e) {
-                console.warn("❌ WebTransport failed, falling back to WebSocket", e)
+                console.warn("❌ WebTransport failed, falling back to WebSocket")
+                console.error("WebTransport Error Details:", e)
+                if (e instanceof Error) {
+                    console.error("Error Name:", e.name, "| Message:", e.message)
+                }
                 ElMessage.warning("HTTP/3 连接失败，正在尝试降级 WebSocket...")
             }
         }
