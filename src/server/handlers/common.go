@@ -3,6 +3,7 @@ package handlers
 import (
 	"log"
 	"quiclink-server/store"
+	"strconv"
 )
 
 // ProcessMessage 处理单个业务消息
@@ -46,11 +47,25 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 		// Web/Host 发送了新文本 -> 广播给对面 (包括发送者自己，以同步 Server ID)
 		if payload, ok := msg.Payload.(map[string]interface{}); ok {
 			if text, ok := payload["text"].(string); ok {
-				// Try to get client-provided ID
-				id, _ := payload["id"].(string)
+				// Log entire payload keys to debug missing ID
+				log.Printf("📥 Clipboard Push Payload Keys: %v", payload)
+
+				// Try to get client-provided ID (Handle both string and number types)
+				var id string
+				if val, ok := payload["id"].(string); ok {
+					id = val
+				} else if val, ok := payload["id"].(float64); ok {
+					id = strconv.FormatFloat(val, 'f', 0, 64)
+				} else {
+					log.Printf("⚠️ ID Parsing Failed! Payload['id'] is Type: %T, Value: %v", payload["id"], payload["id"])
+				}
+				log.Printf("📥 Clipboard Push: TextLen=%d, ParsedID=%s", len(text), id)
 
 				item := room.AddClipboardItem(text, id)
 				if item != nil {
+					if id == "" {
+						log.Printf("⚠️ Warning: AddClipboardItem called with empty ID (Server generated: %s)", item.ID)
+					}
 					// Encode item to map for broadcast
 					broadcastPayload := map[string]interface{}{
 						"id":   item.ID,

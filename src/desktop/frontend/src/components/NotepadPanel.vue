@@ -22,7 +22,7 @@ const timers: Record<string, number> = {}
 // 初始化
 onMounted(() => {
   // 注册事件监听
-  conn.onNotepadEvent = (type, payload) => {
+  conn.onNotepadEvent = (type: string, payload: any) => {
     console.log(`📝 NotepadPanel received: ${type}`, payload)
     if (type === 'init') {
       // payload 是 Note[] 列表

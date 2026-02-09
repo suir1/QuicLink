@@ -50,9 +50,14 @@ const clipboardRef = ref()
 const notepadRef = ref()
 
 onMounted(async () => {
-  conn.onClipboardData = (text) => {
-    clipboardRef.value?.updateText(text)
+  // 0. Initialize Wails Events (Desktop Only)
+  if (conn.isDesktop) {
+    conn.setupDesktopEventListeners()
   }
+
+  // NOTE: do NOT set conn.onClipboardData here.
+  // ClipboardCard.vue sets it effectively. Overwriting it here breaks ID sync.
+
 
   // Check mode and join
   try {

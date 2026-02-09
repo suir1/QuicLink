@@ -48,7 +48,7 @@ func LoadConfig() {
 
 	// 默认值处理
 	if Current.Port == 0 {
-		Current.Port = 8080
+		Current.Port = 3100
 	}
 	if Current.RoomTTLHours == 0 {
 		Current.RoomTTLHours = 48 // 默认 2 天
@@ -72,7 +72,7 @@ func createDefaultConfig() {
 	defaultCfg := Config{
 		AppMode:      "public",
 		UseHTTPS:     true, // 默认启用 HTTPS
-		Port:         8080,
+		Port:         3100,
 		RoomTTLHours: 48, // 默认 2 天
 		CertFile:     "cert.pem",
 		KeyFile:      "key.pem",

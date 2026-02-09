@@ -32,7 +32,7 @@ type App struct {
 // NewApp creates a new App application struct
 func NewApp() *App {
 	return &App{
-		serverHost:    "localhost:8080", // Default, can be configured
+		serverHost:    "localhost:3100", // Default, can be configured
 		p2pNode:       p2p.NewNode(),
 		transportMode: "none",
 	}
@@ -75,10 +75,13 @@ func (a *App) watchClipboard() {
 			log.Printf("📋 Clipboard changed (detected): %s", truncate(text, 50))
 
 			// Send to server if connected
+			// Generate ID for the item to ensure persistence
+			id := fmt.Sprintf("%d", time.Now().UnixMilli())
 			a.sendMessage(map[string]interface{}{
 				"type": "clipboard_push",
 				"payload": map[string]string{
 					"text": text,
+					"id":   id,
 				},
 			})
 
@@ -207,10 +210,27 @@ func (a *App) Disconnect() {
 func (a *App) handleIncomingMessage(msgType string, payload map[string]interface{}) {
 	switch msgType {
 	case "clipboard_push":
+		// Deprecated: Server now sends clipboard_data
+		// Keep for compatibility if needed, but logic is moved to clipboard_data
 		if content, ok := payload["text"].(string); ok {
-			log.Printf("📋 Received clipboard: %s", truncate(content, 50))
+			log.Printf("📋 Received clipboard_push (legacy): %s", truncate(content, 50))
 			a.SetClipboard(content)
 			runtime.EventsEmit(a.ctx, "clipboard:remote", content)
+		}
+	case "clipboard_data":
+		// New Protocol: Server broadcasts clipboard_data with ID
+		if content, ok := payload["text"].(string); ok {
+			log.Printf("📋 Received clipboard_data: %s", truncate(content, 50))
+
+			// Update lastClipText to prevent echo when we write to system clipboard
+			a.lastClipText = content
+
+			// Optional: Write to system clipboard if 'Auto Sync' is desired
+			// For now, we just emit to frontend to update UI
+			runtime.EventsEmit(a.ctx, "clipboard:remote", payload)
+
+			// If we wanted to auto-sync to system clipboard:
+			// a.SetClipboard(content)
 		}
 	case "file_offer":
 		// Forward to frontend for display

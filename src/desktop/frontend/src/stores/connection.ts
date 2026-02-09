@@ -1,12 +1,10 @@
 import { ElMessage } from 'element-plus'
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
-import wails, { isWails } from '../utils/wails'
+import { computed, ref } from 'vue'
 
 export const useConnectionStore = defineStore('connection', () => {
     // --- 状态定义 ---
     const isConnected = ref(false)
-    const isDesktop = ref(isWails()) // Detect if running in Wails
     const transport = ref<any>(null) // WebTransport instance
     const streamWriter = ref<WritableStreamDefaultWriter | null>(null)
 
@@ -18,15 +16,20 @@ export const useConnectionStore = defineStore('connection', () => {
     const hostOnline = ref(false)    // C++ Host 是否在线
     const hostIp = ref('')           // C++ Host 的局域网 IP
     const certHash = ref('')         // 服务器证书指纹
+    const isDesktop = ref(false)     // Is running in Wails Desktop environment
 
     // 环境变量处理
     // 环境变量处理
-    // 优先使用环境变量，否则尝试使用 window.location.host (如果是在浏览器环境中)
-    const VPS_HOST = import.meta.env.VITE_VPS_HOST || (window.location.protocol.startsWith('http') ? window.location.host : 'localhost:3100')
-    // 协议检测：跟随当前页面协议（Wails 用 http，生产用 https）
-    const PROTOCOL = window.location.protocol // 'http:' or 'https:'
-    const HTTP_URL = `${PROTOCOL}//${VPS_HOST}`
-    const WT_URL = `https://${VPS_HOST}` // WebTransport 仍需 HTTPS
+    // 优先使用环境变量，否则使用当前浏览器地址栏的 Host (自动适配域名/IP)
+    const VPS_HOST = import.meta.env.VITE_VPS_HOST || window.location.host
+
+    // 协议判定 (Reactive Auto-Detection)
+    const protocol = ref(window.location.protocol) // Default to current
+    const PROTOCOL = computed(() => protocol.value)
+
+    // Computed URLs based on detected protocol
+    const HTTP_URL = computed(() => `${protocol.value}//${VPS_HOST}`)
+    const WT_URL = computed(() => `https://${VPS_HOST}`) // WebTransport always requires HTTPS/QUIC
 
     // --- 回调函数钩子 ---
     const onClipboardData = ref<((data: any) => void) | null>(null)
@@ -39,70 +42,40 @@ export const useConnectionStore = defineStore('connection', () => {
     const localFiles = ref<Map<string, File>>(new Map())
     const receivingFiles = ref<Map<string, { chunks: string[], total: number, received: number, name: string, type: string }>>(new Map())
 
-    // --- Desktop Wails Integration ---
-    function setupDesktopEventListeners() {
-        if (!isDesktop.value) {
-            console.log('❌ Not desktop mode, skipping Wails listeners')
-            return
-        }
+    // --- Auto-Detect Protocol ---
+    async function detectProtocol() {
+        const testHosts = [
+            { proto: 'https:', url: `https://${VPS_HOST}/api/info` },
+            { proto: 'http:', url: `http://${VPS_HOST}/api/info` }
+        ]
 
-        console.log('🖥️ Running in Wails Desktop Mode')
-        ElMessage.info('🖥️ Wails模式已启动，正在注册事件监听器...')
+        console.log("🕵️ Probing server protocol...")
+        for (const test of testHosts) {
+            try {
+                const controller = new AbortController()
+                const timeoutId = setTimeout(() => controller.abort(), 2000)
 
-        // Listen for clipboard updates from Go (Remote & Local)
-        const handleClipboardUpdate = (text: unknown) => {
-            if (typeof text === 'string' && onClipboardData.value) {
-                onClipboardData.value(text)
-            }
-        }
+                const res = await fetch(test.url, { method: 'HEAD', signal: controller.signal })
+                clearTimeout(timeoutId)
 
-        wails.on('clipboard:remote', handleClipboardUpdate)
-        wails.on('clipboard:local', handleClipboardUpdate)
-
-        // Listen for P2P file offers from Go
-        wails.on('p2p:offer', (payload: unknown) => {
-            if (onP2PEvent.value) {
-                onP2PEvent.value('offer', payload as any)
-            }
-        })
-
-        // Listen for P2P messages from Go (for other message types)
-        // Listen for generic messages from Go (including init, chat, etc)
-        wails.on('p2p:message', (msg: unknown) => {
-            console.log("📥 Wails p2p:message received:", msg)
-            // Forward to main message handler logic
-            handleMessage(JSON.stringify(msg))
-        })
-
-        // Listen for clipboard history directly from Go (init handling)
-        wails.on('clipboard:history', (history: unknown) => {
-            console.log("📜 Received clipboard:history event:", history)
-            ElMessage.success(`📜 收到历史记录！共 ${Array.isArray(history) ? history.length : 0} 条`)
-            if (Array.isArray(history) && history.length > 0 && onClipboardHistory.value) {
-                console.log("Calling onClipboardHistory callback")
-                onClipboardHistory.value(history)
-            } else {
-                if (!onClipboardHistory.value) {
-                    ElMessage.warning('⚠️ onClipboardHistory 回调未注册!')
+                if (res.ok || res.status === 405) { // 405 Method Not Allowed is fine (server is reachable)
+                    console.log(`✅ Detected Server Protocol: ${test.proto}`)
+                    protocol.value = test.proto
+                    return
                 }
+            } catch (e) {
+                // Ignore and try next
             }
-        })
-
-        ElMessage.success('✅ Wails事件监听器注册完成')
+        }
+        console.warn("⚠️ Protocol detection failed, keeping default:", protocol.value)
     }
 
     // --- 1. 检查服务器模式 ---
     async function checkMode() {
-        // 桌面端: Go 后端已处理 TLS，直接返回 public 模式
-        // 避免 WebView fetch 遇到自签名证书问题
-        if (isDesktop.value) {
-            console.log('🖥️ Desktop mode: skipping certificate check')
-            serverMode.value = 'public'
-            return 'public'
-        }
+        await detectProtocol() // Probe first
 
         try {
-            const res = await fetch(`${HTTP_URL}/api/info`)
+            const res = await fetch(`${HTTP_URL.value}/api/info`)
             if (!res.ok) throw new Error(`HTTP ${res.status}`)
 
             const data = await res.json()
@@ -127,44 +100,26 @@ export const useConnectionStore = defineStore('connection', () => {
         if ('WebTransport' in window) {
             try {
                 console.log(`🚀 Attempting WebTransport to [${roomId}]...`)
-                let url = `${WT_URL}/wt?room=${roomId}`
+                let url = `${WT_URL.value}/wt?room=${roomId}`
                 if (password) url += `&token=${password}`
 
-                let wt: WebTransport
-
-                // 策略 1: 优先尝试标准 CA 验证 (适用于 Let's Encrypt 等公网证书)
-                try {
-                    console.log("🚀 [Strategy 1] Attempting WebTransport with Standard CA verification...")
-                    wt = new WebTransport(url)
-                    await wt.ready
-                    console.log("✅ [Strategy 1] Standard CA Connected!")
-                } catch (caError) {
-                    console.warn("⚠️ [Strategy 1] Failed:", caError)
-
-                    // 策略 2: 如果失败且有证书指纹，尝试自签名指纹验证
-                    if (certHash.value) {
-                        console.log("🔄 [Strategy 2] Attempting WebTransport with Certificate Hash...")
-                        const binaryString = atob(certHash.value)
-                        const bytes = new Uint8Array(binaryString.length)
-                        for (let i = 0; i < binaryString.length; i++) {
-                            bytes[i] = binaryString.charCodeAt(i)
-                        }
-
-                        const options = {
-                            serverCertificateHashes: [{
-                                algorithm: 'sha-256',
-                                value: bytes
-                            }]
-                        }
-
-                        wt = new WebTransport(url, options)
-                        await wt.ready
-                        console.log("✅ [Strategy 2] Hash Verified Connected!")
-                    } else {
-                        // 没指纹也没法验证，抛出原始错误
-                        throw caError
+                const options: any = {}
+                if (certHash.value) {
+                    // Base64 -> Uint8Array
+                    const binaryString = atob(certHash.value)
+                    const bytes = new Uint8Array(binaryString.length)
+                    for (let i = 0; i < binaryString.length; i++) {
+                        bytes[i] = binaryString.charCodeAt(i)
                     }
+
+                    options.serverCertificateHashes = [{
+                        algorithm: 'sha-256',
+                        value: bytes
+                    }]
                 }
+
+                const wt = new WebTransport(url, options)
+                await wt.ready
 
                 // 成功连接 WT
                 transport.value = wt
@@ -204,7 +159,7 @@ export const useConnectionStore = defineStore('connection', () => {
     }
 
     function connectWebSocket(roomId: string, password?: string) {
-        let url = `${HTTP_URL.replace('http', 'ws')}/ws?room=${roomId}`
+        let url = `${HTTP_URL.value.replace('http', 'ws')}/ws?room=${roomId}`
         if (password) url += `&token=${password}`
 
         console.log(`🔄 Attempting WebSocket to [${roomId}]...`)
@@ -271,17 +226,19 @@ export const useConnectionStore = defineStore('connection', () => {
 
     // --- 4. 发送消息 ---
     async function sendMessage(data: any) {
-        const jsonStr = JSON.stringify(data)
-
-        // Desktop Mode: Route through Go backend
+        // Desktop Mode: Use Wails Bridge
         if (isDesktop.value) {
-            try {
-                await wails.sendGenericMessage(data.type, data.payload || {})
-            } catch (e) {
-                console.error("Desktop Send Failed", e)
+            // @ts-ignore
+            if (window.go && window.go.main && window.go.main.App && window.go.main.App.SendGenericMessage) {
+                // @ts-ignore
+                window.go.main.App.SendGenericMessage(data.type, data.payload || {})
+                return
+            } else {
+                console.warn('⚠️ Desktop mode detected but Wails SendGenericMessage not available')
             }
-            return
         }
+
+        const jsonStr = JSON.stringify(data)
 
         // WebTransport 发送
         if (streamWriter.value) {
@@ -422,17 +379,14 @@ export const useConnectionStore = defineStore('connection', () => {
                         if (msg.type === 'register_host') ElMessage.success(`主机 [${info.ip}] 上线`)
                     }
                     if (msg.type === 'init') {
-                        console.log("📦 Processing Init Message. Payload:", msg.payload)
                         if (msg.payload.notes && onNotepadEvent.value) {
                             onNotepadEvent.value('init', msg.payload.notes)
                         }
-                        if (msg.payload.clipboardHistory) {
-                            console.log("📜 Init has history. Callback exists?", !!onClipboardHistory.value)
-                            if (onClipboardHistory.value) {
-                                onClipboardHistory.value(msg.payload.clipboardHistory)
-                            }
+                        if (msg.payload.clipboardHistory && onClipboardHistory.value) {
+                            console.log('📜 Init: History received', msg.payload.clipboardHistory)
+                            onClipboardHistory.value(msg.payload.clipboardHistory)
                         } else {
-                            console.log("⚠️ Init payload missing clipboardHistory")
+                            console.log('📜 Init: No history in payload', msg.payload)
                         }
                     }
                     break
@@ -440,7 +394,6 @@ export const useConnectionStore = defineStore('connection', () => {
                 case 'notepad_update':
                 case 'notepad_delete':
                     console.log(`📝 Store handling ${msg.type}`, msg.payload)
-                    console.log(`Callback status:`, !!onNotepadEvent.value)
                     if (onNotepadEvent.value) {
                         onNotepadEvent.value(msg.type, msg.payload)
                     } else {
@@ -457,8 +410,14 @@ export const useConnectionStore = defineStore('connection', () => {
                     break
 
                 case 'clipboard_delete':
+                    console.log('🔄 Store: Received clipboard_delete message', msg.payload)
                     if (msg.payload && msg.payload.id && onClipboardDelete.value) {
                         onClipboardDelete.value(msg.payload.id)
+                    } else {
+                        console.warn('⚠️ Store: clipboard_delete missing ID or handler not set', {
+                            payload: msg.payload,
+                            handlerSet: !!onClipboardDelete.value
+                        })
                     }
                     break
 
@@ -514,52 +473,79 @@ export const useConnectionStore = defineStore('connection', () => {
         }
     }
 
-    // --- Desktop-specific methods ---
-    async function connectDesktop(host: string, roomId: string, password?: string) {
+    // --- Desktop Specific Methods ---
+    function setupDesktopEventListeners() {
         if (!isDesktop.value) return
 
-        try {
-            // Connect via Go backend (Adaptive: WT -> WSS -> WS)
-            await wails.connect(host, roomId, password)
-            isConnected.value = true
-            currentRoom.value = roomId
+        // @ts-ignore
+        if (window.runtime) {
+            // @ts-ignore
+            window.runtime.EventsOn('clipboard:history', (history: any[]) => {
+                console.log('🖥️ Desktop: Clipboard history received', history)
+                if (onClipboardHistory.value) onClipboardHistory.value(history)
+            })
 
-            // Also connect P2P if available
-            // Refactor: Logic moved to unified Connect() in app.go
-            // try {
-            //     await wails.connectP2P(host, roomId)
-            //     console.log('✅ Desktop P2P connected')
-            // } catch (e) {
-            //     console.warn('P2P connection failed, using signaling only', e)
-            // }
+            // @ts-ignore
+            window.runtime.EventsOn('clipboard:remote', (payload: any) => {
+                // console.log('🖥️ Desktop: Remote clipboard received', payload)
+                if (onClipboardData.value) onClipboardData.value(payload)
+            })
 
-            ElMessage.success(`✅ 桌面端已连接: ${roomId}`)
-        } catch (e) {
-            console.error('Desktop connect failed:', e)
-            ElMessage.error('桌面端连接失败')
+            // @ts-ignore
+            window.runtime.EventsOn('p2p:message', (msg: any) => {
+                // console.log('🖥️ Desktop: Message received', msg)
+                // Forward to handleMessage
+                if (msg && msg.type) {
+                    // Wails might pass object directly, handleMessage expects JSON string usually?
+                    // Let's check handleMessage. It parses JSON. So we might need to stringify or adjust handleMessage.
+                    // The Web handleMessage expects string.
+                    // But let's check if we can reuse handleMessage logic.
+                    // Actually, if msg is object, we can just call the logic directly or stringify.
+                    handleMessage(JSON.stringify(msg))
+                }
+            })
         }
     }
 
-    async function shareFileDesktop(file: File) {
-        if (!isDesktop.value) return shareFile(file)
+    async function connectDesktop(host: string, roomId: string, password?: string) {
+        currentRoom.value = roomId
+        isDesktop.value = true
+        // isConnected.value = true // Don't set true immediately
 
-        const fileId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
-        localFiles.value.set(fileId, file)
+        // @ts-ignore
+        if (window.go && window.go.main && window.go.main.App) {
+            try {
+                // Sanitize host: remove http:// or https://
+                const cleanHost = host.replace(/^https?:\/\//, '')
+                ElMessage.info(`Connecting to ${cleanHost}...`)
 
-        // Share via Go P2P
-        await wails.shareFileP2P(fileId, file.name, file.size, file.type)
+                // @ts-ignore
+                await window.go.main.App.Connect(cleanHost, roomId, password || "")
+                isConnected.value = true
+                ElMessage.success(`✅ Connected to ${roomId}`)
+            } catch (e) {
+                console.error("Desktop Connect Failed:", e)
+                ElMessage.error(`连接失败: ${e}`)
+                isConnected.value = false
+            }
+        }
+    }
+
+    // Initialize isDesktop
+    if (window.navigator.userAgent.includes('Wails')) {
+        isDesktop.value = true
     }
 
     return {
         isConnected,
         isDesktop,
+        transport, // Export for UI state check
         currentRoom,
         serverMode,
         hostOnline,
         hostIp,
         checkMode,
         connect,
-        connectDesktop,
         sendMessage,
         onClipboardData,
         onClipboardHistory,
@@ -567,11 +553,11 @@ export const useConnectionStore = defineStore('connection', () => {
         onNotepadEvent,
         onP2PEvent,
         shareFile,
-        shareFileDesktop,
         requestFile,
+        HTTP_URL,
+        // Desktop Exports
         setupDesktopEventListeners,
-        disconnect: closeConnection, // Export disconnect
-        HTTP_URL
+        connectDesktop,
+        disconnect: closeConnection
     }
 })
-

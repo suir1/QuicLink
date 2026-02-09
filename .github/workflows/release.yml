@@ -20,12 +20,6 @@ jobs:
             goarch: amd64
           - goos: linux
             goarch: arm64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
-          - goos: windows
-            goarch: amd64
 
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +27,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.24'
           cache-dependency-path: src/server/go.sum
 
       - name: Build Server
@@ -73,7 +67,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.24'
           cache-dependency-path: src/desktop/go.sum
 
       - name: Setup Node.js

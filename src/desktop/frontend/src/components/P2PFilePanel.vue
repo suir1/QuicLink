@@ -86,7 +86,7 @@ onMounted(() => {
   if (conn.onP2PEvent) console.warn('onP2PEvent already bound?')
 
   // 绑定 Store 事件
-  conn.onP2PEvent = (type, payload) => {
+  conn.onP2PEvent = (type: string, payload: any) => {
     if (type === 'offer') {
       // 收到别人分享的文件
       addFileToList({

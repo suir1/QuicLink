@@ -69,10 +69,10 @@ conn.onClipboardDelete = (id: number | string) => {
   console.log(`🗑️ Received delete request for ID: ${id} (Type: ${typeof id})`)
 
   // 兼容旧版 number ID
-  const index = clipboardList.value.findIndex(item => {
+  const index = clipboardList.value.findIndex((item, idx) => {
       // String comparison is safest
       const match = item.id.toString() === id.toString()
-      if (match) console.log(`✅ Found match at index ${index}:`, item)
+      if (match) console.log(`✅ Found match at index ${idx}:`, item)
       return match
   })
 
@@ -273,6 +273,8 @@ async function copyItem(item: ClipboardItem) {
 
 // 删除单个 Bullet
 function deleteItem(index: number, item: ClipboardItem) {
+  console.log(`🗑️ Sending delete request for Item:`, item)
+
   // 乐观更新 (Local Optimistic Update)
   clipboardList.value.splice(index, 1)
 

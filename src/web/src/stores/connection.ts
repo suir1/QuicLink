@@ -390,15 +390,21 @@ export const useConnectionStore = defineStore('connection', () => {
 
                 case 'clipboard_data':
                 case 'clipboard_push': // 接收其它端的剪切板推送
+                    // Unified: Pass full payload (with ID) to UI
                     if (msg.payload && onClipboardData.value) {
-                        // 兼容新版：统一从 payload.text 取
-                        onClipboardData.value(msg.payload.text)
+                        onClipboardData.value(msg.payload)
                     }
                     break
 
                 case 'clipboard_delete':
+                    console.log('🔄 Store: Received clipboard_delete message', msg.payload)
                     if (msg.payload && msg.payload.id && onClipboardDelete.value) {
                         onClipboardDelete.value(msg.payload.id)
+                    } else {
+                        console.warn('⚠️ Store: clipboard_delete missing ID or handler not set', {
+                            payload: msg.payload,
+                            handlerSet: !!onClipboardDelete.value
+                        })
                     }
                     break
 
@@ -472,6 +478,7 @@ export const useConnectionStore = defineStore('connection', () => {
         onP2PEvent,
         shareFile,
         requestFile,
-        HTTP_URL
+        HTTP_URL,
+        disconnect: closeConnection
     }
 })
