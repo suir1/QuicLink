@@ -22,10 +22,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
 )
@@ -73,6 +75,8 @@ type RelaySession struct {
 	Size   int64
 	Type   string
 }
+
+const wtStreamReadBufferSize = 256 * 1024
 
 func NewLocalServer() *LocalServer {
 	// Use ~/Downloads/QuicLink for uploads
@@ -169,6 +173,8 @@ func (s *LocalServer) Start() (*ServerInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen UDP for HTTP/3: %w", err)
 	}
+	_ = h3Conn.SetReadBuffer(8 << 20)
+	_ = h3Conn.SetWriteBuffer(8 << 20)
 	s.h3Conn = h3Conn
 	s.h3Port = h3Conn.LocalAddr().(*net.UDPAddr).Port
 
@@ -183,10 +189,20 @@ func (s *LocalServer) Start() (*ServerInfo, error) {
 		NextProtos:   []string{"h3"},
 	}
 
+	quicConfig := &quic.Config{
+		InitialStreamReceiveWindow:     8 << 20,
+		MaxStreamReceiveWindow:         32 << 20,
+		InitialConnectionReceiveWindow: 16 << 20,
+		MaxConnectionReceiveWindow:     64 << 20,
+		MaxIncomingStreams:             1024,
+		MaxIncomingUniStreams:          1024,
+	}
+
 	s.h3Server = &http3.Server{
-		Addr:      fmt.Sprintf(":%d", s.h3Port),
-		Handler:   handler,
-		TLSConfig: tlsConfig,
+		Addr:       fmt.Sprintf(":%d", s.h3Port),
+		Handler:    handler,
+		TLSConfig:  tlsConfig,
+		QUICConfig: quicConfig,
 	}
 
 	// Configure WebTransport
@@ -379,7 +395,7 @@ func (s *LocalServer) handleWTStream(stream *webtransport.Stream) {
 
 	// Use bufio.Reader to read JSON command line without losing buffered data
 	// json.NewDecoder would buffer extra bytes beyond JSON boundary, causing data loss
-	bufReader := bufio.NewReader(stream)
+	bufReader := bufio.NewReaderSize(stream, wtStreamReadBufferSize)
 
 	// Read the first line (JSON command terminated by \n)
 	line, err := bufReader.ReadBytes('\n')
@@ -394,6 +410,7 @@ func (s *LocalServer) handleWTStream(stream *webtransport.Stream) {
 		RelayID string `json:"relayId,omitempty"`
 		Name    string `json:"name,omitempty"`
 		Size    int64  `json:"size,omitempty"`
+		Persist bool   `json:"persist,omitempty"` // relay only: keep a copy on LAN host disk
 	}
 
 	if err := json.Unmarshal(line, &cmd); err != nil {
@@ -410,7 +427,7 @@ func (s *LocalServer) handleWTStream(stream *webtransport.Stream) {
 		// Pass bufReader so it can read remaining buffered data + stream
 		s.wtHandleUpload(stream, bufReader, cmd.Name, cmd.Size)
 	case "relay_upload":
-		s.wtHandleRelayUpload(stream, bufReader, cmd.RelayID, cmd.Name)
+		s.wtHandleRelayUpload(stream, bufReader, cmd.RelayID, cmd.Name, cmd.Persist)
 	case "relay_download":
 		s.wtHandleRelayDownload(stream, cmd.RelayID)
 	}
@@ -513,13 +530,32 @@ func (s *LocalServer) wtHandleUpload(stream *webtransport.Stream, bufReader *buf
 	})
 }
 
-func (s *LocalServer) wtHandleRelayUpload(stream *webtransport.Stream, bufReader *bufio.Reader, relayID, name string) {
+func (s *LocalServer) wtHandleRelayUpload(stream *webtransport.Stream, bufReader *bufio.Reader, relayID, name string, persist bool) {
 	if relayID == "" {
 		json.NewEncoder(stream).Encode(map[string]string{"error": "missing relayId"})
 		return
 	}
 	if name == "" {
 		name = "relay_" + relayID
+	}
+	name = filepath.Base(name)
+
+	var (
+		fileID    string
+		finalPath string
+		tempPath  string
+		dst       *os.File
+		err       error
+	)
+	if persist {
+		fileID = uuid.New().String()
+		finalPath = filepath.Join(s.uploadDir, fileID+"_"+name)
+		tempPath = finalPath + ".part"
+		dst, err = os.Create(tempPath)
+		if err != nil {
+			json.NewEncoder(stream).Encode(map[string]string{"error": "failed to create relay temp file"})
+			return
+		}
 	}
 
 	pr, pw := io.Pipe()
@@ -549,12 +585,51 @@ func (s *LocalServer) wtHandleRelayUpload(stream *webtransport.Stream, bufReader
 		close(session.Done)
 	}()
 
-	written, err := io.Copy(pw, bufReader)
+	relayWriter := io.Writer(pw)
+	if persist && dst != nil {
+		relayWriter = io.MultiWriter(pw, dst)
+	}
+
+	written, err := io.Copy(relayWriter, bufReader)
 	if err != nil {
 		log.Printf("❌ WT Relay Upload Error (%s): %v", relayID, err)
+		if persist {
+			if dst != nil {
+				_ = dst.Close()
+			}
+			if tempPath != "" {
+				_ = os.Remove(tempPath)
+			}
+		}
 		return
 	}
-	log.Printf("✅ WT Relay Complete: %s (%d bytes)", relayID, written)
+
+	if persist && dst != nil {
+		closeErr := dst.Close()
+		if closeErr != nil {
+			log.Printf("❌ WT Relay Upload Close Error (%s): %v", relayID, closeErr)
+			_ = os.Remove(tempPath)
+			return
+		}
+		if err := os.Rename(tempPath, finalPath); err != nil {
+			log.Printf("❌ WT Relay Finalize Error (%s): %v", relayID, err)
+			_ = os.Remove(tempPath)
+			return
+		}
+
+		localFile := &LocalFile{
+			ID:        fileID,
+			Name:      name,
+			Size:      written,
+			Path:      finalPath,
+			CreatedAt: time.Now().Unix(),
+		}
+		s.mu.Lock()
+		s.files[fileID] = localFile
+		s.mu.Unlock()
+	}
+
+	log.Printf("✅ WT Relay Complete: %s (%d bytes, persist=%v)", relayID, written, persist)
 }
 
 func (s *LocalServer) wtHandleRelayDownload(stream *webtransport.Stream, relayID string) {
@@ -692,6 +767,25 @@ func (s *LocalServer) handleRelayUpload(w http.ResponseWriter, r *http.Request) 
 	if decodedName == "" {
 		decodedName = "relay_" + id
 	}
+	decodedName = filepath.Base(decodedName)
+	persist := isTruthy(r.URL.Query().Get("persist"))
+
+	var (
+		fileID    string
+		finalPath string
+		tempPath  string
+		dst       *os.File
+	)
+	if persist {
+		fileID = uuid.New().String()
+		finalPath = filepath.Join(s.uploadDir, fileID+"_"+decodedName)
+		tempPath = finalPath + ".part"
+		dst, err = os.Create(tempPath)
+		if err != nil {
+			http.Error(w, "Failed to create relay temp file", http.StatusInternalServerError)
+			return
+		}
+	}
 
 	session := &RelaySession{
 		Reader: pr,
@@ -721,14 +815,53 @@ func (s *LocalServer) handleRelayUpload(w http.ResponseWriter, r *http.Request) 
 
 	// Copy request body to Pipe
 	// This BLOCKs until the Reader (Downloader) reads data
-	written, err := io.Copy(pw, r.Body)
+	relayWriter := io.Writer(pw)
+	if persist && dst != nil {
+		relayWriter = io.MultiWriter(pw, dst)
+	}
+
+	written, err := io.Copy(relayWriter, r.Body)
 	if err != nil {
 		log.Printf("❌ Relay Pipe Error (Upload side): %v", err)
+		if persist {
+			if dst != nil {
+				_ = dst.Close()
+			}
+			if tempPath != "" {
+				_ = os.Remove(tempPath)
+			}
+		}
 		http.Error(w, "Relay Broken", http.StatusInternalServerError)
 		return
 	}
+	if persist && dst != nil {
+		closeErr := dst.Close()
+		if closeErr != nil {
+			log.Printf("❌ Relay Temp Close Error: %v", closeErr)
+			_ = os.Remove(tempPath)
+			http.Error(w, "Relay Broken", http.StatusInternalServerError)
+			return
+		}
+		if err := os.Rename(tempPath, finalPath); err != nil {
+			log.Printf("❌ Relay Finalize Error: %v", err)
+			_ = os.Remove(tempPath)
+			http.Error(w, "Relay Broken", http.StatusInternalServerError)
+			return
+		}
 
-	log.Printf("✅ Relay Complete: %s (%d bytes)", id, written)
+		localFile := &LocalFile{
+			ID:        fileID,
+			Name:      decodedName,
+			Size:      written,
+			Path:      finalPath,
+			CreatedAt: time.Now().Unix(),
+		}
+		s.mu.Lock()
+		s.files[fileID] = localFile
+		s.mu.Unlock()
+	}
+
+	log.Printf("✅ Relay Complete: %s (%d bytes, persist=%v)", id, written, persist)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -778,4 +911,186 @@ func (s *LocalServer) waitRelaySession(id string, timeoutDur time.Duration) (*Re
 			}
 		}
 	}
+}
+
+func isTruthy(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// ImportFileFromPath copies a local file into LAN shared storage and registers it.
+func (s *LocalServer) ImportFileFromPath(filePath string) (*LocalFile, error) {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" {
+		return nil, fmt.Errorf("file path is required")
+	}
+
+	srcInfo, err := os.Stat(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("stat file failed: %w", err)
+	}
+	if srcInfo.IsDir() {
+		return nil, fmt.Errorf("path is a directory")
+	}
+
+	src, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("open file failed: %w", err)
+	}
+	defer src.Close()
+
+	id := uuid.New().String()
+	name := filepath.Base(filePath)
+	savePath := filepath.Join(s.uploadDir, id+"_"+name)
+
+	dst, err := os.Create(savePath)
+	if err != nil {
+		return nil, fmt.Errorf("create target file failed: %w", err)
+	}
+	defer dst.Close()
+
+	written, err := io.Copy(dst, src)
+	if err != nil {
+		return nil, fmt.Errorf("copy file failed: %w", err)
+	}
+
+	localFile := &LocalFile{
+		ID:        id,
+		Name:      name,
+		Size:      written,
+		Path:      savePath,
+		CreatedAt: time.Now().Unix(),
+	}
+
+	s.mu.Lock()
+	s.files[id] = localFile
+	s.mu.Unlock()
+
+	log.Printf("📥 Native Import received: %s (%d bytes)", name, written)
+	return localFile, nil
+}
+
+// StartRelayFromFile starts a relay session from a local file path using Go native IO.
+// It registers the relay immediately, then streams the file in a background goroutine.
+func (s *LocalServer) StartRelayFromFile(relayID, filePath, displayName string, persist bool) error {
+	relayID = strings.TrimSpace(relayID)
+	if relayID == "" {
+		return fmt.Errorf("missing relay id")
+	}
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" {
+		return fmt.Errorf("missing file path")
+	}
+
+	src, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open file failed: %w", err)
+	}
+
+	name := strings.TrimSpace(displayName)
+	if name == "" {
+		name = filepath.Base(filePath)
+	}
+	name = filepath.Base(name)
+
+	pr, pw := io.Pipe()
+	session := &RelaySession{
+		Reader: pr,
+		Writer: pw,
+		Done:   make(chan struct{}),
+		Name:   name,
+	}
+
+	s.relayMu.Lock()
+	if _, exists := s.relayMap[relayID]; exists {
+		s.relayMu.Unlock()
+		_ = src.Close()
+		return fmt.Errorf("relay session already exists: %s", relayID)
+	}
+	s.relayMap[relayID] = session
+	s.relayMu.Unlock()
+
+	log.Printf("🚀 Native Relay Upload Start: %s (%s)", relayID, name)
+
+	go func() {
+		defer func() {
+			log.Printf("🏁 Native Relay Session Cleanup: %s", relayID)
+			s.relayMu.Lock()
+			delete(s.relayMap, relayID)
+			s.relayMu.Unlock()
+			_ = src.Close()
+			_ = pw.Close()
+			close(session.Done)
+		}()
+
+		var (
+			fileID    string
+			finalPath string
+			tempPath  string
+			dst       *os.File
+			err       error
+		)
+		if persist {
+			fileID = uuid.New().String()
+			finalPath = filepath.Join(s.uploadDir, fileID+"_"+name)
+			tempPath = finalPath + ".part"
+			dst, err = os.Create(tempPath)
+			if err != nil {
+				log.Printf("❌ Native Relay Temp Create Error (%s): %v", relayID, err)
+				return
+			}
+		}
+
+		relayWriter := io.Writer(pw)
+		if persist && dst != nil {
+			relayWriter = io.MultiWriter(pw, dst)
+		}
+
+		written, copyErr := io.Copy(relayWriter, src)
+		if copyErr != nil {
+			log.Printf("❌ Native Relay Copy Error (%s): %v", relayID, copyErr)
+			if persist {
+				if dst != nil {
+					_ = dst.Close()
+				}
+				if tempPath != "" {
+					_ = os.Remove(tempPath)
+				}
+			}
+			return
+		}
+
+		if persist && dst != nil {
+			closeErr := dst.Close()
+			if closeErr != nil {
+				log.Printf("❌ Native Relay Temp Close Error (%s): %v", relayID, closeErr)
+				_ = os.Remove(tempPath)
+				return
+			}
+			if err := os.Rename(tempPath, finalPath); err != nil {
+				log.Printf("❌ Native Relay Finalize Error (%s): %v", relayID, err)
+				_ = os.Remove(tempPath)
+				return
+			}
+
+			localFile := &LocalFile{
+				ID:        fileID,
+				Name:      name,
+				Size:      written,
+				Path:      finalPath,
+				CreatedAt: time.Now().Unix(),
+			}
+			s.mu.Lock()
+			s.files[fileID] = localFile
+			s.mu.Unlock()
+		}
+
+		log.Printf("✅ Native Relay Complete: %s (%d bytes, persist=%v)", relayID, written, persist)
+	}()
+
+	return nil
 }

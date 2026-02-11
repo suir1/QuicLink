@@ -9,6 +9,10 @@ export function Disconnect():Promise<void>;
 
 export function DisconnectP2P():Promise<void>;
 
+export function DownloadLanRelayFile(arg1:string,arg2:string,arg3:string,arg4:number):Promise<string>;
+
+export function GetAutoSyncRemoteClipboard():Promise<boolean>;
+
 export function GetClipboard():Promise<string>;
 
 export function GetConnectionStatus():Promise<boolean>;
@@ -25,9 +29,13 @@ export function GetTransportMode():Promise<string>;
 
 export function Greet(arg1:string):Promise<string>;
 
+export function ImportLocalFile(arg1:string):Promise<Record<string, any>>;
+
 export function OpenDownloadDir():Promise<void>;
 
 export function SelectDownloadDir():Promise<string>;
+
+export function SelectRelayFiles():Promise<Array<Record<string, any>>>;
 
 export function SendClipboard():Promise<void>;
 
@@ -35,6 +43,14 @@ export function SendGenericMessage(arg1:string,arg2:Record<string, any>):Promise
 
 export function SendP2PHello():Promise<void>;
 
+export function SetAutoSyncRemoteClipboard(arg1:boolean):Promise<void>;
+
 export function SetClipboard(arg1:string):Promise<void>;
 
 export function ShareFileP2P(arg1:string,arg2:string,arg3:number,arg4:string):Promise<void>;
+
+export function StartNativeRelayUpload(arg1:string,arg2:string,arg3:string,arg4:boolean):Promise<void>;
+
+export function UploadCloudFile(arg1:string):Promise<Record<string, any>>;
+
+export function UploadVpsRelayFile(arg1:string):Promise<Record<string, any>>;

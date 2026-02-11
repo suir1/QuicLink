@@ -21,6 +21,10 @@ const route = useRoute()
 const router = useRouter()
 const conn = useConnectionStore()
 const currentUrl = computed(() => window.location.href)
+const webDownloadMode = computed({
+  get: () => conn.downloadMode,
+  set: (mode: 'compat' | 'speed') => conn.setDownloadMode(mode)
+})
 
 // 子组件引用 (用于调用子组件的方法)
 const clipboardRef = ref()
@@ -116,6 +120,11 @@ function copyLink() {
   navigator.clipboard.writeText(currentUrl.value)
   ElMessage.success('链接已复制，发给手机即可互联')
 }
+
+function handleDownloadModeChange(mode: 'compat' | 'speed') {
+  conn.setDownloadMode(mode)
+  ElMessage.success(mode === 'speed' ? '已切换为极速模式（WT优先）' : '已切换为兼容模式（URL优先）')
+}
 </script>
 
 <template>
@@ -139,6 +148,13 @@ function copyLink() {
           <el-tag v-else-if="conn.isConnected" type="warning" size="large" effect="plain" round>
             🔌 WebSocket
           </el-tag>
+        </div>
+
+        <div class="toolbar-item mode-section">
+          <el-radio-group v-model="webDownloadMode" size="small" @change="handleDownloadModeChange">
+            <el-radio-button label="compat">兼容下载</el-radio-button>
+            <el-radio-button label="speed">极速WT</el-radio-button>
+          </el-radio-group>
         </div>
 
         <!-- QR码 -->

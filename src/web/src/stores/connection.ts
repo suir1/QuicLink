@@ -3,6 +3,21 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
 export const useConnectionStore = defineStore('connection', () => {
+    type DownloadMode = 'compat' | 'speed'
+    type TransferPath =
+        | 'unknown'
+        | 'webrtc'
+        | 'lan-wt-relay'
+        | 'lan-http-relay'
+        | 'lan-wt-direct'
+        | 'lan-http-direct'
+        | 'vps-relay'
+        | 'browser-url'
+        | 'cloud'
+    type TransferStatus = 'idle' | 'active' | 'handoff' | 'done' | 'error'
+    type TransferDirection = 'upload' | 'download'
+    const DOWNLOAD_MODE_KEY = 'ql_web_download_mode'
+
     // --- 状态定义 ---
     const isConnected = ref(false)
     const isDesktop = ref(!!(window as any).runtime) // Detect Wails
@@ -28,6 +43,10 @@ export const useConnectionStore = defineStore('connection', () => {
         certHash?: string
     }
     const lanServers = ref<Map<string, LanServerInfo>>(new Map())
+    const lanHttpsProbeCache = ref<Map<string, { ok: boolean, ts: number }>>(new Map())
+    const downloadMode = ref<DownloadMode>(
+        (localStorage.getItem(DOWNLOAD_MODE_KEY) === 'speed' ? 'speed' : 'compat')
+    )
 
     // 环境变量处理
     // 环境变量处理
@@ -52,18 +71,174 @@ export const useConnectionStore = defineStore('connection', () => {
 
     // P2P State
     const localFiles = ref<Map<string, File>>(new Map())
+    const vpsRelayOffers = ref<Map<string, {
+        relayId: string
+        name: string
+        size: number
+        type: string
+        url: string
+        expiresAt?: number
+    }>>(new Map())
     const receivingFiles = ref<Map<string, { chunks: string[], total: number, received: number, name: string, type: string }>>(new Map())
 
-    // WebRTC State (Phase 2b)
-    // Key: remote peer id (or temporary just "peer" for 1-on-1 simplicity in demo)
-    // In multi-user room, we need map<userId, RTCPeerConnection>. For now assuming 1 peer for simplicity or broadcast.
-    // Let's use a single peer for the "Partner" model or just loop if needed.
-    // For V1, let's keep it simple: We allow *one* P2P connection at a time or handle via map.
-    // Given the room structure, let's try to be smart.
-    const peerConnection = ref<RTCPeerConnection | null>(null)
-    const dataChannel = ref<RTCDataChannel | null>(null)
+    // WebRTC State
+    const selfPeerId = `peer-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`
+    const knownPeers = ref<Set<string>>(new Set())
+    const peerConnections = ref<Map<string, RTCPeerConnection>>(new Map())
+    const dataChannels = ref<Map<string, RTCDataChannel>>(new Map())
     const isP2PConnected = ref(false)
-    const RELAY_MAX_SIZE_BYTES = 10 * 1024 * 1024
+    const pendingIceCandidates = ref<Map<string, RTCIceCandidateInit[]>>(new Map())
+    const incomingFilesById = ref<Map<string, {
+        id: string
+        name: string
+        size: number
+        received: number
+        buffer: BlobPart[]
+    }>>(new Map())
+    const activeIncomingFileByPeer = ref<Map<string, string>>(new Map())
+    const DEFAULT_RELAY_MAX_SIZE_BYTES = 10 * 1024 * 1024
+    const relayMaxSizeBytes = ref(DEFAULT_RELAY_MAX_SIZE_BYTES)
+    const applyingAnswers = ref<Set<string>>(new Set())
+    const transferTelemetry = ref<{
+        path: TransferPath
+        status: TransferStatus
+        direction: TransferDirection
+        fileName: string
+        bytes: number
+        total: number
+        speedBps: number
+        startedAt: number
+        updatedAt: number
+        note: string
+    }>({
+        path: 'unknown',
+        status: 'idle',
+        direction: 'download',
+        fileName: '',
+        bytes: 0,
+        total: 0,
+        speedBps: 0,
+        startedAt: 0,
+        updatedAt: 0,
+        note: ''
+    })
+    const transferSession = ref<{
+        id: string
+        startedAt: number
+        bytes: number
+    } | null>(null)
+
+    function startTransferTelemetry(
+        path: TransferPath,
+        direction: TransferDirection,
+        fileName: string,
+        total = 0,
+        note = ''
+    ): string {
+        const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const now = Date.now()
+        transferSession.value = { id, startedAt: now, bytes: 0 }
+        transferTelemetry.value = {
+            path,
+            status: 'active',
+            direction,
+            fileName,
+            bytes: 0,
+            total: total > 0 ? total : 0,
+            speedBps: 0,
+            startedAt: now,
+            updatedAt: now,
+            note
+        }
+        return id
+    }
+
+    function bumpTransferTelemetry(deltaBytes: number, total?: number) {
+        const session = transferSession.value
+        if (!session || deltaBytes <= 0) return
+
+        session.bytes += deltaBytes
+        const now = Date.now()
+        const elapsedSec = Math.max(0.001, (now - session.startedAt) / 1000)
+        transferTelemetry.value = {
+            ...transferTelemetry.value,
+            bytes: session.bytes,
+            total: typeof total === 'number' && total > 0 ? total : transferTelemetry.value.total,
+            speedBps: session.bytes / elapsedSec,
+            updatedAt: now
+        }
+    }
+
+    function finishTransferTelemetry(status: Exclude<TransferStatus, 'idle' | 'active'>, note = '') {
+        transferTelemetry.value = {
+            ...transferTelemetry.value,
+            status,
+            updatedAt: Date.now(),
+            note: note || transferTelemetry.value.note
+        }
+        transferSession.value = null
+    }
+
+    function resetTransferTelemetry() {
+        transferTelemetry.value = {
+            path: transferTelemetry.value.path,
+            status: 'idle',
+            direction: transferTelemetry.value.direction,
+            fileName: '',
+            bytes: 0,
+            total: 0,
+            speedBps: 0,
+            startedAt: 0,
+            updatedAt: Date.now(),
+            note: ''
+        }
+        transferSession.value = null
+    }
+
+    function getRelayMaxSizeMb(): number {
+        return Math.max(1, Math.floor(relayMaxSizeBytes.value / 1024 / 1024))
+    }
+
+    function isRelaySizeAllowed(size: number): boolean {
+        return Number.isFinite(size) && size <= relayMaxSizeBytes.value
+    }
+
+    function parseIceServersFromEnv(): RTCIceServer[] {
+        const defaults: RTCIceServer[] = [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:global.stun.twilio.com:3478' }
+        ]
+
+        const turnUrl = import.meta.env.VITE_TURN_URL as string | undefined
+        const turnUsername = import.meta.env.VITE_TURN_USERNAME as string | undefined
+        const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL as string | undefined
+        if (turnUrl && turnUsername && turnCredential) {
+            defaults.push({
+                urls: turnUrl,
+                username: turnUsername,
+                credential: turnCredential
+            })
+        }
+
+        const rawIceServers = import.meta.env.VITE_ICE_SERVERS as string | undefined
+        if (!rawIceServers) {
+            return defaults
+        }
+
+        try {
+            const parsed = JSON.parse(rawIceServers)
+            if (Array.isArray(parsed)) {
+                return [...defaults, ...parsed]
+            }
+            if (parsed && typeof parsed === 'object') {
+                return [...defaults, parsed]
+            }
+        } catch (e) {
+            console.warn('Invalid VITE_ICE_SERVERS, using defaults only', e)
+        }
+
+        return defaults
+    }
 
     // --- Auto-Detect Protocol ---
     async function detectProtocol() {
@@ -106,6 +281,11 @@ export const useConnectionStore = defineStore('connection', () => {
             if (data.certHash) {
                 certHash.value = data.certHash
                 console.log("🔒 Server Cert Hash:", data.certHash)
+            }
+            if (Number.isFinite(data?.maxUploadSizeBytes) && data.maxUploadSizeBytes > 0) {
+                relayMaxSizeBytes.value = Number(data.maxUploadSizeBytes)
+            } else if (Number.isFinite(data?.maxUploadSizeMB) && data.maxUploadSizeMB > 0) {
+                relayMaxSizeBytes.value = Number(data.maxUploadSizeMB) * 1024 * 1024
             }
             return data.mode
         } catch (e) {
@@ -157,7 +337,7 @@ export const useConnectionStore = defineStore('connection', () => {
                 readLoop(stream.readable)
 
                 // Send Hello only after control stream is ready
-                sendMessage({ type: 'p2p_hello' })
+                sendMessage({ type: 'p2p_hello', payload: { peerId: selfPeerId } })
 
                 // 监听连接关闭
                 wt.closed.then(() => {
@@ -197,7 +377,7 @@ export const useConnectionStore = defineStore('connection', () => {
             isConnected.value = true
             ElMessage.success(`✅ 已通过 WebSocket 加入房间: ${roomId}`)
             // Send Hello
-            sendMessage({ type: 'p2p_hello' })
+            sendMessage({ type: 'p2p_hello', payload: { peerId: selfPeerId } })
         }
         ws.onclose = () => handleClose()
         ws.onmessage = (e) => handleMessage(e.data)
@@ -219,181 +399,374 @@ export const useConnectionStore = defineStore('connection', () => {
     function handleClose() {
         isConnected.value = false
         hostOnline.value = false
-        // Close WebRTC
-        if (peerConnection.value) {
-            peerConnection.value.close()
-            peerConnection.value = null
+        for (const pc of peerConnections.value.values()) {
+            pc.close()
         }
-        dataChannel.value = null
+        peerConnections.value.clear()
+        dataChannels.value.clear()
+        knownPeers.value.clear()
+        vpsRelayOffers.value.clear()
+        pendingIceCandidates.value.clear()
+        incomingFilesById.value.clear()
+        activeIncomingFileByPeer.value.clear()
+        applyingAnswers.value.clear()
+        resetTransferTelemetry()
         isP2PConnected.value = false
     }
 
-    // --- WebRTC Logic (Phase 2b) ---
-    const rtcConfig = {
-        iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:global.stun.twilio.com:3478' }
-        ]
+    // --- WebRTC Logic ---
+    const rtcConfig: RTCConfiguration = {
+        iceServers: parseIceServersFromEnv()
     }
 
-    function setupPeerConnection() {
-        if (peerConnection.value) return peerConnection.value
+    function updateP2PConnectedState() {
+        isP2PConnected.value = Array.from(dataChannels.value.values())
+            .some(dc => dc.readyState === 'open')
+    }
+
+    function shouldInitiateToPeer(peerId: string): boolean {
+        return selfPeerId < peerId
+    }
+
+    function setupPeerConnection(peerId: string): RTCPeerConnection {
+        const existing = peerConnections.value.get(peerId)
+        if (existing) return existing
 
         const pc = new RTCPeerConnection(rtcConfig)
 
         pc.onicecandidate = (event) => {
             if (event.candidate) {
-                sendMessage({ type: 'candidate', payload: event.candidate })
+                sendMessage({
+                    type: 'candidate',
+                    payload: {
+                        from: selfPeerId,
+                        to: peerId,
+                        candidate: event.candidate
+                    }
+                })
             }
         }
 
         pc.onconnectionstatechange = () => {
-            console.log('RTC State:', pc.connectionState)
+            console.log(`RTC[${peerId}] State:`, pc.connectionState)
+            if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
+                dataChannels.value.delete(peerId)
+                peerConnections.value.delete(peerId)
+                updateP2PConnectedState()
+            }
             if (pc.connectionState === 'connected') {
-                isP2PConnected.value = true
-                ElMessage.success('⚡ P2P 直接连接已建立')
-            } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-                isP2PConnected.value = false
+                ElMessage.success(`⚡ P2P 连接已建立: ${peerId.slice(0, 8)}`)
             }
         }
 
         pc.ondatachannel = (event) => {
-            setupDataChannel(event.channel)
+            setupDataChannel(event.channel, peerId)
         }
 
-        peerConnection.value = pc
+        peerConnections.value.set(peerId, pc)
         return pc
     }
 
-    function setupDataChannel(dc: RTCDataChannel) {
+    function setupDataChannel(dc: RTCDataChannel, peerId: string) {
         dc.onopen = () => {
-            console.log('RTC DataChannel OPEN')
-            dataChannel.value = dc
+            console.log(`RTC DataChannel OPEN -> ${peerId}`)
+            dataChannels.value.set(peerId, dc)
+            updateP2PConnectedState()
+        }
+        dc.onclose = () => {
+            dataChannels.value.delete(peerId)
+            updateP2PConnectedState()
+        }
+        dc.onerror = (e) => {
+            console.warn(`RTC DataChannel Error -> ${peerId}`, e)
         }
         dc.onmessage = (e) => {
-            // Handle P2P messages (files)
-            handleP2PMessage(e.data)
+            void handleP2PMessage(e.data, peerId)
         }
     }
 
-    async function startP2P() {
-        // Initiator
-        console.log("⚡ Starting P2P Handshake...")
-        const pc = setupPeerConnection()!
-        const dc = pc.createDataChannel("file-transfer")
-        setupDataChannel(dc)
+    async function startP2P(peerId: string) {
+        if (peerId === selfPeerId) return
+
+        console.log(`⚡ Starting P2P Handshake -> ${peerId}`)
+        const pc = setupPeerConnection(peerId)
+        if (pc.signalingState !== 'stable') {
+            // Avoid creating nested offers; wait for current negotiation to settle.
+            console.warn(`Skip startP2P for ${peerId}: signalingState=${pc.signalingState}`)
+            return
+        }
+        let dc = dataChannels.value.get(peerId)
+        if (!dc || dc.readyState === 'closed') {
+            dc = pc.createDataChannel("file-transfer")
+            setupDataChannel(dc, peerId)
+        }
 
         const offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
-        sendMessage({ type: 'offer', payload: offer })
+        sendMessage({
+            type: 'offer',
+            payload: {
+                from: selfPeerId,
+                to: peerId,
+                sdp: offer
+            }
+        })
     }
 
-    async function handleOffer(offer: RTCSessionDescriptionInit) {
-        console.log("⚡ Received Offer, answering...")
-        const pc = setupPeerConnection()!
+    async function flushPendingCandidates(peerId: string) {
+        const pending = pendingIceCandidates.value.get(peerId)
+        if (!pending || pending.length === 0) return
+
+        const pc = peerConnections.value.get(peerId)
+        if (!pc || !pc.remoteDescription) return
+
+        while (pending.length > 0) {
+            const next = pending.shift()
+            if (!next) continue
+            try {
+                await pc.addIceCandidate(new RTCIceCandidate(next))
+            } catch (e) {
+                console.warn(`Failed to add pending ICE candidate from ${peerId}`, e)
+            }
+        }
+    }
+
+    async function handleOffer(payload: any) {
+        let fromPeerId = payload?.from
+        const targetPeerId = payload?.to
+        const offer = payload?.sdp || payload
+        if (!fromPeerId) {
+            fromPeerId = Array.from(knownPeers.value)[0]
+        }
+        if (!fromPeerId || !offer) return
+        if (targetPeerId && targetPeerId !== selfPeerId) return
+        if (fromPeerId === selfPeerId) return
+
+        knownPeers.value.add(fromPeerId)
+
+        const pc = setupPeerConnection(fromPeerId)
+        if (pc.signalingState !== 'stable') {
+            try {
+                await pc.setLocalDescription({ type: 'rollback' } as RTCSessionDescriptionInit)
+            } catch (e) {
+                console.warn(`Rollback failed for ${fromPeerId}`, e)
+            }
+        }
+
         await pc.setRemoteDescription(new RTCSessionDescription(offer))
+        await flushPendingCandidates(fromPeerId)
+
         const answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
-        sendMessage({ type: 'answer', payload: answer })
+        sendMessage({
+            type: 'answer',
+            payload: {
+                from: selfPeerId,
+                to: fromPeerId,
+                sdp: answer
+            }
+        })
     }
 
-    async function handleAnswer(answer: RTCSessionDescriptionInit) {
-        console.log("⚡ Received Answer")
-        const pc = peerConnection.value
-        if (pc) {
-            await pc.setRemoteDescription(new RTCSessionDescription(answer))
+    async function handleAnswer(payload: any) {
+        let fromPeerId = payload?.from
+        const targetPeerId = payload?.to
+        const answer = payload?.sdp || payload
+        if (!fromPeerId) {
+            fromPeerId = Array.from(peerConnections.value.keys())[0]
+        }
+        if (!fromPeerId || !answer) return
+        if (targetPeerId && targetPeerId !== selfPeerId) return
+
+        const pc = peerConnections.value.get(fromPeerId)
+        if (!pc) return
+        if (applyingAnswers.value.has(fromPeerId)) {
+            console.warn(`Ignore concurrent answer from ${fromPeerId}`)
+            return
+        }
+        applyingAnswers.value.add(fromPeerId)
+        try {
+            if (pc.signalingState !== 'have-local-offer') {
+                // Duplicate / stale answer can arrive after state returned to stable.
+                console.warn(`Ignore unexpected answer from ${fromPeerId}: signalingState=${pc.signalingState}`)
+                return
+            }
+            try {
+                await pc.setRemoteDescription(new RTCSessionDescription(answer))
+            } catch (e) {
+                console.warn(`setRemoteDescription(answer) failed for ${fromPeerId}`, e)
+                return
+            }
+            await flushPendingCandidates(fromPeerId)
+        } finally {
+            applyingAnswers.value.delete(fromPeerId)
         }
     }
 
-    async function handleCandidate(candidate: RTCIceCandidateInit) {
-        const pc = peerConnection.value
-        if (pc) {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate))
+    async function handleCandidate(payload: any) {
+        let fromPeerId = payload?.from
+        const targetPeerId = payload?.to
+        const candidate = payload?.candidate || payload
+        if (!fromPeerId) {
+            fromPeerId = Array.from(peerConnections.value.keys())[0] || Array.from(knownPeers.value)[0]
         }
+        if (!fromPeerId || !candidate) return
+        if (targetPeerId && targetPeerId !== selfPeerId) return
+
+        const pc = setupPeerConnection(fromPeerId)
+        if (!pc.remoteDescription) {
+            const queue = pendingIceCandidates.value.get(fromPeerId) || []
+            queue.push(candidate)
+            pendingIceCandidates.value.set(fromPeerId, queue)
+            return
+        }
+
+        await pc.addIceCandidate(new RTCIceCandidate(candidate))
     }
 
-    async function waitForP2PReady(timeoutMs = 2500): Promise<boolean> {
-        if (isP2PConnected.value) return true
+    async function waitForP2PReady(timeoutMs = 3000, preferredPeerId?: string): Promise<boolean> {
         if (!isConnected.value) return false
 
-        if (!peerConnection.value) {
+        if (preferredPeerId && preferredPeerId !== selfPeerId) {
+            const preferredDc = dataChannels.value.get(preferredPeerId)
+            if (preferredDc?.readyState === 'open') return true
+
             try {
-                await startP2P()
+                await startP2P(preferredPeerId)
             } catch (e) {
-                console.warn('P2P bootstrap failed', e)
-                return false
+                console.warn('P2P preferred bootstrap failed', e)
+            }
+        } else if (!isP2PConnected.value) {
+            for (const peerId of knownPeers.value) {
+                if (shouldInitiateToPeer(peerId)) {
+                    try {
+                        await startP2P(peerId)
+                    } catch (e) {
+                        console.warn(`P2P bootstrap failed for ${peerId}`, e)
+                    }
+                }
             }
         }
 
         const start = Date.now()
         while (Date.now() - start < timeoutMs) {
-            if (isP2PConnected.value) return true
+            if (preferredPeerId) {
+                const dc = dataChannels.value.get(preferredPeerId)
+                if (dc?.readyState === 'open') return true
+            } else if (isP2PConnected.value) {
+                return true
+            }
             await new Promise(r => setTimeout(r, 100))
+        }
+
+        if (preferredPeerId) {
+            return dataChannels.value.get(preferredPeerId)?.readyState === 'open'
         }
         return isP2PConnected.value
     }
 
     // P2P File Sending (Stream via Chunking over DC)
-    async function sendFileP2P(file: File) {
-        if (!dataChannel.value || dataChannel.value.readyState !== 'open') throw new Error("No Data Channel")
+    async function sendFileP2P(file: File, targetPeerId?: string) {
+        const channels = targetPeerId
+            ? [dataChannels.value.get(targetPeerId)].filter((dc): dc is RTCDataChannel => !!dc && dc.readyState === 'open')
+            : Array.from(dataChannels.value.values()).filter(dc => dc.readyState === 'open')
 
-        // 1. Send Meta
-        const id = `${Date.now()}-${file.name}`
-        const meta = JSON.stringify({
-            type: 'meta',
-            id,
-            name: file.name,
-            size: file.size,
-            mime: file.type
-        })
-        dataChannel.value.send(meta)
+        if (channels.length === 0) throw new Error("No open Data Channel")
+        startTransferTelemetry('webrtc', 'upload', file.name, file.size, 'WebRTC DataChannel')
 
-        // 2. Send Chunks
-        const CHUNK_SIZE = 16 * 1024 // Safe MTU
-        const total = Math.ceil(file.size / CHUNK_SIZE)
+        try {
+            const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${file.name}`
+            const meta = JSON.stringify({
+                type: 'meta',
+                id,
+                name: file.name,
+                size: file.size,
+                mime: file.type,
+                from: selfPeerId
+            })
 
-        let sent = 0
-        for (let i = 0; i < total; i++) {
-            const start = i * CHUNK_SIZE
-            const end = Math.min(start + CHUNK_SIZE, file.size)
-            const chunk = file.slice(start, end)
-            const buffer = await chunk.arrayBuffer()
-
-            // Check buffer level to avoid flooding
-            while (dataChannel.value.bufferedAmount > 10 * 1024 * 1024) {
-                await new Promise(r => setTimeout(r, 50))
+            for (const channel of channels) {
+                channel.send(meta)
             }
 
-            dataChannel.value.send(buffer)
-            sent++
+            const CHUNK_SIZE = 16 * 1024
+            const total = Math.ceil(file.size / CHUNK_SIZE)
 
-            // Optional: Send progress event locally or via channel?
-            // For now, assume receiver tracks it
+            for (let i = 0; i < total; i++) {
+                const start = i * CHUNK_SIZE
+                const end = Math.min(start + CHUNK_SIZE, file.size)
+                const chunk = file.slice(start, end)
+                const buffer = await chunk.arrayBuffer()
+
+                while (channels.some(ch => ch.bufferedAmount > 10 * 1024 * 1024)) {
+                    await new Promise(r => setTimeout(r, 50))
+                }
+
+                for (const channel of channels) {
+                    channel.send(buffer)
+                }
+                bumpTransferTelemetry(buffer.byteLength, file.size)
+            }
+
+            finishTransferTelemetry('done')
+            console.log(`✅ P2P Send Complete: ${file.name} -> ${targetPeerId || 'all-open-peers'}`)
+        } catch (e) {
+            finishTransferTelemetry('error', 'WebRTC send failed')
+            throw e
         }
-
-        console.log(`✅ P2P Send Complete: ${file.name}`)
     }
 
-    // Handle Incoming P2P Data
-    // We need a state machine because messages are ordered on DC
-    let incomingFile: {
-        id: string, name: string, size: number, received: number, buffer: Blob[]
-    } | null = null
+    async function handleIncomingBinaryChunk(peerId: string, data: ArrayBuffer) {
+        const activeFileId = activeIncomingFileByPeer.value.get(peerId)
+        if (!activeFileId) return
 
-    function handleP2PMessage(data: any) {
+        const incomingFile = incomingFilesById.value.get(activeFileId)
+        if (!incomingFile) return
+
+        incomingFile.buffer.push(data)
+        incomingFile.received += data.byteLength
+        bumpTransferTelemetry(data.byteLength, incomingFile.size)
+
+        if (onP2PEvent.value) {
+            onP2PEvent.value('progress', {
+                id: incomingFile.id,
+                received: incomingFile.received,
+                total: incomingFile.size
+            })
+        }
+
+        if (incomingFile.received >= incomingFile.size) {
+            const blob = new Blob(incomingFile.buffer)
+            const url = URL.createObjectURL(blob)
+            const a = document.createElement('a')
+            a.href = url
+            a.download = incomingFile.name
+            a.click()
+            URL.revokeObjectURL(url)
+
+            incomingFilesById.value.delete(activeFileId)
+            activeIncomingFileByPeer.value.delete(peerId)
+            finishTransferTelemetry('done')
+            ElMessage.success('WebRTC P2P 传输完成! 🚀')
+        }
+    }
+
+    async function handleP2PMessage(data: any, peerId: string) {
         if (typeof data === 'string') {
             try {
                 const msg = JSON.parse(data)
                 if (msg.type === 'meta') {
-                    // Start new file
-                    incomingFile = {
+                    const incoming = {
                         id: msg.id,
                         name: msg.name,
                         size: msg.size,
                         received: 0,
-                        buffer: []
+                        buffer: [] as BlobPart[]
                     }
-                    console.log(`📥 P2P Incoming File: ${msg.name}`)
+                    incomingFilesById.value.set(msg.id, incoming)
+                    activeIncomingFileByPeer.value.set(peerId, msg.id)
+                    startTransferTelemetry('webrtc', 'download', msg.name, Number(msg.size) || 0, 'WebRTC DataChannel')
+                    console.log(`📥 P2P Incoming File: ${msg.name} from ${peerId}`)
 
                     if (onP2PEvent.value) {
                         onP2PEvent.value('offer', {
@@ -401,43 +774,25 @@ export const useConnectionStore = defineStore('connection', () => {
                             name: msg.name,
                             size: msg.size,
                             type: msg.mime,
-                            isLan: false, // It's P2P
+                            isLan: false,
                             isP2P: true
                         })
                     }
                 }
-            } catch (e) { }
-        } else if (data instanceof ArrayBuffer) {
-            // Binary Chunk
-            if (!incomingFile) return
-
-            incomingFile.buffer.push(new Blob([data]))
-            incomingFile.received += data.byteLength
-
-            // Update UI Progress
-            if (onP2PEvent.value) {
-                onP2PEvent.value('progress', {
-                    id: incomingFile.id,
-                    received: incomingFile.received,
-                    total: incomingFile.size
-                })
+            } catch (e) {
+                console.warn('Invalid P2P message payload', e)
             }
+            return
+        }
 
-            // Check Complete
-            if (incomingFile.received >= incomingFile.size) {
-                const blob = new Blob(incomingFile.buffer)
-                const url = URL.createObjectURL(blob)
-                // Auto download or let UI handle?
-                // For now, simple auto download trigger
-                const a = document.createElement('a')
-                a.href = url
-                a.download = incomingFile.name
-                a.click()
-                URL.revokeObjectURL(url)
+        if (data instanceof Blob) {
+            const buffer = await data.arrayBuffer()
+            await handleIncomingBinaryChunk(peerId, buffer)
+            return
+        }
 
-                incomingFile = null
-                ElMessage.success('WebRTC P2P 传输完成! 🚀')
-            }
+        if (data instanceof ArrayBuffer) {
+            await handleIncomingBinaryChunk(peerId, data)
         }
     }
 
@@ -583,19 +938,19 @@ export const useConnectionStore = defineStore('connection', () => {
     function requestP2PRelayFile(fileId: string) {
         sendMessage({
             type: 'p2p_relay_request',
-            payload: { id: fileId }
+            payload: { id: fileId, requesterId: selfPeerId }
         })
     }
 
-    async function handleP2PRelayRequest(fileId: string) {
+    async function handleP2PRelayRequest(fileId: string, requesterId?: string) {
         const file = localFiles.value.get(fileId)
         if (!file) return
 
         const fallbackToWebRTC = async (reason: string) => {
             console.warn(`LAN relay unavailable (${reason}), auto fallback to WebRTC for ${file.name}`)
-            if (await waitForP2PReady()) {
+            if (await waitForP2PReady(4000, requesterId)) {
                 try {
-                    await sendFileP2P(file)
+                    await sendFileP2P(file, requesterId)
                     ElMessage.warning(`LAN中转失败，已自动切换 WebRTC: ${file.name}`)
                     return
                 } catch (e) {
@@ -603,9 +958,19 @@ export const useConnectionStore = defineStore('connection', () => {
                 }
             }
 
-            // Keep a final fallback for delivery success when WebRTC cannot be established.
-            shareFile(file)
-            ElMessage.warning(`LAN中转失败，WebRTC不可用，已切换 VPS 中转: ${file.name}`)
+            // Final fallback to VPS stream relay.
+            if (!isRelaySizeAllowed(file.size)) {
+                const maxMb = getRelayMaxSizeMb()
+                ElMessage.error(`LAN/WebRTC 均失败，且文件超过 VPS 中转限制(${maxMb}MB): ${file.name}`)
+                return
+            }
+            try {
+                await shareViaVpsRelay(file)
+                ElMessage.warning(`LAN中转失败，WebRTC不可用，已切换 VPS 中转: ${file.name}`)
+            } catch (err) {
+                console.error('VPS relay fallback failed', err)
+                ElMessage.error(`LAN/WebRTC 均失败，且 VPS 中转不可用: ${file.name}`)
+            }
         }
 
         const activeLanServer = getActiveLanServer()
@@ -632,7 +997,9 @@ export const useConnectionStore = defineStore('connection', () => {
                         h3Port: activeLanServer.h3Port,
                         certHash: activeLanServer.certHash,
                         isRelay: true,
-                        status: 'ready'
+                        status: 'ready',
+                        from: selfPeerId,
+                        to: requesterId
                     }
                 })
             }
@@ -672,13 +1039,39 @@ export const useConnectionStore = defineStore('connection', () => {
     function requestLanFile(fileId: string) {
         sendMessage({
             type: 'lan_file_request',
-            payload: { id: fileId }
+            payload: { id: fileId, requesterId: selfPeerId }
         })
         console.log(`📥 Requesting LAN file: ${fileId}`)
     }
 
-    // Handle lan_file_request: upload file to desktop LAN server on demand
-    async function handleLanFileRequest(fileId: string) {
+    function notifyLanFileConsumed(originalId: string, lanFileId?: string) {
+        if (!originalId) return
+        sendMessage({
+            type: 'lan_file_consumed',
+            payload: {
+                originalId,
+                lanFileId,
+                by: selfPeerId,
+                at: Date.now()
+            }
+        })
+    }
+
+    function notifyLanFileFailed(originalId: string, reason: string, requesterId?: string) {
+        if (!originalId) return
+        sendMessage({
+            type: 'lan_file_failed',
+            payload: {
+                originalId,
+                reason,
+                from: selfPeerId,
+                to: requesterId
+            }
+        })
+    }
+
+    // Handle lan_file_request: start relay on demand (LAN host forwards stream and persists copy).
+    async function handleLanFileRequest(fileId: string, requesterId?: string) {
         const file = localFiles.value.get(fileId)
         if (!file) {
             console.warn(`File ${fileId} not found locally`)
@@ -711,13 +1104,15 @@ export const useConnectionStore = defineStore('connection', () => {
                         httpPort: activeLanServer.httpPort,
                         h3Port: activeLanServer.h3Port,
                         certHash: activeLanServer.certHash,
-                        isRelay: true
+                        isRelay: true,
+                        from: selfPeerId,
+                        to: requesterId
                     }
                 })
             }
 
             if (activeLanServer.h3Port && activeLanServer.certHash) {
-                await uploadToLanRelayWT(file, activeLanServer, relayId, sendLanReady)
+                await uploadToLanRelayWT(file, activeLanServer, relayId, sendLanReady, 8000, true)
                 // Backward compatibility: if older desktop doesn't return WT ready ack line.
                 sendLanReady()
                 ElMessage.success(`✅ ${file.name} 就绪 (LAN 中转)`)
@@ -725,37 +1120,45 @@ export const useConnectionStore = defineStore('connection', () => {
             }
 
             if (activeLanServer.httpPort && window.location.protocol !== 'https:') {
-                uploadToLanRelay(file, activeLanServer, relayId).catch(e => {
+                uploadToLanRelay(file, activeLanServer, relayId, true).catch(e => {
                     console.error("HTTP Relay Upload Aborted", e)
+                    notifyLanFileFailed(fileId, 'http_relay_upload_failed', requesterId)
                 })
                 // HTTP relay has no explicit ready ack; send ready once upload request starts.
                 sendLanReady()
                 ElMessage.success(`✅ ${file.name} 就绪 (LAN 中转)`)
                 return
-            } else {
-                if (window.location.protocol === 'https:') {
-                    ElMessage.warning('当前为 HTTPS 页面，HTTP 中转被浏览器拦截；请确保 LAN WebTransport 可用')
-                } else {
-                    ElMessage.error('没有可用的 LAN 中转通道')
-                }
-                return
             }
+
+            if (window.location.protocol === 'https:') {
+                notifyLanFileFailed(fileId, 'https_http_relay_blocked', requesterId)
+                ElMessage.warning('当前为 HTTPS 页面，HTTP 中转被浏览器拦截；请确保 LAN WebTransport 可用')
+            } else {
+                notifyLanFileFailed(fileId, 'no_lan_transport', requesterId)
+                ElMessage.error('没有可用的 LAN 中转通道')
+            }
+            return
         } catch (e) {
             console.error('Failed to upload on demand', e)
+            notifyLanFileFailed(fileId, 'relay_start_failed', requesterId)
             ElMessage.error('上传失败')
         }
     }
 
-    async function uploadToLanRelay(file: File, server: LanServerInfo, relayId: string) {
+    async function uploadToLanRelay(file: File, server: LanServerInfo, relayId: string, persistToHost = false) {
         // This request will BLOCK until the receiver connects!
         // or until server times out (we rely on server timeout)
         console.log(`🚀 Starting Relay Stream: ${relayId}`)
-        const relayUrl = `http://${server.ip}:${server.httpPort}/api/lan/relay/upload/${relayId}?name=${encodeURIComponent(file.name)}`
-        const res = await fetch(relayUrl, {
-            method: 'POST',
-            body: file
-        })
-        if (!res.ok) throw new Error(`Relay error: ${res.statusText}`)
+        startTransferTelemetry('lan-http-relay', 'upload', file.name, file.size, 'LAN HTTP relay')
+        const relayUrl = `http://${server.ip}:${server.httpPort}/api/lan/relay/upload/${relayId}?name=${encodeURIComponent(file.name)}&persist=${persistToHost ? '1' : '0'}`
+        const res = await fetch(relayUrl, { method: 'POST', body: file })
+        if (!res.ok) {
+            finishTransferTelemetry('error', `HTTP ${res.status}`)
+            throw new Error(`Relay error: ${res.statusText}`)
+        }
+        // Browser fetch upload doesn't expose byte progress; set at completion.
+        bumpTransferTelemetry(file.size, file.size)
+        finishTransferTelemetry('done')
         console.log(`✅ Relay Stream Complete: ${relayId}`)
     }
 
@@ -764,84 +1167,106 @@ export const useConnectionStore = defineStore('connection', () => {
         server: LanServerInfo,
         relayId: string,
         onReady?: () => void,
-        readyTimeoutMs = 8000
+        readyTimeoutMs = 8000,
+        persistToHost = false
     ) {
         if (!server.h3Port || !server.certHash) throw new Error('LAN WT unavailable')
 
         console.log(`🚀 Starting WT Relay Stream: ${relayId}`)
-        const wt = await createLanWT(server)
-        const stream = await wt.createBidirectionalStream()
-        const writer = stream.writable.getWriter()
-        const reader = stream.readable.getReader()
+        startTransferTelemetry('lan-wt-relay', 'upload', file.name, file.size, 'LAN WT relay')
+        try {
+            const wt = await createLanWT(server)
+            const stream = await wt.createBidirectionalStream()
+            const writer = stream.writable.getWriter()
+            const reader = stream.readable.getReader()
 
-        const cmd = JSON.stringify({
-            action: 'relay_upload',
-            relayId,
-            name: file.name,
-            size: file.size
-        }) + '\n'
-        await writer.write(new TextEncoder().encode(cmd))
+            const cmd = JSON.stringify({
+                action: 'relay_upload',
+                relayId,
+                name: file.name,
+                size: file.size,
+                persist: persistToHost
+            }) + '\n'
+            await writer.write(new TextEncoder().encode(cmd))
 
-        // Desktop returns {"status":"ready"} before it starts reading stream body.
-        let readyTimer: any = null
-        const readyResp = await Promise.race([
-            readJsonResponse(reader),
-            new Promise((_, reject) => {
-                readyTimer = setTimeout(() => reject(new Error('WT relay ready timeout')), readyTimeoutMs)
-            })
-        ]).finally(() => {
-            if (readyTimer) clearTimeout(readyTimer)
-        }) as any
+            // Desktop returns {"status":"ready"} before it starts reading stream body.
+            let readyTimer: any = null
+            const readyResp = await Promise.race([
+                readJsonResponse(reader),
+                new Promise((_, reject) => {
+                    readyTimer = setTimeout(() => reject(new Error('WT relay ready timeout')), readyTimeoutMs)
+                })
+            ]).finally(() => {
+                if (readyTimer) clearTimeout(readyTimer)
+            }) as any
 
-        if (readyResp?.error) {
+            if (readyResp?.error) {
+                wt.close()
+                throw new Error(readyResp.error)
+            }
+            if (!readyResp || readyResp.status !== 'ready') {
+                wt.close()
+                finishTransferTelemetry('error', 'WT relay ready missing')
+                throw new Error('WT relay ready response missing')
+            }
+            if (readyResp?.status === 'ready' && onReady) onReady()
+
+            await streamFileToWriter(file, writer, (bytes) => bumpTransferTelemetry(bytes, file.size))
+            await writer.close()
+            finishTransferTelemetry('done')
             wt.close()
-            throw new Error(readyResp.error)
+        } catch (e) {
+            finishTransferTelemetry('error', 'WT relay upload failed')
+            throw e
         }
-        if (!readyResp || readyResp.status !== 'ready') {
-            wt.close()
-            throw new Error('WT relay ready response missing')
-        }
-        if (readyResp?.status === 'ready' && onReady) onReady()
-
-        await streamFileToWriter(file, writer)
-        await writer.close()
-        wt.close()
     }
 
     async function uploadToLanWT(file: File, server: LanServerInfo): Promise<string | null> {
         const url = `https://${server.ip}:${server.h3Port}/wt`
         const hashBytes = decodeCertHashBase64(server.certHash!)
-        const wt = new WebTransport(url, {
-            serverCertificateHashes: [{ algorithm: 'sha-256', value: hashBytes.buffer }]
-        })
-        await wt.ready
-        const stream = await wt.createBidirectionalStream()
-        const writer = stream.writable.getWriter()
-        const reader = stream.readable.getReader()
+        startTransferTelemetry('lan-wt-direct', 'upload', file.name, file.size, 'LAN WT direct')
+        try {
+            const wt = new WebTransport(url, {
+                serverCertificateHashes: [{ algorithm: 'sha-256', value: hashBytes.buffer }]
+            })
+            await wt.ready
+            const stream = await wt.createBidirectionalStream()
+            const writer = stream.writable.getWriter()
+            const reader = stream.readable.getReader()
 
-        const cmd = JSON.stringify({ action: 'upload', name: file.name, size: file.size }) + '\n'
-        await writer.write(new TextEncoder().encode(cmd))
-        await streamFileToWriter(file, writer)
-        await writer.close()
+            const cmd = JSON.stringify({ action: 'upload', name: file.name, size: file.size }) + '\n'
+            await writer.write(new TextEncoder().encode(cmd))
+            await streamFileToWriter(file, writer, (bytes) => bumpTransferTelemetry(bytes, file.size))
+            await writer.close()
 
-        const resp = await readJsonResponse(reader)
-        wt.close()
-        if (resp) {
-            if (resp.status === 'ok') return resp.file.id
+            const resp = await readJsonResponse(reader)
+            wt.close()
+            if (resp && resp.status === 'ok') {
+                finishTransferTelemetry('done')
+                return resp.file.id
+            }
+            finishTransferTelemetry('error', 'LAN WT upload failed')
+            return null
+        } catch (e) {
+            finishTransferTelemetry('error', 'LAN WT upload failed')
+            throw e
         }
-        return null
     }
 
     async function uploadToLanHTTP(file: File, server: LanServerInfo): Promise<string | null> {
         const formData = new FormData()
         formData.append('file', file)
+        startTransferTelemetry('lan-http-direct', 'upload', file.name, file.size, 'LAN HTTP direct')
         const res = await fetch(`http://${server.ip}:${server.httpPort}/api/lan/upload`, {
             method: 'POST', body: formData
         })
         if (res.ok) {
             const data = await res.json()
+            bumpTransferTelemetry(file.size, file.size)
+            finishTransferTelemetry('done')
             return data.id
         }
+        finishTransferTelemetry('error', `HTTP ${res.status}`)
         return null
     }
 
@@ -854,32 +1279,378 @@ export const useConnectionStore = defineStore('connection', () => {
         mode: 'netdisk'
     } | null> {
         try {
+            startTransferTelemetry('cloud', 'upload', file.name, file.size, 'Cloud upload')
             const formData = new FormData()
             formData.append('file', file)
             const res = await fetch(`${HTTP_URL.value}/upload`, {
                 method: 'POST',
                 body: formData
             })
-            if (!res.ok) return null
+            if (!res.ok) {
+                finishTransferTelemetry('error', `HTTP ${res.status}`)
+                return null
+            }
 
             const data = await res.json()
-            if (!data?.url) return null
+            if (!data?.url) {
+                finishTransferTelemetry('error', 'Cloud upload response invalid')
+                return null
+            }
 
             const absoluteUrl = data.url.startsWith('http')
                 ? data.url
                 : `${HTTP_URL.value}${data.url}`
 
-            return {
+            const result = {
                 id: `cloud-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
                 name: data.name || file.name,
                 size: file.size,
                 type: file.type || 'application/octet-stream',
                 url: absoluteUrl,
-                mode: 'netdisk'
+                mode: 'netdisk' as const
             }
+            bumpTransferTelemetry(file.size, file.size)
+            finishTransferTelemetry('done')
+            return result
         } catch (e) {
             console.error('Cloud upload failed', e)
+            finishTransferTelemetry('error', 'Cloud upload failed')
             return null
+        }
+    }
+
+    function shouldPreferBrowserDownloadManager(): boolean {
+        // In web browsers (especially Android), native URL download is more reliable
+        // than fetch+blob streaming and shows up in browser download list.
+        return !isDesktop.value && downloadMode.value === 'compat'
+    }
+
+    function setDownloadMode(mode: DownloadMode) {
+        downloadMode.value = mode
+        localStorage.setItem(DOWNLOAD_MODE_KEY, mode)
+    }
+
+    function isSpeedDownloadMode(): boolean {
+        return !isDesktop.value && downloadMode.value === 'speed'
+    }
+
+    async function probeLanHttpsUrlReachable(ip: string, h3Port?: number): Promise<boolean> {
+        if (!ip || !h3Port) return false
+        const key = `${ip}:${h3Port}`
+        const now = Date.now()
+        const cached = lanHttpsProbeCache.value.get(key)
+        if (cached && now - cached.ts < 5 * 60 * 1000) {
+            return cached.ok
+        }
+
+        try {
+            const controller = new AbortController()
+            const timer = setTimeout(() => controller.abort(), 1800)
+            // `no-cors` lets us probe TLS/connectivity without CORS coupling.
+            await fetch(`https://${ip}:${h3Port}/api/lan/files`, {
+                method: 'GET',
+                mode: 'no-cors',
+                cache: 'no-store',
+                signal: controller.signal
+            })
+            clearTimeout(timer)
+            lanHttpsProbeCache.value.set(key, { ok: true, ts: now })
+            return true
+        } catch (e) {
+            lanHttpsProbeCache.value.set(key, { ok: false, ts: now })
+            return false
+        }
+    }
+
+    async function openLanDownloadURL(
+        fileId: string,
+        fileName: string,
+        ip?: string,
+        httpPort?: number,
+        h3Port?: number,
+        isRelay = false
+    ): Promise<'https' | 'http' | null> {
+        if (!ip) return null
+        startTransferTelemetry('browser-url', 'download', fileName, 0, 'Browser download manager')
+        const path = isRelay
+            ? `/api/lan/relay/download/${fileId}`
+            : `/api/lan/download/${fileId}`
+
+        if (h3Port) {
+            const httpsReachable = await probeLanHttpsUrlReachable(ip, h3Port)
+            if (httpsReachable) {
+                const a = document.createElement('a')
+                a.href = `https://${ip}:${h3Port}${path}`
+                a.target = '_blank'
+                a.rel = 'noopener'
+                a.download = fileName
+                document.body.appendChild(a)
+                a.click()
+                document.body.removeChild(a)
+                finishTransferTelemetry('handoff', `URL handoff: HTTPS${isRelay ? ' relay' : ''}`)
+                return 'https'
+            }
+        }
+
+        if (httpPort) {
+            const a = document.createElement('a')
+            a.href = `http://${ip}:${httpPort}${path}`
+            a.target = '_blank'
+            a.rel = 'noopener'
+            a.download = fileName
+            document.body.appendChild(a)
+            a.click()
+            document.body.removeChild(a)
+            finishTransferTelemetry('handoff', `URL handoff: HTTP${isRelay ? ' relay' : ''}`)
+            return 'http'
+        }
+
+        finishTransferTelemetry('error', 'No LAN URL available')
+        return null
+    }
+
+    function sleep(ms: number): Promise<void> {
+        return new Promise(resolve => setTimeout(resolve, ms))
+    }
+
+    function parseFileNameFromContentDisposition(headerValue: string | null): string | null {
+        if (!headerValue) return null
+
+        const utf8Match = headerValue.match(/filename\*=UTF-8''([^;]+)/i)
+        if (utf8Match?.[1]) {
+            try {
+                return decodeURIComponent(utf8Match[1])
+            } catch {
+                return utf8Match[1]
+            }
+        }
+
+        const plainMatch = headerValue.match(/filename=\"?([^\";]+)\"?/i)
+        if (plainMatch?.[1]) {
+            return plainMatch[1]
+        }
+
+        return null
+    }
+
+    async function ackVpsRelay(relayId: string, cleanup = false): Promise<void> {
+        const url = `${HTTP_URL.value}/api/relay/ack/${relayId}`
+        try {
+            await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cleanup })
+            })
+        } catch (e) {
+            console.warn(`VPS relay ack failed: ${relayId}`, e)
+        }
+    }
+
+    async function downloadVpsRelayFile(
+        relayId: string,
+        downloadUrl: string,
+        fallbackName: string,
+        totalSizeHint = 0
+    ): Promise<boolean> {
+        if (shouldPreferBrowserDownloadManager()) {
+            startTransferTelemetry('browser-url', 'download', fallbackName, totalSizeHint || 0, 'Browser download manager')
+            const a = document.createElement('a')
+            a.href = downloadUrl
+            a.target = '_blank'
+            a.rel = 'noopener'
+            a.download = fallbackName
+            document.body.appendChild(a)
+            a.click()
+            document.body.removeChild(a)
+            finishTransferTelemetry('handoff', 'URL handoff: VPS relay')
+            return true
+        }
+
+        startTransferTelemetry('vps-relay', 'download', fallbackName, totalSizeHint || 0, 'VPS relay')
+        const chunks: BlobPart[] = []
+        let downloaded = 0
+        let expectedTotal = totalSizeHint
+        let finalName = fallbackName
+
+        const maxRetries = 3
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            const headers: HeadersInit = {}
+            if (downloaded > 0) {
+                headers.Range = `bytes=${downloaded}-`
+            }
+
+            try {
+                const res = await fetch(downloadUrl, { method: 'GET', headers })
+                if (!res.ok && res.status !== 206) {
+                    throw new Error(`HTTP ${res.status}`)
+                }
+
+                if (downloaded > 0 && res.status === 200) {
+                    // Server ignored range, restart from beginning.
+                    downloaded = 0
+                    chunks.length = 0
+                }
+
+                const fileNameFromHeader = parseFileNameFromContentDisposition(
+                    res.headers.get('content-disposition')
+                )
+                if (fileNameFromHeader) finalName = fileNameFromHeader
+
+                const contentRange = res.headers.get('content-range')
+                if (contentRange) {
+                    const totalFromRange = Number(contentRange.split('/')[1])
+                    if (!Number.isNaN(totalFromRange) && totalFromRange > 0) {
+                        expectedTotal = totalFromRange
+                    }
+                } else if (!expectedTotal) {
+                    const len = Number(res.headers.get('content-length') || '0')
+                    if (!Number.isNaN(len) && len > 0) {
+                        expectedTotal = downloaded + len
+                    }
+                }
+
+                const reader = res.body?.getReader()
+                if (!reader) throw new Error('ReadableStream unavailable')
+
+                while (true) {
+                    const { value, done } = await reader.read()
+                    if (done) break
+                    if (!value) continue
+
+                    chunks.push(value)
+                    downloaded += value.byteLength
+                    bumpTransferTelemetry(value.byteLength, expectedTotal || totalSizeHint || 0)
+                    if (onP2PEvent.value) {
+                        onP2PEvent.value('progress', {
+                            id: relayId,
+                            received: downloaded,
+                            total: expectedTotal || totalSizeHint || downloaded
+                        })
+                    }
+                }
+
+                if (!expectedTotal || downloaded >= expectedTotal) {
+                    break
+                }
+            } catch (e) {
+                if (attempt >= maxRetries) {
+                    console.error('VPS relay download failed after retries', e)
+                    finishTransferTelemetry('error', 'VPS relay download failed')
+                    return false
+                }
+                await sleep(300 * (attempt + 1))
+                continue
+            }
+        }
+
+        const blob = new Blob(chunks)
+        const a = document.createElement('a')
+        a.href = URL.createObjectURL(blob)
+        a.download = finalName
+        a.click()
+        URL.revokeObjectURL(a.href)
+
+        await ackVpsRelay(relayId, false)
+        sendMessage({
+            type: 'vps_relay_ack',
+            payload: {
+                relayId,
+                from: selfPeerId
+            }
+        })
+        finishTransferTelemetry('done')
+        return true
+    }
+
+    async function shareViaVpsRelay(file: File): Promise<{
+        relayId: string
+        url: string
+        expiresAt?: number
+    }> {
+        if (!isRelaySizeAllowed(file.size)) {
+            const maxMb = getRelayMaxSizeMb()
+            throw new Error(`VPS relay size limit exceeded (${maxMb}MB)`)
+        }
+        startTransferTelemetry('vps-relay', 'upload', file.name, file.size, 'VPS relay')
+
+        const maxUploadRetries = 2
+        let lastError: any = null
+        let relayId = ''
+        let data: any = null
+
+        for (let attempt = 0; attempt <= maxUploadRetries; attempt++) {
+            try {
+                relayId = `vps-relay-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+                const uploadUrl = `${HTTP_URL.value}/api/relay/upload/${relayId}?name=${encodeURIComponent(file.name)}`
+                const res = await fetch(uploadUrl, {
+                    method: 'POST',
+                    body: file
+                })
+                if (!res.ok) {
+                    const errText = await res.text().catch(() => '')
+                    const message = `VPS relay upload failed: ${res.status}${errText ? ` ${errText}` : ''}`
+                    const err: any = new Error(message)
+                    // 4xx are usually non-transient (size limits, validation errors).
+                    if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+                        err.nonRetryable = true
+                    }
+                    throw err
+                }
+                data = await res.json()
+                bumpTransferTelemetry(file.size, file.size)
+                lastError = null
+                break
+            } catch (e: any) {
+                lastError = e
+                if (e?.nonRetryable) {
+                    break
+                }
+                if (attempt >= maxUploadRetries) {
+                    break
+                }
+                await sleep(250 * (attempt + 1))
+            }
+        }
+
+        if (lastError || !relayId || !data) {
+            finishTransferTelemetry('error', 'VPS relay upload failed')
+            throw lastError || new Error('VPS relay upload failed')
+        }
+
+        const rawDownloadUrl = data?.downloadUrl || `/api/relay/download/${relayId}`
+        const absoluteDownloadUrl = rawDownloadUrl.startsWith('http')
+            ? rawDownloadUrl
+            : `${HTTP_URL.value}${rawDownloadUrl}`
+
+        vpsRelayOffers.value.set(relayId, {
+            relayId,
+            name: file.name,
+            size: file.size,
+            type: file.type,
+            url: absoluteDownloadUrl,
+            expiresAt: data?.expiresAt
+        })
+
+        sendMessage({
+            type: 'vps_relay_offer',
+            payload: {
+                id: relayId,
+                relayId,
+                name: file.name,
+                size: file.size,
+                type: file.type,
+                url: absoluteDownloadUrl,
+                isVpsRelay: true,
+                expiresAt: data?.expiresAt
+            }
+        })
+
+        finishTransferTelemetry('done')
+
+        return {
+            relayId,
+            url: absoluteDownloadUrl,
+            expiresAt: data?.expiresAt
         }
     }
 
@@ -962,7 +1733,8 @@ export const useConnectionStore = defineStore('connection', () => {
 
     async function streamFileToWriter(
         file: File,
-        writer: WritableStreamDefaultWriter<Uint8Array>
+        writer: WritableStreamDefaultWriter<Uint8Array>,
+        onChunk?: (bytes: number) => void
     ): Promise<void> {
         const reader = file.stream().getReader()
         try {
@@ -970,7 +1742,9 @@ export const useConnectionStore = defineStore('connection', () => {
                 const { value, done } = await reader.read()
                 if (done) break
                 if (!value) continue
-                await writer.write(toArrayBufferBytes(value))
+                const chunk = toArrayBufferBytes(value)
+                await writer.write(chunk)
+                if (onChunk) onChunk(chunk.byteLength)
             }
         } finally {
             reader.releaseLock()
@@ -979,7 +1753,8 @@ export const useConnectionStore = defineStore('connection', () => {
 
     async function saveWTDownloadToFile(
         reader: ReadableStreamDefaultReader<Uint8Array>,
-        fallbackName: string
+        fallbackName: string,
+        onChunk?: (bytes: number) => void
     ): Promise<boolean> {
         const chunks: BlobPart[] = []
         let metaReceived = false
@@ -1023,6 +1798,7 @@ export const useConnectionStore = defineStore('connection', () => {
                         } else {
                             chunks.push(rest)
                         }
+                        if (onChunk) onChunk(rest.byteLength)
                     }
 
                     metaReceived = true
@@ -1037,6 +1813,7 @@ export const useConnectionStore = defineStore('connection', () => {
                 } else {
                     chunks.push(chunk)
                 }
+                if (onChunk) onChunk(chunk.byteLength)
             }
         }
 
@@ -1140,10 +1917,13 @@ export const useConnectionStore = defineStore('connection', () => {
 
     // Download file via WebTransport
     async function downloadLanFileWT(fileId: string, fileName: string): Promise<boolean> {
+        if (shouldPreferBrowserDownloadManager()) return false
+
         const server = getActiveLanServer()
         if (!server?.h3Port || !server?.certHash) return false
 
         try {
+            startTransferTelemetry('lan-wt-direct', 'download', fileName, 0, 'LAN WT direct')
             const wt = await createLanWT(server)
             const stream = await wt.createBidirectionalStream()
             const writer = stream.writable.getWriter()
@@ -1153,11 +1933,13 @@ export const useConnectionStore = defineStore('connection', () => {
                 JSON.stringify({ action: 'download', fileId }) + '\n'
             ))
             await writer.close()
-            const ok = await saveWTDownloadToFile(reader, fileName)
+            const ok = await saveWTDownloadToFile(reader, fileName, (bytes) => bumpTransferTelemetry(bytes))
             wt.close()
+            finishTransferTelemetry(ok ? 'done' : 'error', ok ? '' : 'WT download failed')
             return ok
         } catch (e) {
             console.error('WT download failed', e)
+            finishTransferTelemetry('error', 'WT download failed')
             return false
         }
     }
@@ -1169,6 +1951,8 @@ export const useConnectionStore = defineStore('connection', () => {
         h3Port?: number,
         certHashVal?: string
     ): Promise<boolean> {
+        if (shouldPreferBrowserDownloadManager()) return false
+
         const activeServer = getActiveLanServer()
         const targetIp = ip || activeServer?.ip
         const targetH3Port = h3Port || activeServer?.h3Port
@@ -1176,6 +1960,7 @@ export const useConnectionStore = defineStore('connection', () => {
         if (!targetIp || !targetH3Port || !targetCertHash) return false
 
         try {
+            startTransferTelemetry('lan-wt-relay', 'download', fileName, 0, 'LAN WT relay')
             const wt = await createLanWTByAddress(targetIp, targetH3Port, targetCertHash)
             const stream = await wt.createBidirectionalStream()
             const writer = stream.writable.getWriter()
@@ -1186,11 +1971,13 @@ export const useConnectionStore = defineStore('connection', () => {
             ))
             await writer.close()
 
-            const ok = await saveWTDownloadToFile(reader, fileName)
+            const ok = await saveWTDownloadToFile(reader, fileName, (bytes) => bumpTransferTelemetry(bytes))
             wt.close()
+            finishTransferTelemetry(ok ? 'done' : 'error', ok ? '' : 'WT relay download failed')
             return ok
         } catch (e) {
             console.error('WT relay download failed', e)
+            finishTransferTelemetry('error', 'WT relay download failed')
             return false
         }
     }
@@ -1210,8 +1997,8 @@ export const useConnectionStore = defineStore('connection', () => {
             return
         }
 
-        if (file.size <= RELAY_MAX_SIZE_BYTES) {
-            shareFile(file)
+        if (isRelaySizeAllowed(file.size)) {
+            await shareViaVpsRelay(file)
             ElMessage.info('已切换 VPS Relay 中转')
             return
         }
@@ -1285,9 +2072,9 @@ export const useConnectionStore = defineStore('connection', () => {
         }
 
         // Priority 4: VPS Relay (small files only)
-        if (file.size <= RELAY_MAX_SIZE_BYTES) {
+        if (isRelaySizeAllowed(file.size)) {
             console.log("🔄 Smart Send: Falling back to VPS Relay")
-            shareFile(file)
+            await shareViaVpsRelay(file)
             ElMessage.info('已切换 VPS Relay 中转')
             return
         }
@@ -1512,13 +2299,13 @@ export const useConnectionStore = defineStore('connection', () => {
                     break
 
                 case 'offer':
-                    handleOffer(msg.payload)
+                    void handleOffer(msg.payload)
                     break
                 case 'answer':
-                    handleAnswer(msg.payload)
+                    void handleAnswer(msg.payload)
                     break
                 case 'candidate':
-                    handleCandidate(msg.payload)
+                    void handleCandidate(msg.payload)
                     break
 
                 // --- P2P File Handling ---
@@ -1533,14 +2320,38 @@ export const useConnectionStore = defineStore('connection', () => {
                     })
                     break
 
-                case 'p2p_hello':
-                    console.log('👋 Received p2p_hello from new peer')
+                case 'vps_relay_offer':
+                    if (onP2PEvent.value) onP2PEvent.value('offer', {
+                        ...msg.payload,
+                        isVpsRelay: true
+                    })
+                    break
 
-                    // Trigger P2P Handshake if we are "older" or just random?
-                    // Simple: Both try, WebRTC handles glare using 'polite' peer pattern, or just let Initiator be the one sending file?
-                    // Better: Auto-connect mesh.
-                    if (!peerConnection.value) {
-                        startP2P()
+                case 'vps_relay_ack':
+                    if (msg.payload?.relayId) {
+                        vpsRelayOffers.value.delete(msg.payload.relayId)
+                        if (onP2PEvent.value) {
+                            onP2PEvent.value('relay_ack', msg.payload)
+                        }
+                    }
+                    break
+
+                case 'p2p_hello':
+                    if (msg.payload?.peerId && msg.payload.peerId !== selfPeerId) {
+                        const remotePeerId = msg.payload.peerId as string
+                        const isNewPeer = !knownPeers.value.has(remotePeerId)
+                        knownPeers.value.add(remotePeerId)
+                        console.log(`👋 Received p2p_hello from ${remotePeerId}`)
+
+                        if (isNewPeer) {
+                            sendMessage({ type: 'p2p_hello', payload: { peerId: selfPeerId } })
+                        }
+
+                        if (shouldInitiateToPeer(remotePeerId)) {
+                            void startP2P(remotePeerId).catch((e) => {
+                                console.warn(`Auto startP2P failed for ${remotePeerId}`, e)
+                            })
+                        }
                     }
 
                     // A new peer joined. Re-broadcast my files.
@@ -1586,6 +2397,24 @@ export const useConnectionStore = defineStore('connection', () => {
                         }
                     } else {
                         console.log('No local files to share.')
+                    }
+
+                    if (vpsRelayOffers.value.size > 0) {
+                        for (const offer of vpsRelayOffers.value.values()) {
+                            sendMessage({
+                                type: 'vps_relay_offer',
+                                payload: {
+                                    id: offer.relayId,
+                                    relayId: offer.relayId,
+                                    name: offer.name,
+                                    size: offer.size,
+                                    type: offer.type,
+                                    url: offer.url,
+                                    isVpsRelay: true,
+                                    expiresAt: offer.expiresAt
+                                }
+                            })
+                        }
                     }
                     break
 
@@ -1662,14 +2491,32 @@ export const useConnectionStore = defineStore('connection', () => {
 
                 case 'lan_file_request':
                     // Someone wants our file - upload to desktop on demand
-                    handleLanFileRequest(msg.payload.id)
+                    handleLanFileRequest(msg.payload.id, msg.payload.requesterId || msg.payload.from)
                     break
 
                 case 'lan_file_ready':
+                    if (msg.payload?.to && msg.payload.to !== selfPeerId) {
+                        break
+                    }
                     console.log('LAN File Ready:', msg.payload)
                     // File has been uploaded to desktop, ready to download
                     if (onLanEvent.value) {
                         onLanEvent.value('lan_ready', msg.payload)
+                    }
+                    break
+
+                case 'lan_file_failed':
+                    if (msg.payload?.to && msg.payload.to !== selfPeerId) {
+                        break
+                    }
+                    if (onLanEvent.value) {
+                        onLanEvent.value('lan_failed', msg.payload)
+                    }
+                    break
+
+                case 'lan_file_consumed':
+                    if (onLanEvent.value) {
+                        onLanEvent.value('lan_consumed', msg.payload)
                     }
                     break
 
@@ -1697,10 +2544,13 @@ export const useConnectionStore = defineStore('connection', () => {
                     break
 
                 case 'p2p_relay_request':
-                    handleP2PRelayRequest(msg.payload.id)
+                    void handleP2PRelayRequest(msg.payload.id, msg.payload.requesterId || msg.payload.from)
                     break
 
                 case 'p2p_relay_ready':
+                    if (msg.payload?.to && msg.payload.to !== selfPeerId) {
+                        break
+                    }
                     if (onP2PEvent.value) {
                         onP2PEvent.value('relay_ready', msg.payload)
                     }
@@ -1744,6 +2594,7 @@ export const useConnectionStore = defineStore('connection', () => {
         shareLanFile,
         shareLanFilePersistent,
         requestLanFile,
+        notifyLanFileConsumed,
         requestP2PRelayFile,
         HTTP_URL,
         disconnect: closeConnection,
@@ -1762,6 +2613,13 @@ export const useConnectionStore = defineStore('connection', () => {
         uploadLanFileWT,
         downloadLanFileWT,
         downloadLanRelayWT,
+        downloadVpsRelayFile,
+        openLanDownloadURL,
+        downloadMode,
+        setDownloadMode,
+        isSpeedDownloadMode,
         getActiveLanServer,
+        transferTelemetry,
+        clearTransferTelemetry: resetTransferTelemetry,
     }
 })

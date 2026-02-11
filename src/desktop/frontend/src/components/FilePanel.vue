@@ -1,10 +1,7 @@
 <script setup lang="ts">
 import { Cloudy, Delete, Download, FolderOpened, Monitor, UploadFilled } from '@element-plus/icons-vue'
-import { ElMessage, type UploadProps } from 'element-plus'
-import { computed, onMounted, ref, watch } from 'vue'
-import { useConnectionStore } from '../stores/connection'
-
-const conn = useConnectionStore()
+import { ElMessage } from 'element-plus'
+import { onMounted, ref, watch } from 'vue'
 const activeTab = ref('lan')
 const downloadDir = ref('')
 
@@ -47,7 +44,8 @@ const fetchLanPort = async () => {
     }
 }
 
-const lanUploadUrl = computed(() => `http://localhost:${lanPort.value}/api/lan/upload`)
+const lanUploading = ref(false)
+const cloudUploading = ref(false)
 
 const fetchLanFiles = async () => {
     if (!lanPort.value) return
@@ -61,9 +59,38 @@ const fetchLanFiles = async () => {
     }
 }
 
-const handleLanSuccess: UploadProps['onSuccess'] = () => {
-    ElMessage.success('文件已添加到 LAN 共享')
-    fetchLanFiles()
+const pickNativeFiles = async (): Promise<Array<{ path: string; name: string; size: number }>> => {
+    const app = wailsApp()
+    if (!app || !app.SelectRelayFiles) return []
+    const selected = await app.SelectRelayFiles()
+    if (!Array.isArray(selected)) return []
+    return selected
+}
+
+const uploadLanNative = async () => {
+    const app = wailsApp()
+    if (!app || !app.ImportLocalFile) {
+        ElMessage.error('当前环境不支持原生 LAN 上传')
+        return
+    }
+    const files = await pickNativeFiles()
+    if (files.length === 0) return
+
+    lanUploading.value = true
+    let success = 0
+    try {
+        for (const f of files) {
+            await app.ImportLocalFile(f.path)
+            success++
+        }
+        ElMessage.success(`已添加 ${success} 个文件到 LAN 共享`)
+        fetchLanFiles()
+    } catch (e) {
+        console.error('ImportLocalFile failed', e)
+        ElMessage.error('LAN 原生上传失败')
+    } finally {
+        lanUploading.value = false
+    }
 }
 
 const openLanDownload = (file: any) => {
@@ -76,14 +103,30 @@ const cloudFileList = ref<any[]>([])
 const VPS_HOST = import.meta.env.VITE_VPS_HOST || 'localhost:3100'
 const HTTP_URL = `http://${VPS_HOST}`
 
-const cloudUploadUrl = computed(() => `${HTTP_URL}/upload`)
+const uploadCloudNative = async () => {
+    const app = wailsApp()
+    if (!app || !app.UploadCloudFile) {
+        ElMessage.error('当前环境不支持原生云端上传')
+        return
+    }
+    const files = await pickNativeFiles()
+    if (files.length === 0) return
 
-const handleCloudSuccess: UploadProps['onSuccess'] = (response, uploadFile) => {
-  if (response.url) {
-      uploadFile.url = `${HTTP_URL}${response.url}`
-      ElMessage.success('云端上传成功')
-      fetchCloudFiles()
-  }
+    cloudUploading.value = true
+    let success = 0
+    try {
+        for (const f of files) {
+            await app.UploadCloudFile(f.path)
+            success++
+        }
+        ElMessage.success(`云端上传完成: ${success} 个文件`)
+        fetchCloudFiles()
+    } catch (e) {
+        console.error('UploadCloudFile failed', e)
+        ElMessage.error('云端原生上传失败')
+    } finally {
+        cloudUploading.value = false
+    }
 }
 
 const fetchCloudFiles = async () => {
@@ -156,19 +199,9 @@ onMounted(async () => {
         <!-- LAN Drive View (Desktop is the server) -->
         <div v-if="activeTab === 'lan'" class="pane-content">
              <div class="upload-area">
-                <el-upload
-                    class="upload-demo"
-                    drag
-                    :action="lanUploadUrl"
-                    multiple
-                    :show-file-list="false"
-                    :on-success="handleLanSuccess"
-                >
-                    <el-icon class="el-icon--upload"><upload-filled /></el-icon>
-                    <div class="el-upload__text">
-                        添加文件到 LAN 共享
-                    </div>
-                </el-upload>
+                <el-button type="primary" :icon="UploadFilled" :loading="lanUploading" @click="uploadLanNative">
+                    选择文件添加到 LAN 共享 (Go 原生)
+                </el-button>
             </div>
 
             <div class="file-list-container">
@@ -198,19 +231,9 @@ onMounted(async () => {
         <!-- Cloud Drive View -->
         <div v-if="activeTab === 'cloud'" class="pane-content">
             <div class="upload-area">
-                <el-upload
-                    class="upload-demo"
-                    drag
-                    :action="cloudUploadUrl"
-                    multiple
-                    :on-success="handleCloudSuccess"
-                    :file-list="cloudFileList"
-                >
-                    <el-icon class="el-icon--upload"><upload-filled /></el-icon>
-                    <div class="el-upload__text">
-                        上传到 VPS (临时存储)
-                    </div>
-                </el-upload>
+                <el-button type="success" :icon="UploadFilled" :loading="cloudUploading" @click="uploadCloudNative">
+                    选择文件上传到 VPS (Go 原生)
+                </el-button>
             </div>
 
             <div class="file-list-container">

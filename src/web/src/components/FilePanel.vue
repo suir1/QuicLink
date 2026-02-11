@@ -7,6 +7,40 @@ import { useConnectionStore } from '../stores/connection'
 const conn = useConnectionStore()
 const activeTab = ref('lan')
 const downloadDir = ref('')
+const transfer = computed(() => conn.transferTelemetry)
+
+const transferPathLabel = computed(() => {
+    const path = transfer.value?.path
+    switch (path) {
+        case 'lan-wt-relay': return 'LAN WT Relay'
+        case 'lan-http-relay': return 'LAN HTTP Relay'
+        case 'lan-wt-direct': return 'LAN WT Direct'
+        case 'lan-http-direct': return 'LAN HTTP Direct'
+        case 'webrtc': return 'WebRTC'
+        case 'vps-relay': return 'VPS Relay'
+        case 'browser-url': return 'Browser URL'
+        case 'cloud': return 'Cloud'
+        default: return 'N/A'
+    }
+})
+
+const transferStatusLabel = computed(() => {
+    const status = transfer.value?.status || 'idle'
+    switch (status) {
+        case 'active': return '传输中'
+        case 'done': return '完成'
+        case 'handoff': return '已交给浏览器下载'
+        case 'error': return '失败'
+        default: return '空闲'
+    }
+})
+
+const transferSpeedText = computed(() => {
+    const bps = Number(transfer.value?.speedBps || 0)
+    if (bps <= 0) return '--'
+    const mbps = bps / (1024 * 1024)
+    return `${mbps.toFixed(mbps >= 10 ? 1 : 2)} MB/s`
+})
 
 const fetchDownloadDir = async () => {
     const w = window as any
@@ -107,38 +141,15 @@ const onShareFileSelected = async (e: Event) => {
     const input = e.target as HTMLInputElement
     if (!input.files) return
     for (const file of input.files) {
-        const localId = `lan-local-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
-        sharedFiles.value.set(localId, {
-            id: localId,
+        const shareId = conn.shareLanFile(file)
+        sharedFiles.value.set(shareId, {
+            id: shareId,
             name: file.name,
             size: file.size,
-            status: 'uploading',
+            status: 'pending',
             source: 'local'
         })
-
-        try {
-            const shared = await conn.shareLanFilePersistent(file)
-            const existing = sharedFiles.value.get(localId)
-            if (existing) sharedFiles.value.delete(localId)
-            sharedFiles.value.set(shared.id, {
-                id: shared.id,
-                name: file.name,
-                size: file.size,
-                status: 'ready',
-                lanFileId: shared.lanFileId,
-                ip: shared.ip,
-                httpPort: shared.httpPort,
-                h3Port: shared.h3Port,
-                certHash: shared.certHash,
-                isRelay: false,
-                source: 'local'
-            })
-            ElMessage.success(`📤 ${file.name} 已上传到主机并共享`)
-            fetchLanFiles()
-        } catch (err) {
-            sharedFiles.value.delete(localId)
-            ElMessage.error(`共享失败: ${file.name}`)
-        }
+        ElMessage.success(`📋 ${file.name} 已加入共享列表，等待下载触发上传`)
     }
     input.value = '' // reset
 }
@@ -175,6 +186,7 @@ const handleLanEvent = (type: string, data: any) => {
         sharedFiles.value.set(data.id, file)
     } else if (type === 'lan_ready') {
         const existing = sharedFiles.value.get(data.originalId)
+        const autoDownload = !!existing && existing.source === 'remote' && existing.status === 'uploading'
         if (existing) {
             existing.status = 'ready'
             existing.lanFileId = data.lanFileId
@@ -185,7 +197,34 @@ const handleLanEvent = (type: string, data: any) => {
             existing.isRelay = data.isRelay
         }
         ElMessage.success(`📥 ${data.name} 已就绪，可下载`)
+        if (autoDownload && existing) {
+            void requestDownload(existing)
+        }
         fetchLanFiles()
+    } else if (type === 'lan_consumed') {
+        const originalId = data?.originalId
+        if (originalId && sharedFiles.value.has(originalId)) {
+            sharedFiles.value.delete(originalId)
+            downloadingFiles.value.delete(originalId)
+        } else if (data?.lanFileId) {
+            for (const [id, f] of sharedFiles.value.entries()) {
+                if (f.lanFileId === data.lanFileId) {
+                    sharedFiles.value.delete(id)
+                    downloadingFiles.value.delete(id)
+                }
+            }
+        }
+    } else if (type === 'lan_failed') {
+        const originalId = data?.originalId
+        if (originalId) {
+            const existing = sharedFiles.value.get(originalId)
+            if (existing && existing.source === 'remote') {
+                existing.status = 'pending'
+                existing.lanFileId = undefined
+            }
+            downloadingFiles.value.delete(originalId)
+        }
+        ElMessage.error(`中转失败: ${data?.reason || 'unknown'}`)
     } else if (type === 'lan_list') {
         lanFileList.value = data
     }
@@ -202,8 +241,9 @@ const downloadLanFile = async (
     httpPort?: number,
     isRelay?: boolean,
     h3Port?: number,
-    certHash?: string
-) => {
+    certHash?: string,
+    autoTriggered = false
+): Promise<boolean> => {
     // Phase 9: Relay Download (Direct HTTP Stream)
     if (isRelay) {
         const server = conn.getActiveLanServer()
@@ -211,6 +251,23 @@ const downloadLanFile = async (
         const targetPort = httpPort || server?.httpPort
         const targetH3Port = h3Port || server?.h3Port
         const targetCertHash = certHash || server?.certHash
+
+        if (!autoTriggered && !conn.isDesktop && !conn.isSpeedDownloadMode()) {
+            const via = await conn.openLanDownloadURL(
+                lanFileId,
+                name,
+                targetIp,
+                targetPort,
+                targetH3Port,
+                true
+            )
+            if (via) {
+                ElMessage.success(`📥 ${name} 开始下载 (${via.toUpperCase()})`)
+                return true
+            }
+            ElMessage.error('无法获取中转地址')
+            return false
+        }
 
         try {
             const ok = await conn.downloadLanRelayWT(
@@ -222,19 +279,54 @@ const downloadLanFile = async (
             )
             if (ok) {
                 ElMessage.success(`📥 ${name} 下载完成 (WT Relay)`)
-                return
+                return true
             }
         } catch (e) {
             console.warn('WT relay download failed, falling back to HTTP', e)
         }
 
-        if (targetIp && targetPort) {
-            window.open(`http://${targetIp}:${targetPort}/api/lan/relay/download/${lanFileId}`, '_blank')
-            ElMessage.success(`📥 ${name} 开始中转下载 (无硬盘)`)
+        if (autoTriggered && !conn.isSpeedDownloadMode()) {
+            ElMessage.warning(`自动下载失败，请点击再次下载: ${name}`)
+            return false
+        }
+
+        const via = await conn.openLanDownloadURL(
+            lanFileId,
+            name,
+            targetIp,
+            targetPort,
+            targetH3Port,
+            true
+        )
+        if (via) {
+            ElMessage.success(`📥 ${name} 开始中转下载 (${via.toUpperCase()})`)
+            return true
         } else {
             ElMessage.error('无法获取中转地址')
+            return false
         }
-        return
+    }
+
+    const server = conn.getActiveLanServer()
+    const targetIp = ip || server?.ip
+    const targetPort = httpPort || server?.httpPort
+    const targetH3Port = h3Port || server?.h3Port
+
+    if (!conn.isDesktop && !conn.isSpeedDownloadMode()) {
+        const via = await conn.openLanDownloadURL(
+            lanFileId,
+            name,
+            targetIp,
+            targetPort,
+            targetH3Port,
+            false
+        )
+        if (via) {
+            ElMessage.success(`📥 ${name} 开始下载 (${via.toUpperCase()})`)
+            return true
+        }
+        ElMessage.error('无法获取下载地址')
+        return false
     }
 
     // 1. Try WebTransport first
@@ -242,29 +334,39 @@ const downloadLanFile = async (
         const ok = await conn.downloadLanFileWT(lanFileId, name)
         if (ok) {
             ElMessage.success(`📥 ${name} 下载完成 (WT)`)
-            return
+            return true
         }
     } catch (e) {
         console.warn('WT download failed, falling back to HTTP', e)
     }
 
-    // 2. Fallback to HTTP (works for Mixed Content via new tab/window)
-    const server = conn.getActiveLanServer()
-    const targetIp = ip || server?.ip
-    const targetPort = httpPort || server?.httpPort
-
-    if (targetIp && targetPort) {
-        window.open(`http://${targetIp}:${targetPort}/api/lan/download/${lanFileId}`, '_blank')
-        ElMessage.success(`📥 ${name} 开始下载 (HTTP)`)
+    // 2. Fallback to URL Download (HTTPS first, then HTTP)
+    const via = await conn.openLanDownloadURL(
+        lanFileId,
+        name,
+        targetIp,
+        targetPort,
+        targetH3Port,
+        false
+    )
+    if (via) {
+        ElMessage.success(`📥 ${name} 开始下载 (${via.toUpperCase()})`)
+        return true
     } else {
         ElMessage.error('无法获取下载地址')
+        return false
     }
 }
 
 const requestDownload = async (file: LanSharedFile) => {
     if (file.status === 'ready' && file.lanFileId) {
+        const autoTriggered = downloadingFiles.value.has(file.id)
         downloadingFiles.value.add(file.id)
-        await downloadLanFile(file.lanFileId, file.name, file.ip, file.httpPort, file.isRelay, file.h3Port, file.certHash)
+        const ok = await downloadLanFile(file.lanFileId, file.name, file.ip, file.httpPort, file.isRelay, file.h3Port, file.certHash, autoTriggered)
+        if (ok && file.source === 'remote') {
+            conn.notifyLanFileConsumed(file.id, file.lanFileId)
+            sharedFiles.value.delete(file.id)
+        }
         downloadingFiles.value.delete(file.id)
     } else if (file.status === 'pending' && file.source === 'remote') {
         downloadingFiles.value.add(file.id)
@@ -342,6 +444,13 @@ const formatSize = (bytes: number) => {
     const i = Math.floor(Math.log(bytes) / Math.log(k))
     return (bytes / Math.pow(k, i)).toPrecision(3) + ' ' + sizes[i]
 }
+
+const transferProgressText = computed(() => {
+    const bytes = Number(transfer.value?.bytes || 0)
+    const total = Number(transfer.value?.total || 0)
+    if (!bytes && !total) return '--'
+    return `${formatSize(bytes)} / ${total > 0 ? formatSize(total) : '未知'}`
+})
 
 const openDownloadFolder = () => {
     const w = window as any
@@ -458,6 +567,13 @@ const statusType = (status: string) => {
                     </el-button>
                     <input ref="directUploadInput" type="file" multiple hidden @change="onDirectUploadSelected" />
                     <input ref="shareFileInput" type="file" multiple hidden @change="onShareFileSelected" />
+                 </div>
+
+                 <div class="transfer-diagnostics">
+                    <span><strong>通道:</strong> {{ transferPathLabel }}</span>
+                    <span><strong>状态:</strong> {{ transferStatusLabel }}</span>
+                    <span><strong>速率:</strong> {{ transferSpeedText }}</span>
+                    <span><strong>进度:</strong> {{ transferProgressText }}</span>
                  </div>
 
                  <!-- Section: Shared Files (lazy, not yet uploaded) -->
@@ -633,6 +749,23 @@ const statusType = (status: string) => {
     display: flex;
     gap: 10px;
     align-items: center;
+}
+
+.transfer-diagnostics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    font-size: 12px;
+    color: var(--el-text-color-regular);
+    background: var(--el-fill-color-lighter);
+    border: 1px solid var(--el-border-color-light);
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+.transfer-diagnostics strong {
+    color: var(--el-text-color-primary);
+    font-weight: 600;
 }
 
 .lan-section {

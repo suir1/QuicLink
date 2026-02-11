@@ -18,6 +18,14 @@ export function DisconnectP2P() {
   return window['go']['main']['App']['DisconnectP2P']();
 }
 
+export function DownloadLanRelayFile(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['DownloadLanRelayFile'](arg1, arg2, arg3, arg4);
+}
+
+export function GetAutoSyncRemoteClipboard() {
+  return window['go']['main']['App']['GetAutoSyncRemoteClipboard']();
+}
+
 export function GetClipboard() {
   return window['go']['main']['App']['GetClipboard']();
 }
@@ -50,12 +58,20 @@ export function Greet(arg1) {
   return window['go']['main']['App']['Greet'](arg1);
 }
 
+export function ImportLocalFile(arg1) {
+  return window['go']['main']['App']['ImportLocalFile'](arg1);
+}
+
 export function OpenDownloadDir() {
   return window['go']['main']['App']['OpenDownloadDir']();
 }
 
 export function SelectDownloadDir() {
   return window['go']['main']['App']['SelectDownloadDir']();
+}
+
+export function SelectRelayFiles() {
+  return window['go']['main']['App']['SelectRelayFiles']();
 }
 
 export function SendClipboard() {
@@ -70,10 +86,26 @@ export function SendP2PHello() {
   return window['go']['main']['App']['SendP2PHello']();
 }
 
+export function SetAutoSyncRemoteClipboard(arg1) {
+  return window['go']['main']['App']['SetAutoSyncRemoteClipboard'](arg1);
+}
+
 export function SetClipboard(arg1) {
   return window['go']['main']['App']['SetClipboard'](arg1);
 }
 
 export function ShareFileP2P(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['ShareFileP2P'](arg1, arg2, arg3, arg4);
+}
+
+export function StartNativeRelayUpload(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['StartNativeRelayUpload'](arg1, arg2, arg3, arg4);
+}
+
+export function UploadCloudFile(arg1) {
+  return window['go']['main']['App']['UploadCloudFile'](arg1);
+}
+
+export function UploadVpsRelayFile(arg1) {
+  return window['go']['main']['App']['UploadVpsRelayFile'](arg1);
 }

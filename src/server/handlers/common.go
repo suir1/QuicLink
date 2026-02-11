@@ -120,9 +120,9 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 
 	// --- LAN 文件共享信令 ---
 	case "lan_file_offer", "lan_file_request", "lan_file_ready", "lan_file_shared",
-		"lan_list_request", "lan_list_response", "lan_download_request",
+		"lan_file_consumed", "lan_file_failed", "lan_list_request", "lan_list_response", "lan_download_request",
 		"p2p_relay_offer", "p2p_relay_request", "p2p_relay_ready",
-		"netdisk_file":
+		"netdisk_file", "vps_relay_offer", "vps_relay_ack":
 		room.Broadcast(msg, conn)
 
 	// --- 心跳检测 ---

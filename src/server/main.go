@@ -56,6 +56,7 @@ func main() {
 
 	// 启动房间清理任务 (Public 模式有效)
 	store.StartCleanupLoop()
+	handlers.StartRelayCleanupLoop()
 
 	port := fmt.Sprintf("%d", config.Current.Port)
 
@@ -120,6 +121,30 @@ func main() {
 		}
 		handlers.HandleListFiles(w, r)
 	})
+	http.HandleFunc("/api/relay/upload/", func(w http.ResponseWriter, r *http.Request) {
+		if config.Current.UseHTTPS {
+			addH3AltSvcHeader(w, r)
+		}
+		handlers.HandleRelayUpload(w, r)
+	})
+	http.HandleFunc("/api/relay/meta/", func(w http.ResponseWriter, r *http.Request) {
+		if config.Current.UseHTTPS {
+			addH3AltSvcHeader(w, r)
+		}
+		handlers.HandleRelayMeta(w, r)
+	})
+	http.HandleFunc("/api/relay/download/", func(w http.ResponseWriter, r *http.Request) {
+		if config.Current.UseHTTPS {
+			addH3AltSvcHeader(w, r)
+		}
+		handlers.HandleRelayDownload(w, r)
+	})
+	http.HandleFunc("/api/relay/ack/", func(w http.ResponseWriter, r *http.Request) {
+		if config.Current.UseHTTPS {
+			addH3AltSvcHeader(w, r)
+		}
+		handlers.HandleRelayAck(w, r)
+	})
 
 	// WebTransport endpoint (仅 HTTPS 模式)
 	http.HandleFunc("/wt", func(w http.ResponseWriter, r *http.Request) {
@@ -137,11 +162,17 @@ func main() {
 		if config.Current.UseHTTPS {
 			addH3AltSvcHeader(w, r)
 		}
+		maxUploadSizeMB := config.Current.Limits.MaxUploadSizeMB
+		if maxUploadSizeMB <= 0 {
+			maxUploadSizeMB = 10
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"mode":     config.Current.AppMode,
-			"proto":    r.Proto,
-			"https":    config.Current.UseHTTPS,
-			"certHash": CertHash,
+			"mode":               config.Current.AppMode,
+			"proto":              r.Proto,
+			"https":              config.Current.UseHTTPS,
+			"certHash":           CertHash,
+			"maxUploadSizeMB":    maxUploadSizeMB,
+			"maxUploadSizeBytes": maxUploadSizeMB << 20,
 		})
 	})
 

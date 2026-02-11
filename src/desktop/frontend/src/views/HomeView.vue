@@ -32,6 +32,9 @@ const currentUrl = computed(() => {
 // Server Configuration State
 const savedHost = localStorage.getItem('custom_server_host')
 const serverHost = ref(savedHost || import.meta.env.VITE_VPS_HOST || (window.location.protocol.startsWith('http') ? window.location.host : 'localhost:3100'))
+const CLIPBOARD_AUTO_SYNC_KEY = 'desktop_auto_sync_remote_clipboard'
+const savedClipboardAutoSync = localStorage.getItem(CLIPBOARD_AUTO_SYNC_KEY)
+const autoSyncRemoteClipboard = ref(savedClipboardAutoSync === null ? true : savedClipboardAutoSync === '1')
 const showSettings = ref(false)
 
 // Transport Mode (桌面端专用: ws/wt/none)
@@ -48,15 +51,38 @@ async function updateTransportMode() {
   }
 }
 
-function saveSettings() {
+async function applyClipboardAutoSyncSetting(showSuccess = false) {
+  if (!conn.isDesktop) return
+  const w = window as any
+  if (w.go?.main?.App?.SetAutoSyncRemoteClipboard) {
+    try {
+      await w.go.main.App.SetAutoSyncRemoteClipboard(autoSyncRemoteClipboard.value)
+      if (showSuccess) {
+        ElMessage.success(`远端剪切板写回系统剪切板: ${autoSyncRemoteClipboard.value ? '已开启' : '已关闭'}`)
+      }
+    } catch (e) {
+      console.error('Failed to apply clipboard auto sync setting:', e)
+      ElMessage.error('剪切板同步开关保存失败')
+    }
+  }
+}
+
+async function saveSettings() {
   if (!serverHost.value) {
     ElMessage.warning('服务器地址不能为空')
     return
   }
+  const prevHost = localStorage.getItem('custom_server_host') || ''
   localStorage.setItem('custom_server_host', serverHost.value)
+  localStorage.setItem(CLIPBOARD_AUTO_SYNC_KEY, autoSyncRemoteClipboard.value ? '1' : '0')
+  await applyClipboardAutoSyncSetting(false)
   showSettings.value = false
-  ElMessage.success({ message: '设置已保存，正在重连...', duration: 2000 })
-  joinRoom()
+  if (serverHost.value !== prevHost) {
+    ElMessage.success({ message: '设置已保存，正在重连...', duration: 2000 })
+    joinRoom()
+    return
+  }
+  ElMessage.success('设置已保存')
 }
 
 // 子组件引用
@@ -67,6 +93,7 @@ onMounted(async () => {
   // 0. Initialize Wails Events (Desktop Only)
   if (conn.isDesktop) {
     conn.setupDesktopEventListeners()
+    await applyClipboardAutoSyncSetting(false)
   }
 
   // NOTE: do NOT set conn.onClipboardData here.
@@ -315,6 +342,16 @@ function copyLink() {
           </el-input>
           <div style="font-size: 12px; color: #909399; margin-top: 5px;">
              支持 IP:Port 或域名。客户端会自动适配 HTTP/HTTPS。
+          </div>
+        </el-form-item>
+        <el-form-item v-if="conn.isDesktop" label="远端剪切板写回系统剪切板">
+          <el-switch
+            v-model="autoSyncRemoteClipboard"
+            active-text="开启"
+            inactive-text="关闭"
+          />
+          <div style="font-size: 12px; color: #909399; margin-top: 5px;">
+            关闭后，远端内容仅显示在应用列表，不会覆盖你的系统剪切板。
           </div>
         </el-form-item>
       </el-form>

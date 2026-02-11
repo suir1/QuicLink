@@ -18,6 +18,8 @@ declare global {
                     GetClipboard(): Promise<string>
                     SetClipboard(text: string): Promise<void>
                     SendClipboard(): Promise<void>
+                    GetAutoSyncRemoteClipboard(): Promise<boolean>
+                    SetAutoSyncRemoteClipboard(enabled: boolean): Promise<void>
 
                     // WebSocket Signaling
                     Connect(host: string, roomID: string, password?: string): Promise<void>
@@ -61,6 +63,16 @@ export const wails = {
     async sendClipboard(): Promise<void> {
         if (!isWails()) return
         return window.go.main.App.SendClipboard()
+    },
+
+    async getAutoSyncRemoteClipboard(): Promise<boolean> {
+        if (!isWails()) return true
+        return window.go.main.App.GetAutoSyncRemoteClipboard()
+    },
+
+    async setAutoSyncRemoteClipboard(enabled: boolean): Promise<void> {
+        if (!isWails()) return
+        return window.go.main.App.SetAutoSyncRemoteClipboard(enabled)
     },
 
     // Signaling (WebSocket)

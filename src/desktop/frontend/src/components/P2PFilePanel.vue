@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { Close, Document, UploadFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 
 const conn = useConnectionStore()
 
 interface P2PFile {
   id: string
+  relayId?: string
+  originalId?: string
   name: string
   size: number
   type: string
@@ -17,6 +19,8 @@ interface P2PFile {
   baseUrl?: string
   isNetdisk?: boolean
   netdiskUrl?: string
+  isVpsRelay?: boolean
+  vpsRelayUrl?: string
   isRelay?: boolean
   relayStatus?: 'pending' | 'requesting' | 'ready'
   lanFileId?: string
@@ -27,6 +31,58 @@ interface P2PFile {
 }
 
 const fileList = ref<P2PFile[]>([])
+const transfer = computed(() => conn.transferTelemetry)
+
+const transferPathLabel = computed(() => {
+  const path = transfer.value?.path
+  switch (path) {
+    case 'lan-go-relay': return 'LAN Go Relay'
+    case 'lan-wt-relay': return 'LAN WT Relay'
+    case 'lan-http-relay': return 'LAN HTTP Relay'
+    case 'lan-wt-direct': return 'LAN WT Direct'
+    case 'lan-http-direct': return 'LAN HTTP Direct'
+    case 'webrtc': return 'WebRTC'
+    case 'vps-relay': return 'VPS Relay'
+    case 'browser-url': return 'Browser URL'
+    case 'cloud': return 'Cloud'
+    default: return 'N/A'
+  }
+})
+
+const transferStatusLabel = computed(() => {
+  const status = transfer.value?.status || 'idle'
+  switch (status) {
+    case 'active': return '传输中'
+    case 'done': return '完成'
+    case 'handoff': return '已交给系统下载'
+    case 'error': return '失败'
+    default: return '空闲'
+  }
+})
+
+const transferSpeedText = computed(() => {
+  const bps = Number(transfer.value?.speedBps || 0)
+  if (bps <= 0) return '--'
+  const mbps = bps / (1024 * 1024)
+  return `${mbps.toFixed(mbps >= 10 ? 1 : 2)} MB/s`
+})
+
+const transferProgressText = computed(() => {
+  const bytes = Number(transfer.value?.bytes || 0)
+  const total = Number(transfer.value?.total || 0)
+  if (!bytes && !total) return '--'
+  return `${formatSize(bytes)} / ${total > 0 ? formatSize(total) : '未知'}`
+})
+
+const transferUploadViaText = computed(() => {
+  const via = String((transfer.value as any)?.uploadVia || '').trim()
+  return via ? via.toUpperCase() : '--'
+})
+
+const transferNoteText = computed(() => {
+  const note = String(transfer.value?.note || '').trim()
+  return note || '--'
+})
 
 // 格式化文件大小
 function formatSize(bytes: number) {
@@ -42,28 +98,41 @@ function handleDrop(e: DragEvent) {
   e.preventDefault()
   const files = e.dataTransfer?.files
   if (!files || files.length === 0) return
-
-  processFiles(files)
+  processFiles(files, 'drop')
 }
 
 function handleFileSelect(e: Event) {
   const input = e.target as HTMLInputElement
   if (input.files && input.files.length > 0) {
-    processFiles(input.files)
+    processFiles(input.files, 'input')
   }
   input.value = '' // reset
 }
 
-function triggerUpload() {
+async function triggerUpload() {
+  if (conn.isDesktop && conn.pickNativeRelayFiles) {
+    const picked = await conn.pickNativeRelayFiles()
+    if (picked.length > 0) {
+      processNativeFiles(picked)
+      return
+    }
+  }
   document.getElementById('p2p-file-input')?.click()
 }
 
-function processFiles(files: FileList) {
+function processFiles(files: FileList, source: 'drop' | 'input' = 'input') {
+  let skippedNoPath = 0
   for (let i = 0; i < files.length; i++) {
     const file = files[i]
     if (!file) continue
 
-    conn.smartRelaySendFile(file).catch((e: any) => {
+    const nativePath = (file as any)?.path
+    if (conn.isDesktop && (!nativePath || typeof nativePath !== 'string')) {
+      skippedNoPath++
+      continue
+    }
+
+    conn.smartRelaySendFile(file, typeof nativePath === 'string' && nativePath ? nativePath : undefined).catch((e: any) => {
       console.error('Relay-only send failed', e)
     })
     addFileToList({
@@ -71,6 +140,28 @@ function processFiles(files: FileList) {
       name: file.name,
       size: file.size,
       type: file.type,
+      fromSelf: true
+    })
+  }
+
+  if (conn.isDesktop && skippedNoPath > 0) {
+    const msg = source === 'drop'
+      ? `已跳过 ${skippedNoPath} 个拖拽文件：当前环境无法获取本地路径，请点击下方按钮使用原生文件选择器`
+      : `已跳过 ${skippedNoPath} 个文件：当前环境无法获取本地路径`
+    ElMessage.warning(msg)
+  }
+}
+
+function processNativeFiles(files: Array<{ path: string; name: string; size: number; type?: string }>) {
+  for (const file of files) {
+    conn.smartRelaySendNativeFile(file).catch((e: any) => {
+      console.error('Native relay send failed', e)
+    })
+    addFileToList({
+      id: 'local-' + Date.now(),
+      name: file.name,
+      size: file.size,
+      type: file.type || 'application/octet-stream',
       fromSelf: true
     })
   }
@@ -96,6 +187,19 @@ async function handleDownload(file: P2PFile) {
       return
     }
 
+    if (conn.isDesktop) {
+      const nativeOk = await conn.downloadLanRelayNative(
+        file.lanFileId,
+        file.name,
+        file.ip,
+        file.httpPort
+      )
+      if (nativeOk) {
+        ElMessage.success(`下载完成: ${file.name} (Go Native Relay)`)
+        return
+      }
+    }
+
     try {
       const ok = await conn.downloadLanRelayWT(
         file.lanFileId,
@@ -117,6 +221,12 @@ async function handleDownload(file: P2PFile) {
       return
     }
     ElMessage.error('无法获取中转下载地址')
+    return
+  }
+
+  if (file.isVpsRelay && file.vpsRelayUrl) {
+    window.open(file.vpsRelayUrl, '_blank')
+    ElMessage.info(`正在 VPS 中转下载: ${file.name}`)
     return
   }
 
@@ -145,9 +255,32 @@ onMounted(() => {
   // 绑定 Store 事件
   conn.onP2PEvent = (type: string, payload: any) => {
     if (type === 'offer') {
+      if (payload.isVpsRelay && payload.originalId) {
+        const existing = fileList.value.find(f => f.id === payload.originalId)
+        if (existing) {
+          const autoDownload = existing.relayStatus === 'requesting'
+          existing.isRelay = false
+          existing.relayStatus = undefined
+          existing.isVpsRelay = true
+          existing.id = payload.id || existing.id
+          existing.relayId = payload.relayId || payload.id || existing.relayId
+          existing.originalId = payload.originalId
+          existing.vpsRelayUrl = payload.url
+          existing.name = payload.name || existing.name
+          existing.size = Number(payload.size || existing.size)
+          existing.type = payload.type || existing.type
+          if (autoDownload) {
+            void handleDownload(existing)
+          }
+          return
+        }
+      }
+
       // 收到别人分享的文件
       addFileToList({
         id: payload.id,
+        relayId: payload.relayId,
+        originalId: payload.originalId,
         name: payload.name,
         size: payload.size,
         type: payload.type,
@@ -156,6 +289,8 @@ onMounted(() => {
         baseUrl: payload.baseUrl,
         isNetdisk: payload.isNetdisk,
         netdiskUrl: payload.url,
+        isVpsRelay: payload.isVpsRelay,
+        vpsRelayUrl: payload.url,
         isRelay: payload.isRelay,
         relayStatus: payload.isRelay ? (payload.status || 'pending') : undefined,
         lanFileId: payload.lanFileId,
@@ -185,6 +320,13 @@ onMounted(() => {
       if (item) {
         item.progress = includePercentage(payload.received, payload.total)
       }
+    } else if (type === 'relay_ack') {
+      const relayId = payload?.relayId
+      if (!relayId) return
+      const item = fileList.value.find(f => f.id === relayId || f.relayId === relayId)
+      if (item && item.fromSelf && item.isVpsRelay) {
+        item.progress = 100
+      }
     }
   }
 })
@@ -206,6 +348,15 @@ function deleteFile(index: number) {
         <el-tag size="small" type="success" effect="plain">P2P Stream</el-tag>
       </div>
     </template>
+
+    <div class="transfer-diagnostics">
+      <span class="diag-item"><strong>通道:</strong> {{ transferPathLabel }}</span>
+      <span class="diag-item"><strong>状态:</strong> {{ transferStatusLabel }}</span>
+      <span class="diag-item"><strong>上传协议:</strong> {{ transferUploadViaText }}</span>
+      <span class="diag-item"><strong>速率:</strong> {{ transferSpeedText }}</span>
+      <span class="diag-item"><strong>进度:</strong> {{ transferProgressText }}</span>
+      <span class="diag-item diag-note"><strong>说明:</strong> {{ transferNoteText }}</span>
+    </div>
 
     <!-- 列表区域 -->
     <div class="p2p-list" @dragover.prevent @drop="handleDrop">
@@ -235,6 +386,7 @@ function deleteFile(index: number) {
             <span>{{ formatSize(file.size) }}</span>
             <span v-if="file.fromSelf" class="tag-me">我发送的</span>
             <span v-else-if="file.isRelay" class="tag-lan">{{ file.relayStatus === 'ready' ? 'LAN中转可下' : 'LAN中转等待' }}</span>
+            <span v-else-if="file.isVpsRelay" class="tag-peer">VPS中转</span>
             <span v-else-if="file.isNetdisk" class="tag-peer">云端</span>
             <span v-else-if="file.isLan" class="tag-lan">LAN加速</span>
             <span v-else class="tag-peer">来自伙伴</span>
@@ -257,7 +409,7 @@ function deleteFile(index: number) {
     <!-- 底部提示 -->
     <div class="p2p-footer" @click="triggerUpload">
       <el-icon><UploadFilled /></el-icon>
-      <span>把小文件拖进来即可分享</span>
+      <span>{{ conn.isDesktop ? '点击选择文件（Go原生中转）' : '把小文件拖进来即可分享' }}</span>
     </div>
   </el-card>
 </template>
@@ -284,6 +436,27 @@ function deleteFile(index: number) {
   align-items: center;
   background: var(--el-bg-color-overlay);
   border-bottom: 1px solid var(--el-border-color-light);
+}
+
+.transfer-diagnostics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  background: var(--el-fill-color-blank);
+}
+
+.diag-item {
+  white-space: nowrap;
+}
+
+.diag-note {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .p2p-list {

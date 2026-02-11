@@ -4,6 +4,20 @@ import { computed, ref } from 'vue'
 import { isWails } from '../utils/wails'
 
 export const useConnectionStore = defineStore('connection', () => {
+    type TransferPath =
+        | 'unknown'
+        | 'lan-go-relay'
+        | 'lan-wt-relay'
+        | 'lan-http-relay'
+        | 'lan-wt-direct'
+        | 'lan-http-direct'
+        | 'webrtc'
+        | 'vps-relay'
+        | 'browser-url'
+        | 'cloud'
+    type TransferStatus = 'idle' | 'active' | 'handoff' | 'done' | 'error'
+    type TransferDirection = 'upload' | 'download'
+
     // --- 状态定义 ---
     const isConnected = ref(false)
     const transport = ref<any>(null) // WebTransport instance
@@ -51,7 +65,130 @@ export const useConnectionStore = defineStore('connection', () => {
 
     // P2P State
     const localFiles = ref<Map<string, File>>(new Map())
+    const relaySources = ref<Map<string, {
+        name: string
+        size: number
+        type: string
+        file?: File
+        nativePath?: string
+    }>>(new Map())
+    const vpsRelayOffers = ref<Map<string, {
+        relayId: string
+        name: string
+        size: number
+        type: string
+        url: string
+        expiresAt?: number
+    }>>(new Map())
     const receivingFiles = ref<Map<string, { chunks: string[], total: number, received: number, name: string, type: string }>>(new Map())
+    const transferTelemetry = ref<{
+        path: TransferPath
+        status: TransferStatus
+        direction: TransferDirection
+        fileName: string
+        uploadVia: string
+        bytes: number
+        total: number
+        speedBps: number
+        startedAt: number
+        updatedAt: number
+        note: string
+    }>({
+        path: 'unknown',
+        status: 'idle',
+        direction: 'download',
+        fileName: '',
+        uploadVia: '',
+        bytes: 0,
+        total: 0,
+        speedBps: 0,
+        startedAt: 0,
+        updatedAt: 0,
+        note: ''
+    })
+    const transferSession = ref<{
+        id: string
+        startedAt: number
+        bytes: number
+    } | null>(null)
+
+    function startTransferTelemetry(
+        path: TransferPath,
+        direction: TransferDirection,
+        fileName: string,
+        total = 0,
+        note = ''
+    ): string {
+        const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const now = Date.now()
+        transferSession.value = { id, startedAt: now, bytes: 0 }
+        transferTelemetry.value = {
+            path,
+            status: 'active',
+            direction,
+            fileName,
+            uploadVia: '',
+            bytes: 0,
+            total: total > 0 ? total : 0,
+            speedBps: 0,
+            startedAt: now,
+            updatedAt: now,
+            note
+        }
+        return id
+    }
+
+    function bumpTransferTelemetry(deltaBytes: number, total?: number) {
+        const session = transferSession.value
+        if (!session || deltaBytes <= 0) return
+
+        session.bytes += deltaBytes
+        const now = Date.now()
+        const elapsedSec = Math.max(0.001, (now - session.startedAt) / 1000)
+        transferTelemetry.value = {
+            ...transferTelemetry.value,
+            bytes: session.bytes,
+            total: typeof total === 'number' && total > 0 ? total : transferTelemetry.value.total,
+            speedBps: session.bytes / elapsedSec,
+            updatedAt: now
+        }
+    }
+
+    function finishTransferTelemetry(status: Exclude<TransferStatus, 'idle' | 'active'>, note = '') {
+        transferTelemetry.value = {
+            ...transferTelemetry.value,
+            status,
+            updatedAt: Date.now(),
+            note: note || transferTelemetry.value.note
+        }
+        transferSession.value = null
+    }
+
+    function setTransferUploadVia(via: string) {
+        const normalized = String(via || '').trim().toLowerCase()
+        transferTelemetry.value = {
+            ...transferTelemetry.value,
+            uploadVia: normalized,
+            updatedAt: Date.now()
+        }
+    }
+
+    function resetTransferTelemetry() {
+        transferTelemetry.value = {
+            path: transferTelemetry.value.path,
+            status: 'idle',
+            direction: transferTelemetry.value.direction,
+            fileName: '',
+            uploadVia: '',
+            bytes: 0,
+            total: 0,
+            speedBps: 0,
+            startedAt: 0,
+            updatedAt: Date.now(),
+            note: ''
+        }
+        transferSession.value = null
+    }
 
     // --- Auto-Detect Protocol ---
     async function detectProtocol() {
@@ -214,6 +351,7 @@ export const useConnectionStore = defineStore('connection', () => {
     function handleClose() {
         isConnected.value = false
         hostOnline.value = false
+        resetTransferTelemetry()
     }
 
     // --- 3. 读取循环 (处理粘包/分包) ---
@@ -340,9 +478,15 @@ export const useConnectionStore = defineStore('connection', () => {
         return null
     }
 
-    function shareP2PRelayFile(file: File): string {
+    function shareP2PRelayFile(file: File, nativePath?: string): string {
         const fileId = `p2p-relay-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
-        localFiles.value.set(fileId, file)
+        relaySources.value.set(fileId, {
+            name: file.name,
+            size: file.size,
+            type: file.type,
+            file,
+            nativePath: nativePath || undefined
+        })
         sendMessage({
             type: 'p2p_relay_offer',
             payload: {
@@ -357,9 +501,144 @@ export const useConnectionStore = defineStore('connection', () => {
         return fileId
     }
 
-    async function smartRelaySendFile(file: File) {
-        shareP2PRelayFile(file)
+    async function smartRelaySendFile(file: File, nativePath?: string) {
+        shareP2PRelayFile(file, nativePath)
         ElMessage.success(`📡 已发布 LAN 中转任务: ${file.name}`)
+    }
+
+    async function smartRelaySendNativeFile(meta: {
+        path: string
+        name: string
+        size: number
+        type?: string
+    }) {
+        const fileId = `p2p-relay-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+        relaySources.value.set(fileId, {
+            name: meta.name,
+            size: Number(meta.size || 0),
+            type: meta.type || 'application/octet-stream',
+            nativePath: meta.path
+        })
+        sendMessage({
+            type: 'p2p_relay_offer',
+            payload: {
+                id: fileId,
+                name: meta.name,
+                size: Number(meta.size || 0),
+                type: meta.type || 'application/octet-stream',
+                isRelay: true,
+                status: 'pending'
+            }
+        })
+        ElMessage.success(`📡 已发布 Go 原生中转任务: ${meta.name}`)
+    }
+
+    async function pickNativeRelayFiles(): Promise<Array<{
+        path: string
+        name: string
+        size: number
+        type?: string
+    }>> {
+        const w = window as any
+        if (!(w.go && w.go.main && w.go.main.App && w.go.main.App.SelectRelayFiles)) {
+            return []
+        }
+        try {
+            const selected = await w.go.main.App.SelectRelayFiles()
+            if (!Array.isArray(selected)) return []
+            return selected
+                .map((item: any) => ({
+                    path: String(item?.path || ''),
+                    name: String(item?.name || ''),
+                    size: Number(item?.size || 0),
+                    type: String(item?.type || 'application/octet-stream')
+                }))
+                .filter((item: any) => item.path && item.name && item.size >= 0)
+        } catch (e) {
+            console.error('SelectRelayFiles failed', e)
+            return []
+        }
+    }
+
+    async function startNativeRelayUpload(
+        relayId: string,
+        nativePath: string,
+        fileName: string,
+        fileSize: number
+    ): Promise<void> {
+        const w = window as any
+        if (!(w.go && w.go.main && w.go.main.App && w.go.main.App.StartNativeRelayUpload)) {
+            throw new Error('native relay api unavailable')
+        }
+
+        startTransferTelemetry('lan-go-relay', 'upload', fileName, fileSize, 'LAN Go native relay')
+        await w.go.main.App.StartNativeRelayUpload(relayId, nativePath, fileName, false)
+        finishTransferTelemetry('handoff', 'Go native relay started')
+    }
+
+    async function shareViaVpsRelayNative(
+        nativePath: string,
+        fileName: string,
+        fileSize: number,
+        fileType: string,
+        originalId?: string
+    ): Promise<string> {
+        const w = window as any
+        if (!(w.go && w.go.main && w.go.main.App && w.go.main.App.UploadVpsRelayFile)) {
+            throw new Error('native vps relay api unavailable')
+        }
+
+        startTransferTelemetry('vps-relay', 'upload', fileName, fileSize, 'VPS Go native relay')
+        try {
+            const data = await w.go.main.App.UploadVpsRelayFile(nativePath)
+            const relayId = String(data?.relayId || data?.id || '').trim()
+            if (!relayId) {
+                throw new Error('missing relay id')
+            }
+            const uploadVia = String(data?.uploadVia || '').trim().toLowerCase()
+            if (uploadVia) {
+                setTransferUploadVia(uploadVia)
+            }
+            const rawUrl = String(data?.url || data?.downloadUrl || '').trim()
+            const absoluteUrl = rawUrl.startsWith('/')
+                ? `${HTTP_URL.value}${rawUrl}`
+                : rawUrl
+            if (!absoluteUrl) {
+                throw new Error('missing relay download url')
+            }
+            const expiresAt = Number(data?.expiresAt || 0) || undefined
+
+            vpsRelayOffers.value.set(relayId, {
+                relayId,
+                name: fileName,
+                size: fileSize,
+                type: fileType || 'application/octet-stream',
+                url: absoluteUrl,
+                expiresAt
+            })
+
+            sendMessage({
+                type: 'vps_relay_offer',
+                payload: {
+                    id: relayId,
+                    relayId,
+                    originalId,
+                    name: fileName,
+                    size: fileSize,
+                    type: fileType || 'application/octet-stream',
+                    url: absoluteUrl,
+                    isVpsRelay: true,
+                    expiresAt
+                }
+            })
+
+            const viaNote = uploadVia ? ` (via ${uploadVia.toUpperCase()})` : ''
+            finishTransferTelemetry('done', `VPS Go native relay${viaNote}`)
+            return relayId
+        } catch (e) {
+            finishTransferTelemetry('error', 'VPS relay upload failed')
+            throw e
+        }
     }
 
     function requestP2PRelayFile(fileId: string) {
@@ -369,14 +648,27 @@ export const useConnectionStore = defineStore('connection', () => {
         })
     }
 
-    async function uploadToLocalRelay(file: File, port: number, relayId: string) {
-        const url = `http://localhost:${port}/api/lan/relay/upload/${relayId}?name=${encodeURIComponent(file.name)}`
-        const res = await fetch(url, {
-            method: 'POST',
-            body: file
-        })
-        if (!res.ok) {
-            throw new Error(`relay upload failed: ${res.status}`)
+    async function uploadToLocalRelay(file: File, port: number, relayId: string, fallbackNote = '') {
+        const note = fallbackNote
+            ? `LAN HTTP relay (fallback: ${fallbackNote})`
+            : 'LAN HTTP relay'
+        startTransferTelemetry('lan-http-relay', 'upload', file.name, file.size, note)
+        try {
+            const url = `http://localhost:${port}/api/lan/relay/upload/${relayId}?name=${encodeURIComponent(file.name)}&persist=0`
+            const res = await fetch(url, {
+                method: 'POST',
+                body: file
+            })
+            if (!res.ok) {
+                finishTransferTelemetry('error', `HTTP ${res.status}`)
+                throw new Error(`relay upload failed: ${res.status}`)
+            }
+            // Browser fetch upload has no per-chunk progress callback.
+            bumpTransferTelemetry(file.size, file.size)
+            finishTransferTelemetry('done')
+        } catch (e) {
+            finishTransferTelemetry('error', 'LAN HTTP relay upload failed')
+            throw e
         }
     }
 
@@ -407,7 +699,8 @@ export const useConnectionStore = defineStore('connection', () => {
 
     async function streamFileToWriter(
         file: File,
-        writer: WritableStreamDefaultWriter<Uint8Array>
+        writer: WritableStreamDefaultWriter<Uint8Array>,
+        onChunk?: (deltaBytes: number) => void
     ): Promise<void> {
         const reader = file.stream().getReader()
         try {
@@ -415,7 +708,9 @@ export const useConnectionStore = defineStore('connection', () => {
                 const { value, done } = await reader.read()
                 if (done) break
                 if (!value) continue
-                await writer.write(toArrayBufferBytes(value))
+                const chunk = toArrayBufferBytes(value)
+                await writer.write(chunk)
+                if (onChunk) onChunk(chunk.byteLength)
             }
         } finally {
             reader.releaseLock()
@@ -424,60 +719,112 @@ export const useConnectionStore = defineStore('connection', () => {
 
     async function uploadToLocalRelayWT(
         file: File,
+        hostIp: string | undefined,
         h3Port: number,
         certHashValue: string,
         relayId: string,
         onReady?: () => void,
         readyTimeoutMs = 8000
     ) {
-        const wt = await createLanWTByAddress('localhost', h3Port, certHashValue)
-        const stream = await wt.createBidirectionalStream()
-        const writer = stream.writable.getWriter()
-        const reader = stream.readable.getReader()
+        startTransferTelemetry('lan-wt-relay', 'upload', file.name, file.size, 'LAN WT relay')
+        try {
+            const targets = Array.from(new Set(
+                ['localhost', hostIp || '', '127.0.0.1']
+                    .map(v => (v || '').trim())
+                    .filter(Boolean)
+            ))
+            let wt: any = null
+            let connectedTarget = ''
+            let lastErr: any = null
+            for (const target of targets) {
+                try {
+                    wt = await createLanWTByAddress(target, h3Port, certHashValue)
+                    connectedTarget = target
+                    break
+                } catch (e) {
+                    lastErr = e
+                }
+            }
+            if (!wt) {
+                const reason = lastErr instanceof Error ? lastErr.message : String(lastErr || 'wt_connect_failed')
+                throw new Error(`WT connect failed (${targets.join(',')}): ${reason}`)
+            }
+            console.log(`✅ Local WT relay connected via ${connectedTarget}:${h3Port}`)
 
-        const cmd = JSON.stringify({
-            action: 'relay_upload',
-            relayId,
-            name: file.name,
-            size: file.size
-        }) + '\n'
-        await writer.write(new TextEncoder().encode(cmd))
+            const stream = await wt.createBidirectionalStream()
+            const writer = stream.writable.getWriter()
+            const reader = stream.readable.getReader()
 
-        let readyTimer: any = null
-        const readyResp = await Promise.race([
-            readJsonResponse(reader),
-            new Promise((_, reject) => {
-                readyTimer = setTimeout(() => reject(new Error('WT relay ready timeout')), readyTimeoutMs)
-            })
-        ]).finally(() => {
-            if (readyTimer) clearTimeout(readyTimer)
-        }) as any
+            const cmd = JSON.stringify({
+                action: 'relay_upload',
+                relayId,
+                name: file.name,
+                size: file.size,
+                persist: false
+            }) + '\n'
+            await writer.write(new TextEncoder().encode(cmd))
 
-        if (readyResp?.error) {
+            let readyTimer: any = null
+            const readyResp = await Promise.race([
+                readJsonResponse(reader),
+                new Promise((_, reject) => {
+                    readyTimer = setTimeout(() => reject(new Error('WT relay ready timeout')), readyTimeoutMs)
+                })
+            ]).finally(() => {
+                if (readyTimer) clearTimeout(readyTimer)
+            }) as any
+
+            if (readyResp?.error) {
+                wt.close()
+                finishTransferTelemetry('error', readyResp.error || 'WT relay ready failed')
+                throw new Error(readyResp.error)
+            }
+            if (!readyResp || readyResp.status !== 'ready') {
+                wt.close()
+                finishTransferTelemetry('error', 'WT relay ready missing')
+                throw new Error('WT relay ready response missing')
+            }
+            if (onReady) onReady()
+
+            await streamFileToWriter(file, writer, (bytes) => bumpTransferTelemetry(bytes, file.size))
+            await writer.close()
+            finishTransferTelemetry('done')
             wt.close()
-            throw new Error(readyResp.error)
+        } catch (e) {
+            finishTransferTelemetry('error', 'LAN WT relay upload failed')
+            throw e
         }
-        if (!readyResp || readyResp.status !== 'ready') {
-            wt.close()
-            throw new Error('WT relay ready response missing')
-        }
-        if (onReady) onReady()
-
-        await streamFileToWriter(file, writer)
-        await writer.close()
-        wt.close()
     }
 
     async function handleP2PRelayRequest(fileId: string) {
-        const file = localFiles.value.get(fileId)
-        if (!file) return
+        const source = relaySources.value.get(fileId)
+        if (!source) return
 
         const localInfo = await getLocalLanInfoNative()
         const port = localInfo?.httpPort || await getLocalServerPortNative()
         if (!port) {
-            // Fallback to existing signaling relay when local LAN server is unavailable.
-            shareFile(file)
-            ElMessage.warning(`LAN 中转不可用，已切换普通中转: ${file.name}`)
+            if (source.nativePath) {
+                try {
+                    await shareViaVpsRelayNative(
+                        source.nativePath,
+                        source.name,
+                        source.size,
+                        source.type,
+                        fileId
+                    )
+                    ElMessage.warning(`LAN 中转不可用，已切换 VPS 中转: ${source.name}`)
+                    return
+                } catch (e) {
+                    console.error('VPS relay fallback failed', e)
+                }
+            }
+            if (source.file) {
+                // Fallback to existing signaling relay when local LAN server is unavailable.
+                shareFile(source.file)
+                ElMessage.warning(`LAN 中转不可用，已切换普通中转: ${source.name}`)
+                return
+            }
+            ElMessage.error(`LAN 中转不可用，且当前文件仅支持原生中转: ${source.name}`)
             return
         }
 
@@ -491,8 +838,8 @@ export const useConnectionStore = defineStore('connection', () => {
                 payload: {
                     originalId: fileId,
                     lanFileId: relayId,
-                    name: file.name,
-                    size: file.size,
+                    name: source.name,
+                    size: source.size,
                     ip: localInfo?.ip || getActiveLanServer()?.ip,
                     httpPort: port,
                     h3Port: localInfo?.h3Port,
@@ -503,20 +850,56 @@ export const useConnectionStore = defineStore('connection', () => {
             })
         }
 
+        if (source.nativePath) {
+            try {
+                await startNativeRelayUpload(relayId, source.nativePath, source.name, source.size)
+                sendRelayReady()
+                return
+            } catch (e) {
+                console.warn('Go native relay upload failed, fallback to JS relay', e)
+                if (!source.file) {
+                    try {
+                        await shareViaVpsRelayNative(
+                            source.nativePath,
+                            source.name,
+                            source.size,
+                            source.type,
+                            fileId
+                        )
+                        ElMessage.warning(`LAN 中转失败，已切换 VPS 中转: ${source.name}`)
+                        return
+                    } catch (vpsErr) {
+                        console.error('VPS relay fallback failed', vpsErr)
+                    }
+                }
+            }
+        }
+
+        const file = source.file
+        if (!file) {
+            ElMessage.error(`无法读取文件数据: ${source.name}`)
+            return
+        }
+
+        let wtFallbackReason = ''
         if (localInfo?.h3Port && localInfo?.certHash && 'WebTransport' in window) {
             try {
-                await uploadToLocalRelayWT(file, localInfo.h3Port, localInfo.certHash, relayId, sendRelayReady, 8000)
+                await uploadToLocalRelayWT(file, localInfo.ip, localInfo.h3Port, localInfo.certHash, relayId, sendRelayReady, 8000)
                 sendRelayReady()
                 return
             } catch (e) {
                 console.warn('Local WT relay upload failed, fallback to localhost HTTP relay', e)
+                wtFallbackReason = e instanceof Error ? e.message : String(e || 'wt_failed')
             }
+        } else if (!('WebTransport' in window)) {
+            console.warn('Local WT relay skipped: window.WebTransport unavailable in desktop webview')
+            wtFallbackReason = 'webview_no_webtransport'
         }
 
-        uploadToLocalRelay(file, port, relayId).catch((e) => {
+        uploadToLocalRelay(file, port, relayId, wtFallbackReason).catch((e) => {
             console.error('Local relay upload aborted', e)
             shareFile(file)
-            ElMessage.warning(`LAN 中转失败，已切换普通中转: ${file.name}`)
+            ElMessage.warning(`LAN 中转失败，已切换普通中转: ${source.name}`)
         })
         sendRelayReady()
     }
@@ -648,8 +1031,8 @@ export const useConnectionStore = defineStore('connection', () => {
                 case 'clipboard_data':
                 case 'clipboard_push': // 接收其它端的剪切板推送
                     if (msg.payload && onClipboardData.value) {
-                        // 兼容新版：统一从 payload.text 取
-                        onClipboardData.value(msg.payload.text)
+                        // Keep full payload so UI can preserve id/time/type.
+                        onClipboardData.value(msg.payload)
                     }
                     break
 
@@ -690,20 +1073,6 @@ export const useConnectionStore = defineStore('connection', () => {
                     if (localFiles.value.size > 0) {
                         console.log(`📡 Re-broadcasting ${localFiles.value.size} file offers...`)
                         for (const [id, file] of localFiles.value) {
-                            if (id.startsWith('p2p-relay-')) {
-                                sendMessage({
-                                    type: 'p2p_relay_offer',
-                                    payload: {
-                                        id,
-                                        name: file.name,
-                                        size: file.size,
-                                        type: file.type,
-                                        isRelay: true,
-                                        status: 'pending'
-                                    }
-                                })
-                                continue
-                            }
                             sendMessage({
                                 type: 'file_offer',
                                 payload: {
@@ -716,6 +1085,41 @@ export const useConnectionStore = defineStore('connection', () => {
                         }
                     } else {
                         console.log('No local files to share.')
+                    }
+
+                    if (relaySources.value.size > 0) {
+                        console.log(`📡 Re-broadcasting ${relaySources.value.size} relay offers...`)
+                        for (const [id, relay] of relaySources.value) {
+                            sendMessage({
+                                type: 'p2p_relay_offer',
+                                payload: {
+                                    id,
+                                    name: relay.name,
+                                    size: relay.size,
+                                    type: relay.type,
+                                    isRelay: true,
+                                    status: 'pending'
+                                }
+                            })
+                        }
+                    }
+                    if (vpsRelayOffers.value.size > 0) {
+                        console.log(`📡 Re-broadcasting ${vpsRelayOffers.value.size} VPS relay offers...`)
+                        for (const offer of vpsRelayOffers.value.values()) {
+                            sendMessage({
+                                type: 'vps_relay_offer',
+                                payload: {
+                                    id: offer.relayId,
+                                    relayId: offer.relayId,
+                                    name: offer.name,
+                                    size: offer.size,
+                                    type: offer.type,
+                                    url: offer.url,
+                                    isVpsRelay: true,
+                                    expiresAt: offer.expiresAt
+                                }
+                            })
+                        }
                     }
                     break
 
@@ -783,6 +1187,24 @@ export const useConnectionStore = defineStore('connection', () => {
                             isLan: true,
                             status: msg.payload?.status || 'pending'
                         })
+                    }
+                    break
+
+                case 'vps_relay_offer':
+                    if (onP2PEvent.value) {
+                        onP2PEvent.value('offer', {
+                            ...msg.payload,
+                            isVpsRelay: true
+                        })
+                    }
+                    break
+
+                case 'vps_relay_ack':
+                    if (msg.payload?.relayId) {
+                        vpsRelayOffers.value.delete(msg.payload.relayId)
+                        if (onP2PEvent.value) {
+                            onP2PEvent.value('relay_ack', msg.payload)
+                        }
                     }
                     break
 
@@ -864,7 +1286,8 @@ export const useConnectionStore = defineStore('connection', () => {
 
     async function saveWTDownloadToFile(
         reader: ReadableStreamDefaultReader<Uint8Array>,
-        fallbackName: string
+        fallbackName: string,
+        onChunk?: (deltaBytes: number) => void
     ): Promise<boolean> {
         const chunks: BlobPart[] = []
         let metaReceived = false
@@ -905,6 +1328,7 @@ export const useConnectionStore = defineStore('connection', () => {
                     if (rest.length > 0) {
                         if (streamSaver) await streamSaver.write(rest)
                         else chunks.push(rest)
+                        if (onChunk) onChunk(rest.byteLength)
                     }
 
                     metaReceived = true
@@ -916,6 +1340,7 @@ export const useConnectionStore = defineStore('connection', () => {
             } else {
                 if (streamSaver) await streamSaver.write(chunk)
                 else chunks.push(chunk)
+                if (onChunk) onChunk(chunk.byteLength)
             }
         }
 
@@ -949,6 +1374,7 @@ export const useConnectionStore = defineStore('connection', () => {
         if (!targetIp || !targetH3Port || !targetCertHash) return false
 
         try {
+            startTransferTelemetry('lan-wt-relay', 'download', fileName, 0, 'LAN WT relay')
             const wt = await createLanWTByAddress(targetIp, targetH3Port, targetCertHash)
             const stream = await wt.createBidirectionalStream()
             const writer = stream.writable.getWriter()
@@ -959,11 +1385,39 @@ export const useConnectionStore = defineStore('connection', () => {
             ))
             await writer.close()
 
-            const ok = await saveWTDownloadToFile(reader, fileName)
+            const ok = await saveWTDownloadToFile(reader, fileName, (bytes) => bumpTransferTelemetry(bytes))
             wt.close()
+            finishTransferTelemetry(ok ? 'done' : 'error', ok ? '' : 'WT relay download failed')
             return ok
         } catch (e) {
             console.error('WT relay download failed', e)
+            finishTransferTelemetry('error', 'WT relay download failed')
+            return false
+        }
+    }
+
+    async function downloadLanRelayNative(
+        relayId: string,
+        fileName: string,
+        ip?: string,
+        httpPort?: number
+    ): Promise<boolean> {
+        const w = window as any
+        if (!(w.go && w.go.main && w.go.main.App && w.go.main.App.DownloadLanRelayFile)) return false
+
+        const server = getActiveLanServer()
+        const targetIp = ip || server?.ip
+        const targetPort = httpPort || server?.httpPort
+        if (!targetIp || !targetPort) return false
+
+        try {
+            startTransferTelemetry('lan-go-relay', 'download', fileName, 0, 'LAN Go native relay')
+            const savePath = await w.go.main.App.DownloadLanRelayFile(relayId, fileName, targetIp, targetPort)
+            finishTransferTelemetry('done', savePath ? `saved: ${savePath}` : 'saved')
+            return true
+        } catch (e) {
+            console.error('Go native relay download failed', e)
+            finishTransferTelemetry('error', 'Go native relay download failed')
             return false
         }
     }
@@ -978,6 +1432,8 @@ export const useConnectionStore = defineStore('connection', () => {
         const targetIp = ip || server?.ip
         const targetPort = httpPort || server?.httpPort
         if (!targetIp || !targetPort) return false
+        startTransferTelemetry('browser-url', 'download', fileName, 0, 'Browser download manager')
+        finishTransferTelemetry('handoff', 'URL handoff: LAN HTTP relay')
         window.open(`http://${targetIp}:${targetPort}/api/lan/relay/download/${relayId}`, '_blank')
         return true
     }
@@ -1063,14 +1519,18 @@ export const useConnectionStore = defineStore('connection', () => {
         onP2PEvent,
         shareFile,
         smartRelaySendFile,
+        smartRelaySendNativeFile,
+        pickNativeRelayFiles,
         requestP2PRelayFile,
         requestFile,
         lanServerUrl,
         lanServers,
         getActiveLanServer,
         downloadLanRelayWT,
+        downloadLanRelayNative,
         downloadLanRelayHTTP,
         HTTP_URL,
+        transferTelemetry,
         // Desktop Exports
         setupDesktopEventListeners,
         connectDesktop,

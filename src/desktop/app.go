@@ -1,17 +1,25 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,33 +30,40 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/quic-go/quic-go/http3"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 	"golang.design/x/clipboard"
 )
 
 // App struct
 type App struct {
-	ctx           context.Context
-	conn          *websocket.Conn
-	connMu        sync.Mutex
-	roomID        string
-	serverHost    string
-	lastClipText  string
-	p2pNode       *p2p.Node
-	transportMode string // "ws" or "wt"
-	localServer   *server.LocalServer
-	lanServerInfo *server.ServerInfo // LAN Server info (ports, cert hash)
-	deviceID      string
+	ctx                     context.Context
+	conn                    *websocket.Conn
+	connMu                  sync.Mutex
+	roomID                  string
+	serverHost              string
+	lastClipText            string
+	lastClipSig             string
+	pendingClip             map[string]string
+	autoSyncRemoteClipboard bool
+	clipMu                  sync.Mutex
+	p2pNode                 *p2p.Node
+	transportMode           string // "ws" or "wt"
+	localServer             *server.LocalServer
+	lanServerInfo           *server.ServerInfo // LAN Server info (ports, cert hash)
+	deviceID                string
 }
 
 // NewApp creates a new App application struct
 func NewApp() *App {
 	return &App{
-		serverHost:    "localhost:3100", // Default, can be configured
-		p2pNode:       p2p.NewNode(),
-		transportMode: "none",
-		localServer:   server.NewLocalServer(),
-		deviceID:      uuid.New().String(),
+		serverHost:              "localhost:3100", // Default, can be configured
+		p2pNode:                 p2p.NewNode(),
+		transportMode:           "none",
+		localServer:             server.NewLocalServer(),
+		deviceID:                uuid.New().String(),
+		pendingClip:             make(map[string]string),
+		autoSyncRemoteClipboard: true,
 	}
 }
 
@@ -166,30 +181,151 @@ func (a *App) watchClipboard() {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
-			text := a.GetClipboard()
-			if text == "" || text == a.lastClipText {
+			content, sig := a.readClipboardSnapshot()
+			if content == "" || sig == "" {
 				continue
 			}
 
-			// Update local cache
-			a.lastClipText = text
-			log.Printf("📋 Clipboard changed (detected): %s", truncate(text, 50))
+			if !a.tryMarkClipboardSeen(sig, content) {
+				continue
+			}
 
-			// Send to server if connected
-			// Generate ID for the item to ensure persistence
+			log.Printf("📋 Clipboard changed (detected): %s", truncate(content, 50))
+
 			id := fmt.Sprintf("%d", time.Now().UnixMilli())
-			a.sendMessage(map[string]interface{}{
-				"type": "clipboard_push",
-				"payload": map[string]string{
-					"text": text,
-					"id":   id,
-				},
-			})
+			if !a.sendClipboardPush(content, id) {
+				a.setPendingClipboard(content, id)
+			}
 
 			// Emit event to frontend
-			wailsRuntime.EventsEmit(a.ctx, "clipboard:local", text)
+			wailsRuntime.EventsEmit(a.ctx, "clipboard:local", content)
 		}
 	}
+}
+
+func (a *App) readClipboardSnapshot() (string, string) {
+	text := string(clipboard.Read(clipboard.FmtText))
+	if text != "" {
+		sum := sha256.Sum256([]byte(text))
+		return text, "text:" + base64.StdEncoding.EncodeToString(sum[:])
+	}
+
+	imgBytes := clipboard.Read(clipboard.FmtImage)
+	if len(imgBytes) == 0 {
+		return "", ""
+	}
+
+	sum := sha256.Sum256(imgBytes)
+	mime := http.DetectContentType(imgBytes)
+	if !strings.HasPrefix(mime, "image/") {
+		mime = "image/png"
+	}
+	content := fmt.Sprintf(
+		"data:%s;base64,%s",
+		mime,
+		base64.StdEncoding.EncodeToString(imgBytes),
+	)
+	return content, "image:" + base64.StdEncoding.EncodeToString(sum[:])
+}
+
+func (a *App) tryMarkClipboardSeen(sig, content string) bool {
+	a.clipMu.Lock()
+	defer a.clipMu.Unlock()
+
+	if sig == a.lastClipSig {
+		return false
+	}
+	a.lastClipSig = sig
+	a.lastClipText = content
+	return true
+}
+
+func (a *App) markClipboardSeen(content string) {
+	snapshot := content
+	if strings.HasPrefix(content, "data:image") {
+		if raw, err := decodeImageDataURL(content); err == nil {
+			sum := sha256.Sum256(raw)
+			snapshot = "image:" + base64.StdEncoding.EncodeToString(sum[:])
+		}
+	}
+	if !strings.HasPrefix(snapshot, "image:") {
+		sum := sha256.Sum256([]byte(content))
+		snapshot = "text:" + base64.StdEncoding.EncodeToString(sum[:])
+	}
+
+	a.clipMu.Lock()
+	a.lastClipText = content
+	a.lastClipSig = snapshot
+	a.clipMu.Unlock()
+}
+
+func (a *App) sendClipboardPush(content, id string) bool {
+	if !a.GetConnectionStatus() {
+		return false
+	}
+	a.sendMessage(map[string]interface{}{
+		"type": "clipboard_push",
+		"payload": map[string]string{
+			"text": content,
+			"id":   id,
+		},
+	})
+	return true
+}
+
+func (a *App) setPendingClipboard(content, id string) {
+	a.clipMu.Lock()
+	a.pendingClip = map[string]string{
+		"text": content,
+		"id":   id,
+	}
+	a.clipMu.Unlock()
+}
+
+func (a *App) flushPendingClipboard() {
+	if !a.GetConnectionStatus() {
+		return
+	}
+
+	a.clipMu.Lock()
+	payload := a.pendingClip
+	a.clipMu.Unlock()
+	if payload == nil || payload["text"] == "" {
+		return
+	}
+
+	if a.sendClipboardPush(payload["text"], payload["id"]) {
+		a.clipMu.Lock()
+		a.pendingClip = nil
+		a.clipMu.Unlock()
+	}
+}
+
+// GetAutoSyncRemoteClipboard returns whether remote clipboard is written into system clipboard automatically.
+func (a *App) GetAutoSyncRemoteClipboard() bool {
+	a.clipMu.Lock()
+	defer a.clipMu.Unlock()
+	return a.autoSyncRemoteClipboard
+}
+
+// SetAutoSyncRemoteClipboard controls whether remote clipboard updates are written back into system clipboard.
+func (a *App) SetAutoSyncRemoteClipboard(enabled bool) {
+	a.clipMu.Lock()
+	a.autoSyncRemoteClipboard = enabled
+	a.clipMu.Unlock()
+	log.Printf("⚙️ Clipboard auto-sync set to: %v", enabled)
+}
+
+func decodeImageDataURL(content string) ([]byte, error) {
+	const marker = ";base64,"
+	if !strings.HasPrefix(content, "data:image") {
+		return nil, fmt.Errorf("not image data url")
+	}
+	idx := strings.Index(content, marker)
+	if idx < 0 {
+		return nil, fmt.Errorf("invalid data url")
+	}
+	return base64.StdEncoding.DecodeString(content[idx+len(marker):])
 }
 
 // GetTransportMode returns current transport mode ("ws", "wt", or "none")
@@ -223,6 +359,354 @@ func (a *App) GetLocalLanInfo() map[string]interface{} {
 	}
 }
 
+// StartNativeRelayUpload starts LAN relay upload directly in Go (desktop data plane),
+// without using WebView fetch/WebTransport JS APIs.
+func (a *App) StartNativeRelayUpload(relayID, filePath, fileName string, persist bool) error {
+	if a.localServer == nil {
+		return fmt.Errorf("local server not ready")
+	}
+	if strings.TrimSpace(relayID) == "" {
+		return fmt.Errorf("relay id is required")
+	}
+	if strings.TrimSpace(filePath) == "" {
+		return fmt.Errorf("file path is required")
+	}
+
+	err := a.localServer.StartRelayFromFile(relayID, filePath, fileName, persist)
+	if err != nil {
+		return err
+	}
+	log.Printf("🚀 Native relay started: id=%s file=%s persist=%v", relayID, filePath, persist)
+	return nil
+}
+
+// ImportLocalFile imports a local file path into LAN shared storage.
+func (a *App) ImportLocalFile(filePath string) (map[string]interface{}, error) {
+	if a.localServer == nil {
+		return nil, fmt.Errorf("local server not ready")
+	}
+	localFile, err := a.localServer.ImportFileFromPath(filePath)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"id":        localFile.ID,
+		"name":      localFile.Name,
+		"size":      localFile.Size,
+		"createdAt": localFile.CreatedAt,
+	}, nil
+}
+
+// UploadCloudFile uploads a local file to VPS /upload endpoint with Go-native multipart streaming.
+func (a *App) UploadCloudFile(filePath string) (map[string]interface{}, error) {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" {
+		return nil, fmt.Errorf("file path is required")
+	}
+
+	host := strings.TrimSpace(a.serverHost)
+	if host == "" {
+		host = "localhost:3100"
+	}
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.TrimPrefix(host, "https://")
+
+	attempts := []struct {
+		scheme string
+		via    string
+		useH3  bool
+	}{
+		{scheme: "https", via: "h3", useH3: true},
+		{scheme: "https", via: "https", useH3: false},
+		{scheme: "http", via: "http", useH3: false},
+	}
+	var lastErr error
+	for _, attempt := range attempts {
+		endpoint := fmt.Sprintf("%s://%s/upload", attempt.scheme, host)
+		var (
+			resp map[string]interface{}
+			err  error
+		)
+		if attempt.useH3 {
+			resp, err = postMultipartFileH3(endpoint, filePath, true)
+		} else {
+			resp, err = postMultipartFile(endpoint, filePath, attempt.scheme == "https")
+		}
+		if err != nil {
+			lastErr = fmt.Errorf("%s upload failed: %w", strings.ToUpper(attempt.via), err)
+			continue
+		}
+
+		if u, ok := resp["url"].(string); ok && strings.HasPrefix(u, "/") {
+			resp["url"] = fmt.Sprintf("%s://%s%s", attempt.scheme, host, u)
+		}
+		resp["uploadVia"] = attempt.via
+		return resp, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("upload failed")
+	}
+	return nil, lastErr
+}
+
+// UploadVpsRelayFile uploads a local file to VPS relay endpoint and returns relay metadata.
+func (a *App) UploadVpsRelayFile(filePath string) (map[string]interface{}, error) {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" {
+		return nil, fmt.Errorf("file path is required")
+	}
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("path is a directory")
+	}
+
+	host := strings.TrimSpace(a.serverHost)
+	if host == "" {
+		host = "localhost:3100"
+	}
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.TrimPrefix(host, "https://")
+
+	fileName := filepath.Base(filePath)
+	relayID := fmt.Sprintf("vps-relay-%d-%s", time.Now().UnixMilli(), uuid.NewString()[:8])
+	attempts := []struct {
+		scheme string
+		via    string
+		useH3  bool
+	}{
+		{scheme: "https", via: "h3", useH3: true},
+		{scheme: "https", via: "https", useH3: false},
+		{scheme: "http", via: "http", useH3: false},
+	}
+
+	var lastErr error
+	for _, attempt := range attempts {
+		endpoint := fmt.Sprintf("%s://%s/api/relay/upload/%s?name=%s",
+			attempt.scheme, host, relayID, url.QueryEscape(fileName))
+
+		var (
+			resp map[string]interface{}
+			err  error
+		)
+		if attempt.useH3 {
+			resp, err = postMultipartFileH3(endpoint, filePath, true)
+		} else {
+			resp, err = postMultipartFile(endpoint, filePath, attempt.scheme == "https")
+		}
+		if err != nil {
+			lastErr = fmt.Errorf("%s upload failed: %w", strings.ToUpper(attempt.via), err)
+			continue
+		}
+
+		rawDownloadURL, _ := resp["downloadUrl"].(string)
+		if rawDownloadURL == "" {
+			rawDownloadURL = fmt.Sprintf("/api/relay/download/%s", relayID)
+		}
+		absDownloadURL := rawDownloadURL
+		if strings.HasPrefix(rawDownloadURL, "/") {
+			absDownloadURL = fmt.Sprintf("%s://%s%s", attempt.scheme, host, rawDownloadURL)
+		}
+
+		return map[string]interface{}{
+			"id":         relayID,
+			"relayId":    relayID,
+			"name":       fileName,
+			"size":       info.Size(),
+			"type":       "application/octet-stream",
+			"url":        absDownloadURL,
+			"isVpsRelay": true,
+			"uploadVia":  attempt.via,
+			"expiresAt":  resp["expiresAt"],
+		}, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("vps relay upload failed")
+	}
+	return nil, lastErr
+}
+
+func postMultipartFile(endpoint, filePath string, insecureTLS bool) (map[string]interface{}, error) {
+	transport := &http.Transport{}
+	if insecureTLS {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   0, // keep streaming for large files
+	}
+	return postMultipartFileWithClient(endpoint, filePath, client)
+}
+
+func postMultipartFileH3(endpoint, filePath string, insecureTLS bool) (map[string]interface{}, error) {
+	transport := &http3.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS},
+	}
+	defer transport.Close()
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   0, // keep streaming for large files
+	}
+	return postMultipartFileWithClient(endpoint, filePath, client)
+}
+
+func postMultipartFileWithClient(endpoint, filePath string, client *http.Client) (map[string]interface{}, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("open file failed: %w", err)
+	}
+	defer file.Close()
+
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+
+	go func() {
+		defer pw.Close()
+		defer writer.Close()
+
+		part, err := writer.CreateFormFile("file", filepath.Base(filePath))
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if _, err := io.Copy(part, file); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+	}()
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, pr)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("upload failed: %d %s", resp.StatusCode, string(body))
+	}
+
+	if len(bytes.TrimSpace(body)) == 0 {
+		return map[string]interface{}{
+			"url": "",
+		}, nil
+	}
+
+	var out map[string]interface{}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("invalid upload response: %w", err)
+	}
+	return out, nil
+}
+
+// DownloadLanRelayFile downloads LAN relay file to desktop download directory via Go native HTTP client.
+func (a *App) DownloadLanRelayFile(relayID, fileName, ip string, httpPort int) (string, error) {
+	relayID = strings.TrimSpace(relayID)
+	if relayID == "" {
+		return "", fmt.Errorf("relay id is required")
+	}
+	if strings.TrimSpace(ip) == "" {
+		ip = "127.0.0.1"
+	}
+	if httpPort <= 0 {
+		if a.lanServerInfo != nil && a.lanServerInfo.HTTPPort > 0 {
+			httpPort = a.lanServerInfo.HTTPPort
+		} else {
+			return "", fmt.Errorf("http port is required")
+		}
+	}
+
+	endpoint := fmt.Sprintf("http://%s:%d/api/lan/relay/download/%s", ip, httpPort, url.PathEscape(relayID))
+	return a.downloadToLocal(endpoint, fileName)
+}
+
+func (a *App) downloadToLocal(downloadURL, fallbackName string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{
+		Timeout: 0, // Large files: stream until completion.
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return "", fmt.Errorf("download failed: %d %s", resp.StatusCode, string(body))
+	}
+
+	name := strings.TrimSpace(fallbackName)
+	if name == "" {
+		if _, params, err := mime.ParseMediaType(resp.Header.Get("Content-Disposition")); err == nil {
+			if v := strings.TrimSpace(params["filename"]); v != "" {
+				name = filepath.Base(v)
+			}
+		}
+	}
+	if name == "" {
+		name = fmt.Sprintf("relay-%d.bin", time.Now().Unix())
+	}
+
+	dir := config.Current.DownloadDir
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, "Downloads", "QuicLink")
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", err
+	}
+
+	savePath := uniqueFilePath(dir, name)
+	dst, err := os.Create(savePath)
+	if err != nil {
+		return "", err
+	}
+	defer dst.Close()
+
+	written, err := io.Copy(dst, resp.Body)
+	if err != nil {
+		return "", err
+	}
+	log.Printf("📥 Native LAN relay download complete: %s (%d bytes)", savePath, written)
+	return savePath, nil
+}
+
+func uniqueFilePath(dir, name string) string {
+	base := filepath.Base(name)
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	if stem == "" {
+		stem = "download"
+	}
+	full := filepath.Join(dir, stem+ext)
+	if _, err := os.Stat(full); os.IsNotExist(err) {
+		return full
+	}
+	for i := 1; i < 10000; i++ {
+		candidate := filepath.Join(dir, fmt.Sprintf("%s(%d)%s", stem, i, ext))
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+	}
+	return filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, time.Now().UnixNano(), ext))
+}
+
 // GetClipboard returns current clipboard text
 func (a *App) GetClipboard() string {
 	return string(clipboard.Read(clipboard.FmtText))
@@ -230,7 +714,19 @@ func (a *App) GetClipboard() string {
 
 // SetClipboard sets system clipboard text
 func (a *App) SetClipboard(text string) {
-	a.lastClipText = text // Prevent echo
+	if text == "" {
+		return
+	}
+
+	a.markClipboardSeen(text) // Prevent echo
+
+	if strings.HasPrefix(text, "data:image") {
+		if raw, err := decodeImageDataURL(text); err == nil {
+			clipboard.Write(clipboard.FmtImage, raw)
+			return
+		}
+	}
+
 	clipboard.Write(clipboard.FmtText, []byte(text))
 }
 
@@ -261,6 +757,7 @@ func (a *App) Connect(host, roomID, password string) error {
 		a.p2pNode.OnMessage(func(msgType string, payload map[string]interface{}) {
 			a.handleIncomingMessage(msgType, payload)
 		})
+		go a.flushPendingClipboard()
 		return nil
 	}
 	log.Printf("⚠️ WebTransport failed: %v", err)
@@ -315,6 +812,7 @@ func (a *App) connectWebSocket(host, roomID, password string, secure bool) error
 
 	// Start reading messages
 	go a.readMessages()
+	go a.flushPendingClipboard()
 	return nil
 }
 
@@ -348,16 +846,11 @@ func (a *App) handleIncomingMessage(msgType string, payload map[string]interface
 		// New Protocol: Server broadcasts clipboard_data with ID
 		if content, ok := payload["text"].(string); ok {
 			log.Printf("📋 Received clipboard_data: %s", truncate(content, 50))
-
-			// Update lastClipText to prevent echo when we write to system clipboard
-			a.lastClipText = content
-
-			// Optional: Write to system clipboard if 'Auto Sync' is desired
-			// For now, we just emit to frontend to update UI
+			if a.GetAutoSyncRemoteClipboard() {
+				// Auto-sync remote clipboard to system clipboard.
+				a.SetClipboard(content)
+			}
 			wailsRuntime.EventsEmit(a.ctx, "clipboard:remote", payload)
-
-			// If we wanted to auto-sync to system clipboard:
-			// a.SetClipboard(content)
 		}
 	case "file_offer":
 		// Forward to frontend for display
@@ -444,14 +937,13 @@ func (a *App) SendGenericMessage(msgType string, payload map[string]interface{})
 
 // SendClipboard manually sends current clipboard to server
 func (a *App) SendClipboard() {
-	text := a.GetClipboard()
-	if text != "" {
-		a.sendMessage(map[string]interface{}{
-			"type": "clipboard_push",
-			"payload": map[string]string{
-				"text": text,
-			},
-		})
+	content, sig := a.readClipboardSnapshot()
+	if content != "" && sig != "" {
+		a.tryMarkClipboardSeen(sig, content)
+		id := fmt.Sprintf("%d", time.Now().UnixMilli())
+		if !a.sendClipboardPush(content, id) {
+			a.setPendingClipboard(content, id)
+		}
 	}
 }
 
@@ -558,6 +1050,31 @@ func (a *App) SelectDownloadDir() string {
 	// Update Local Server
 	a.localServer.SetUploadDir(selection)
 	return selection
+}
+
+// SelectRelayFiles opens native file picker and returns file metadata for Go-native relay path.
+func (a *App) SelectRelayFiles() []map[string]interface{} {
+	selection, err := wailsRuntime.OpenMultipleFilesDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		Title: "Select Files For Relay",
+	})
+	if err != nil || len(selection) == 0 {
+		return []map[string]interface{}{}
+	}
+
+	result := make([]map[string]interface{}, 0, len(selection))
+	for _, p := range selection {
+		info, statErr := os.Stat(p)
+		if statErr != nil || info.IsDir() {
+			continue
+		}
+		result = append(result, map[string]interface{}{
+			"path": p,
+			"name": filepath.Base(p),
+			"size": info.Size(),
+			"type": "application/octet-stream",
+		})
+	}
+	return result
 }
 
 // GetDownloadDir returns the current download directory
