@@ -12,6 +12,7 @@ interface P2PFile {
   size: number
   type: string
   fromSelf: boolean
+  createdAt?: number
   progress?: number
   isLan?: boolean // Phase 2: LAN Flag
   baseUrl?: string // Phase 5: Multi-Host URL
@@ -62,6 +63,11 @@ const transferSpeedText = computed(() => {
   if (bps <= 0) return '--'
   const mbps = bps / (1024 * 1024)
   return `${mbps.toFixed(mbps >= 10 ? 1 : 2)} MB/s`
+})
+
+const transferRouteText = computed(() => {
+  const route = String((transfer.value as any)?.route || '').trim()
+  return route || '--'
 })
 
 const transferProgressText = computed(() => {
@@ -117,18 +123,106 @@ function processFiles(files: FileList) {
       name: file.name,
       size: file.size,
       type: file.type,
-      fromSelf: true
+      fromSelf: true,
+      createdAt: Date.now()
     })
   }
 }
 
 function addFileToList(file: P2PFile) {
+  if (!file.createdAt) file.createdAt = Date.now()
   fileList.value.push(file)
   // 自动滚动到底部
   setTimeout(() => {
     const container = document.querySelector('.p2p-list')
     if (container) container.scrollTop = container.scrollHeight
   }, 100)
+}
+
+function upsertOfferFile(payload: any) {
+  const offerId = String(payload?.id || '')
+  const relayId = String(payload?.relayId || '')
+  const originalId = String(payload?.originalId || '')
+
+  const existing = fileList.value.find((f) => {
+    if (offerId && f.id === offerId) return true
+    if (relayId && (f.id === relayId || (f as any).relayId === relayId)) return true
+    if (originalId && f.id === originalId) return true
+    return false
+  })
+
+  if (existing) {
+    existing.name = payload.name ?? existing.name
+    existing.size = Number(payload.size ?? existing.size)
+    existing.type = payload.type ?? existing.type
+    existing.isLan = payload.isLan ?? existing.isLan
+    existing.baseUrl = payload.baseUrl ?? existing.baseUrl
+    existing.isNetdisk = payload.isNetdisk ?? existing.isNetdisk
+    existing.netdiskUrl = payload.url ?? existing.netdiskUrl
+    existing.isVpsRelay = payload.isVpsRelay ?? existing.isVpsRelay
+    existing.vpsRelayUrl = payload.url ?? existing.vpsRelayUrl
+    existing.isRelay = payload.isRelay ?? existing.isRelay
+    existing.relayStatus = payload.isRelay ? (payload.status || existing.relayStatus || 'pending') : existing.relayStatus
+    existing.lanFileId = payload.lanFileId ?? existing.lanFileId
+    existing.ip = payload.ip ?? existing.ip
+    existing.httpPort = payload.httpPort ?? existing.httpPort
+    existing.h3Port = payload.h3Port ?? existing.h3Port
+    existing.certHash = payload.certHash ?? existing.certHash
+    return
+  }
+
+  // Merge loopback offer into temporary local row to avoid duplicates.
+  if (offerId) {
+    const now = Date.now()
+    const selfTemp = fileList.value.find((f) =>
+      f.fromSelf &&
+      f.id.startsWith('local-') &&
+      f.name === payload.name &&
+      Number(f.size) === Number(payload.size) &&
+      now - Number(f.createdAt || 0) < 15000
+    )
+    if (selfTemp) {
+      selfTemp.id = offerId
+      ;(selfTemp as any).relayId = relayId || (selfTemp as any).relayId
+      ;(selfTemp as any).originalId = originalId || (selfTemp as any).originalId
+      selfTemp.type = payload.type ?? selfTemp.type
+      selfTemp.isLan = payload.isLan ?? selfTemp.isLan
+      selfTemp.baseUrl = payload.baseUrl ?? selfTemp.baseUrl
+      selfTemp.isNetdisk = payload.isNetdisk ?? selfTemp.isNetdisk
+      selfTemp.netdiskUrl = payload.url ?? selfTemp.netdiskUrl
+      selfTemp.isVpsRelay = payload.isVpsRelay ?? selfTemp.isVpsRelay
+      selfTemp.vpsRelayUrl = payload.url ?? selfTemp.vpsRelayUrl
+      selfTemp.isRelay = payload.isRelay ?? selfTemp.isRelay
+      selfTemp.relayStatus = payload.isRelay ? (payload.status || selfTemp.relayStatus || 'pending') : selfTemp.relayStatus
+      selfTemp.lanFileId = payload.lanFileId ?? selfTemp.lanFileId
+      selfTemp.ip = payload.ip ?? selfTemp.ip
+      selfTemp.httpPort = payload.httpPort ?? selfTemp.httpPort
+      selfTemp.h3Port = payload.h3Port ?? selfTemp.h3Port
+      selfTemp.certHash = payload.certHash ?? selfTemp.certHash
+      return
+    }
+  }
+
+  addFileToList({
+    id: payload.id,
+    name: payload.name,
+    size: payload.size,
+    type: payload.type,
+    fromSelf: false,
+    isLan: payload.isLan,
+    baseUrl: payload.baseUrl,
+    isNetdisk: payload.isNetdisk,
+    netdiskUrl: payload.url,
+    isVpsRelay: payload.isVpsRelay,
+    vpsRelayUrl: payload.url,
+    isRelay: payload.isRelay,
+    relayStatus: payload.isRelay ? (payload.status || 'pending') : undefined,
+    lanFileId: payload.lanFileId,
+    ip: payload.ip,
+    httpPort: payload.httpPort,
+    h3Port: payload.h3Port,
+    certHash: payload.certHash
+  })
 }
 
 async function handleDownload(file: P2PFile) {
@@ -259,27 +353,7 @@ onMounted(() => {
   // 绑定 Store 事件
   conn.onP2PEvent = (type, payload) => {
     if (type === 'offer') {
-      // 收到别人分享的文件
-      addFileToList({
-        id: payload.id,
-        name: payload.name,
-        size: payload.size,
-        type: payload.type,
-        fromSelf: false,
-        isLan: payload.isLan, // Phase 2
-        baseUrl: payload.baseUrl, // Phase 5
-        isNetdisk: payload.isNetdisk,
-        netdiskUrl: payload.url,
-        isVpsRelay: payload.isVpsRelay,
-        vpsRelayUrl: payload.url,
-        isRelay: payload.isRelay,
-        relayStatus: payload.isRelay ? (payload.status || 'pending') : undefined,
-        lanFileId: payload.lanFileId,
-        ip: payload.ip,
-        httpPort: payload.httpPort,
-        h3Port: payload.h3Port,
-        certHash: payload.certHash
-      })
+      upsertOfferFile(payload)
     } else if (type === 'relay_ready') {
       const item = fileList.value.find(f => f.id === payload.originalId)
       if (item) {
@@ -304,7 +378,7 @@ onMounted(() => {
     } else if (type === 'relay_ack') {
       const relayId = payload?.relayId
       if (!relayId) return
-      const item = fileList.value.find(f => f.id === relayId)
+      const item = fileList.value.find(f => f.id === relayId || (f as any).relayId === relayId)
       if (item && item.fromSelf && item.isVpsRelay) {
         item.progress = 100
       }
@@ -333,6 +407,7 @@ function deleteFile(index: number) {
     <div class="transfer-diagnostics">
       <span class="diag-item"><strong>通道:</strong> {{ transferPathLabel }}</span>
       <span class="diag-item"><strong>状态:</strong> {{ transferStatusLabel }}</span>
+      <span class="diag-item"><strong>链路:</strong> {{ transferRouteText }}</span>
       <span class="diag-item"><strong>速率:</strong> {{ transferSpeedText }}</span>
       <span class="diag-item"><strong>进度:</strong> {{ transferProgressText }}</span>
     </div>
@@ -351,7 +426,7 @@ function deleteFile(index: number) {
 
       <div
         v-for="(file, index) in fileList"
-        :key="index"
+        :key="`${file.id}-${index}`"
         class="p2p-item"
         :class="{ 'is-self': file.fromSelf }"
         @click="handleDownload(file)"

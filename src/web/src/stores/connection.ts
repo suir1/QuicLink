@@ -43,7 +43,6 @@ export const useConnectionStore = defineStore('connection', () => {
         certHash?: string
     }
     const lanServers = ref<Map<string, LanServerInfo>>(new Map())
-    const lanHttpsProbeCache = ref<Map<string, { ok: boolean, ts: number }>>(new Map())
     const downloadMode = ref<DownloadMode>(
         (localStorage.getItem(DOWNLOAD_MODE_KEY) === 'speed' ? 'speed' : 'compat')
     )
@@ -104,6 +103,7 @@ export const useConnectionStore = defineStore('connection', () => {
         status: TransferStatus
         direction: TransferDirection
         fileName: string
+        route: string
         bytes: number
         total: number
         speedBps: number
@@ -115,6 +115,7 @@ export const useConnectionStore = defineStore('connection', () => {
         status: 'idle',
         direction: 'download',
         fileName: '',
+        route: '',
         bytes: 0,
         total: 0,
         speedBps: 0,
@@ -143,6 +144,7 @@ export const useConnectionStore = defineStore('connection', () => {
             status: 'active',
             direction,
             fileName,
+            route: '',
             bytes: 0,
             total: total > 0 ? total : 0,
             speedBps: 0,
@@ -179,12 +181,21 @@ export const useConnectionStore = defineStore('connection', () => {
         transferSession.value = null
     }
 
+    function setTransferRoute(route: string) {
+        transferTelemetry.value = {
+            ...transferTelemetry.value,
+            route: String(route || '').trim(),
+            updatedAt: Date.now()
+        }
+    }
+
     function resetTransferTelemetry() {
         transferTelemetry.value = {
             path: transferTelemetry.value.path,
             status: 'idle',
             direction: transferTelemetry.value.direction,
             fileName: '',
+            route: '',
             bytes: 0,
             total: 0,
             speedBps: 0,
@@ -1334,35 +1345,7 @@ export const useConnectionStore = defineStore('connection', () => {
         return !isDesktop.value && downloadMode.value === 'speed'
     }
 
-    async function probeLanHttpsUrlReachable(ip: string, h3Port?: number): Promise<boolean> {
-        if (!ip || !h3Port) return false
-        const key = `${ip}:${h3Port}`
-        const now = Date.now()
-        const cached = lanHttpsProbeCache.value.get(key)
-        if (cached && now - cached.ts < 5 * 60 * 1000) {
-            return cached.ok
-        }
-
-        try {
-            const controller = new AbortController()
-            const timer = setTimeout(() => controller.abort(), 1800)
-            // `no-cors` lets us probe TLS/connectivity without CORS coupling.
-            await fetch(`https://${ip}:${h3Port}/api/lan/files`, {
-                method: 'GET',
-                mode: 'no-cors',
-                cache: 'no-store',
-                signal: controller.signal
-            })
-            clearTimeout(timer)
-            lanHttpsProbeCache.value.set(key, { ok: true, ts: now })
-            return true
-        } catch (e) {
-            lanHttpsProbeCache.value.set(key, { ok: false, ts: now })
-            return false
-        }
-    }
-
-    async function openLanDownloadURL(
+    function openLanDownloadURL(
         fileId: string,
         fileName: string,
         ip?: string,
@@ -1370,43 +1353,45 @@ export const useConnectionStore = defineStore('connection', () => {
         h3Port?: number,
         isRelay = false
     ): Promise<'https' | 'http' | null> {
-        if (!ip) return null
+        if (!ip) return Promise.resolve(null)
         startTransferTelemetry('browser-url', 'download', fileName, 0, 'Browser download manager')
         const path = isRelay
             ? `/api/lan/relay/download/${fileId}`
             : `/api/lan/download/${fileId}`
 
+        const openUrl = (url: string) => {
+            const a = document.createElement('a')
+            a.href = url
+            a.target = '_blank'
+            a.rel = 'noopener'
+            document.body.appendChild(a)
+            a.click()
+            document.body.removeChild(a)
+            return true
+        }
+
         if (h3Port) {
-            const httpsReachable = await probeLanHttpsUrlReachable(ip, h3Port)
-            if (httpsReachable) {
-                const a = document.createElement('a')
-                a.href = `https://${ip}:${h3Port}${path}`
-                a.target = '_blank'
-                a.rel = 'noopener'
-                a.download = fileName
-                document.body.appendChild(a)
-                a.click()
-                document.body.removeChild(a)
+            const httpsUrl = `https://${ip}:${h3Port}${path}`
+            if (openUrl(httpsUrl)) {
+                setTransferRoute('lan-url-https')
+                console.info(`📥 Download route: lan-url-https -> ${httpsUrl}`)
                 finishTransferTelemetry('handoff', `URL handoff: HTTPS${isRelay ? ' relay' : ''}`)
-                return 'https'
+                return Promise.resolve('https')
             }
         }
 
         if (httpPort) {
-            const a = document.createElement('a')
-            a.href = `http://${ip}:${httpPort}${path}`
-            a.target = '_blank'
-            a.rel = 'noopener'
-            a.download = fileName
-            document.body.appendChild(a)
-            a.click()
-            document.body.removeChild(a)
-            finishTransferTelemetry('handoff', `URL handoff: HTTP${isRelay ? ' relay' : ''}`)
-            return 'http'
+            const httpUrl = `http://${ip}:${httpPort}${path}`
+            if (openUrl(httpUrl)) {
+                setTransferRoute('lan-url-http')
+                console.info(`📥 Download route: lan-url-http -> ${httpUrl}`)
+                finishTransferTelemetry('handoff', `URL handoff: HTTP${isRelay ? ' relay' : ''}`)
+                return Promise.resolve('http')
+            }
         }
 
         finishTransferTelemetry('error', 'No LAN URL available')
-        return null
+        return Promise.resolve(null)
     }
 
     function sleep(ms: number): Promise<void> {
@@ -1454,6 +1439,8 @@ export const useConnectionStore = defineStore('connection', () => {
     ): Promise<boolean> {
         if (shouldPreferBrowserDownloadManager()) {
             startTransferTelemetry('browser-url', 'download', fallbackName, totalSizeHint || 0, 'Browser download manager')
+            setTransferRoute('vps-url')
+            console.info(`📥 Download route: vps-url -> ${downloadUrl}`)
             const a = document.createElement('a')
             a.href = downloadUrl
             a.target = '_blank'
@@ -1467,6 +1454,7 @@ export const useConnectionStore = defineStore('connection', () => {
         }
 
         startTransferTelemetry('vps-relay', 'download', fallbackName, totalSizeHint || 0, 'VPS relay')
+        setTransferRoute('vps-stream')
         const chunks: BlobPart[] = []
         let downloaded = 0
         let expectedTotal = totalSizeHint
@@ -1924,6 +1912,7 @@ export const useConnectionStore = defineStore('connection', () => {
 
         try {
             startTransferTelemetry('lan-wt-direct', 'download', fileName, 0, 'LAN WT direct')
+            setTransferRoute('lan-wt-direct')
             const wt = await createLanWT(server)
             const stream = await wt.createBidirectionalStream()
             const writer = stream.writable.getWriter()
@@ -1961,6 +1950,7 @@ export const useConnectionStore = defineStore('connection', () => {
 
         try {
             startTransferTelemetry('lan-wt-relay', 'download', fileName, 0, 'LAN WT relay')
+            setTransferRoute('lan-wt-relay')
             const wt = await createLanWTByAddress(targetIp, targetH3Port, targetCertHash)
             const stream = await wt.createBidirectionalStream()
             const writer = stream.writable.getWriter()

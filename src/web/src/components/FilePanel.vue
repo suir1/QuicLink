@@ -42,6 +42,11 @@ const transferSpeedText = computed(() => {
     return `${mbps.toFixed(mbps >= 10 ? 1 : 2)} MB/s`
 })
 
+const transferRouteText = computed(() => {
+    const route = String((transfer.value as any)?.route || '').trim()
+    return route || '--'
+})
+
 const fetchDownloadDir = async () => {
     const w = window as any
     if (w.go && w.go.main && w.go.main.App) {
@@ -572,6 +577,7 @@ const statusType = (status: string) => {
                  <div class="transfer-diagnostics">
                     <span><strong>通道:</strong> {{ transferPathLabel }}</span>
                     <span><strong>状态:</strong> {{ transferStatusLabel }}</span>
+                    <span><strong>链路:</strong> {{ transferRouteText }}</span>
                     <span><strong>速率:</strong> {{ transferSpeedText }}</span>
                     <span><strong>进度:</strong> {{ transferProgressText }}</span>
                  </div>
