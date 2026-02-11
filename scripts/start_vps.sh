@@ -11,7 +11,7 @@ echo "🛑 Stopping existing server..."
 pkill -f $BINARY || echo "⚠️ No running process found."
 
 echo "🚀 Starting server..."
-export QUIC_GO_LOG_LEVEL=DEBUG
+# export QUIC_GO_LOG_LEVEL=DEBUG
 nohup ./$BINARY > $LOG_FILE 2>&1 &
 
 echo "✅ Server started! Logs are being written to $APP_DIR/$LOG_FILE"

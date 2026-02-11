@@ -184,7 +184,8 @@ func (r *Room) Broadcast(msg interface{}, sender Connection) {
 	r.mutex.RLock()
 	defer r.mutex.RUnlock()
 
-	log.Printf("📢 Broadcasting [Message=%+v] to %d clients in room %s", msg, len(r.Clients), r.ID)
+	// Simplified log: only type and count
+	// log.Printf("📢 Broadcasting type=%s to %d clients", msgType, len(r.Clients))
 
 	i := 0
 	for client := range r.Clients {

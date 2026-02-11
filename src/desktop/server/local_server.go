@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -17,6 +18,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -55,6 +57,19 @@ type LocalServer struct {
 	wtServer   *webtransport.Server
 	certFile   string
 	keyFile    string
+
+	// Phase 9: In-Memory Relay
+	relayMu  sync.Mutex
+	relayMap map[string]*RelaySession
+}
+
+type RelaySession struct {
+	Writer *io.PipeWriter
+	Reader *io.PipeReader
+	Done   chan struct{} // Closed when transfer complete or error
+	Name   string
+	Size   int64
+	Type   string
 }
 
 func NewLocalServer() *LocalServer {
@@ -75,6 +90,7 @@ func NewLocalServer() *LocalServer {
 	return &LocalServer{
 		files:     make(map[string]*LocalFile),
 		uploadDir: uploadDir,
+		relayMap:  make(map[string]*RelaySession),
 	}
 }
 
@@ -98,6 +114,10 @@ func (s *LocalServer) Start() (*ServerInfo, error) {
 	s.certFile = filepath.Join(certDir, "lan_cert.pem")
 	s.keyFile = filepath.Join(certDir, "lan_key.pem")
 
+	// Force regenerate cert to ensure 10-day limit is applied
+	os.Remove(s.certFile)
+	os.Remove(s.keyFile)
+
 	certHash, err := s.generateCertWithHash()
 	if err != nil {
 		log.Printf("❌ Failed to generate cert: %v", err)
@@ -110,6 +130,11 @@ func (s *LocalServer) Start() (*ServerInfo, error) {
 	mux.HandleFunc("/api/lan/files", s.handleListFiles)
 	mux.HandleFunc("/api/lan/upload", s.handleUpload)
 	mux.HandleFunc("/api/lan/download/", s.handleDownload)
+
+	// Relay Endpoints
+	mux.HandleFunc("/api/lan/relay/upload/", s.handleRelayUpload)
+	mux.HandleFunc("/api/lan/relay/download/", s.handleRelayDownload)
+
 	mux.HandleFunc("/wt", s.handleWebTransport) // WebTransport endpoint
 
 	handler := s.enableCORS(mux)
@@ -216,11 +241,13 @@ func (s *LocalServer) generateCertWithHash() (string, error) {
 			Organization: []string{"QuicLink LAN"},
 		},
 		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(14 * 24 * time.Hour), // 14 days
+		NotAfter:              time.Now().Add(10 * 24 * time.Hour), // 14 days max for WebTransport
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
+
+	log.Printf("🔒 Generated self-signed certificate (valid until %s)", template.NotAfter)
 
 	// Add all local IPs to certificate
 	template.DNSNames = []string{"localhost"}
@@ -329,8 +356,17 @@ func (s *LocalServer) handleWTSession(session *webtransport.Session) {
 func (s *LocalServer) handleWTStream(stream *webtransport.Stream) {
 	defer stream.Close()
 
-	// Read command (first line is JSON command)
-	decoder := json.NewDecoder(stream)
+	// Use bufio.Reader to read JSON command line without losing buffered data
+	// json.NewDecoder would buffer extra bytes beyond JSON boundary, causing data loss
+	bufReader := bufio.NewReader(stream)
+
+	// Read the first line (JSON command terminated by \n)
+	line, err := bufReader.ReadBytes('\n')
+	if err != nil {
+		log.Printf("❌ WT Stream read command error: %v", err)
+		return
+	}
+
 	var cmd struct {
 		Action string `json:"action"` // "upload", "download", "list"
 		FileID string `json:"fileId,omitempty"`
@@ -338,7 +374,7 @@ func (s *LocalServer) handleWTStream(stream *webtransport.Stream) {
 		Size   int64  `json:"size,omitempty"`
 	}
 
-	if err := decoder.Decode(&cmd); err != nil {
+	if err := json.Unmarshal(line, &cmd); err != nil {
 		log.Printf("❌ WT Stream decode error: %v", err)
 		return
 	}
@@ -349,7 +385,8 @@ func (s *LocalServer) handleWTStream(stream *webtransport.Stream) {
 	case "download":
 		s.wtHandleDownload(stream, cmd.FileID)
 	case "upload":
-		s.wtHandleUpload(stream, cmd.Name, cmd.Size)
+		// Pass bufReader so it can read remaining buffered data + stream
+		s.wtHandleUpload(stream, bufReader, cmd.Name, cmd.Size)
 	}
 }
 
@@ -395,7 +432,7 @@ func (s *LocalServer) wtHandleDownload(stream *webtransport.Stream, fileID strin
 	io.Copy(stream, file)
 }
 
-func (s *LocalServer) wtHandleUpload(stream *webtransport.Stream, name string, size int64) {
+func (s *LocalServer) wtHandleUpload(stream *webtransport.Stream, bufReader *bufio.Reader, name string, size int64) {
 	id := uuid.New().String()
 	savePath := filepath.Join(s.uploadDir, id+"_"+name)
 
@@ -406,8 +443,8 @@ func (s *LocalServer) wtHandleUpload(stream *webtransport.Stream, name string, s
 	}
 	defer dst.Close()
 
-	// Read file content from stream
-	written, err := io.CopyN(dst, stream, size)
+	// Read file content from bufReader (which contains any buffered data + remaining stream)
+	written, err := io.CopyN(dst, bufReader, size)
 	if err != nil && err != io.EOF {
 		log.Printf("❌ WT Upload error: %v", err)
 		return
@@ -515,4 +552,114 @@ func (s *LocalServer) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileInfo.Name))
 	http.ServeFile(w, r, fileInfo.Path)
+}
+
+// --- Phase 9: Streaming Relay Handlers ---
+
+// handleRelayUpload receives the file stream from Sender
+// POST /api/lan/relay/upload/:id
+func (s *LocalServer) handleRelayUpload(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Path[len("/api/lan/relay/upload/"):]
+	if id == "" {
+		http.Error(w, "Missing Relay ID", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("🚀 Relay Upload Start: %s", id)
+
+	// Create Pipe
+	pr, pw := io.Pipe()
+
+	// Decode filename
+	rawName := r.Header.Get("X-File-Name")
+	decodedName, err := url.QueryUnescape(rawName)
+	if err != nil {
+		decodedName = rawName // Fallback
+	}
+
+	session := &RelaySession{
+		Reader: pr,
+		Writer: pw,
+		Done:   make(chan struct{}),
+		Name:   decodedName,
+		// Size:   r.ContentLength, // optional
+	}
+
+	// Register session
+	s.relayMu.Lock()
+	s.relayMap[id] = session
+	s.relayMu.Unlock()
+
+	// Wait for downloader to connect signal?
+	// Actually, we just start copying to pipe. Writer will block until reader is ready.
+
+	// Cleanup ensure
+	defer func() {
+		log.Printf("🏁 Relay Session Cleanup: %s", id)
+		s.relayMu.Lock()
+		delete(s.relayMap, id)
+		s.relayMu.Unlock()
+		pw.Close() // Close writer, reader will get EOF
+		close(session.Done)
+	}()
+
+	// Copy request body to Pipe
+	// This BLOCKs until the Reader (Downloader) reads data
+	written, err := io.Copy(pw, r.Body)
+	if err != nil {
+		log.Printf("❌ Relay Pipe Error (Upload side): %v", err)
+		http.Error(w, "Relay Broken", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("✅ Relay Complete: %s (%d bytes)", id, written)
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleRelayDownload sends the file stream to Receiver
+// GET /api/lan/relay/download/:id
+func (s *LocalServer) handleRelayDownload(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Path[len("/api/lan/relay/download/"):]
+	if id == "" {
+		http.Error(w, "Missing Relay ID", http.StatusBadRequest)
+		return
+	}
+
+	// Wait loop (max 30s) for session to appear
+	// Because Upload request might be slightly slower to register map than Download request
+	var session *RelaySession
+	timeout := time.After(30 * time.Second)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	found := false
+	for !found {
+		select {
+		case <-timeout:
+			http.Error(w, "Relay Session Timeout (Sender did not connect)", http.StatusNotFound)
+			return
+		case <-ticker.C:
+			s.relayMu.Lock()
+			session, found = s.relayMap[id]
+			s.relayMu.Unlock()
+			if found {
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+
+	log.Printf("🚀 Relay Download Connected: %s (File: %s)", id, session.Name)
+
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", session.Name))
+	w.Header().Set("Content-Type", "application/octet-stream")
+
+	// Stream from Pipe Reader
+	// This UNBLOCKs the writer
+	_, err := io.Copy(w, session.Reader)
+	if err != nil {
+		log.Printf("❌ Relay Download Error: %v", err)
+	}
 }

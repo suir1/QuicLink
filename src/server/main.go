@@ -166,20 +166,23 @@ func main() {
 	// Wrap DefaultServeMux with logging
 	// 注意：对于 WebTransport CONNECT 请求，不能使用 wrapper，因为 http3.Settingser 接口需要原始 ResponseWriter
 	loggingHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("🔍 [%s] Request: %s %s from %s", r.Proto, r.Method, r.URL.Path, r.RemoteAddr)
+		// Access Log (Reduced)
+		if r.URL.Path != "/api/info" { // Skip frequent polls if any
+			// log.Printf("🔍 [%s] Request: %s %s", r.Proto, r.Method, r.URL.Path)
+		}
 
-		// 对于 WebTransport CONNECT 请求，直接使用原始 ResponseWriter
-		// 因为 webtransport.Server.Upgrade() 需要类型断言到 http3.Settingser
-		if r.Method == http.MethodConnect && r.URL.Path == "/wt" {
-			http.DefaultServeMux.ServeHTTP(w, r)
-			log.Printf("🔍 [%s] Response: WebTransport for %s %s", r.Proto, r.Method, r.URL.Path)
+		// Check for upgrade (WebTransport or WebSocket)
+		if r.Method == "CONNECT" && r.Proto == "webtransport" {
+			// log.Printf("🔍 [%s] WebTransport Handshake: %s", r.Proto, r.URL.Path)
+			http.DefaultServeMux.ServeHTTP(w, r) // Use DefaultServeMux as 'next'
 			return
 		}
 
-		// 其他请求使用 wrapper 来记录状态码
-		rw := &responseWriterWrapper{ResponseWriter: w, status: 200}
-		http.DefaultServeMux.ServeHTTP(rw, r)
-		log.Printf("🔍 [%s] Response: %d for %s %s", r.Proto, rw.status, r.Method, r.URL.Path)
+		// Standard handling
+		rw := &responseWriterWrapper{ResponseWriter: w, status: 200} // Use existing responseWriterWrapper
+		http.DefaultServeMux.ServeHTTP(rw, r)                        // Use DefaultServeMux as 'next'
+
+		// log.Printf("🔍 Response: %d %s %s", rw.status, r.Method, r.URL.Path)
 	})
 
 	// 初始化 HTTP/3 Server

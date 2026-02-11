@@ -188,6 +188,14 @@ func (a *App) GetTransportMode() string {
 	return a.transportMode
 }
 
+// GetLocalServerPort returns the HTTP port of the local LAN server
+func (a *App) GetLocalServerPort() int {
+	if a.lanServerInfo != nil {
+		return a.lanServerInfo.HTTPPort
+	}
+	return 0
+}
+
 // GetClipboard returns current clipboard text
 func (a *App) GetClipboard() string {
 	return string(clipboard.Read(clipboard.FmtText))

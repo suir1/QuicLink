@@ -479,9 +479,56 @@ export const useConnectionStore = defineStore('connection', () => {
                         total: msg.payload.total
                     })
                     break
+
+                // --- LAN Signaling (Desktop acts as LAN server) ---
+                case 'lan_list_request':
+                    // Web client wants our file list - fetch from localhost and relay back
+                    handleLanListRequest()
+                    break
+
+                case 'lan_file_offer':
+                    // Another client shared a file (lazy, metadata only)
+                    if (onP2PEvent.value) onP2PEvent.value('lan_offer', msg.payload)
+                    break
+
+                case 'lan_file_request':
+                    // Another client wants a file we shared - handled if we have it
+                    break
+
+                case 'lan_file_ready':
+                    // File uploaded to our LAN server, ready for download
+                    if (onP2PEvent.value) onP2PEvent.value('lan_ready', msg.payload)
+                    break
             }
         } catch (e) {
             console.error("消息解析失败", e, jsonStr)
+        }
+    }
+
+    // --- LAN List Relay (Desktop fetches from its own localhost and relays via VPS) ---
+    async function handleLanListRequest() {
+        try {
+            const w = window as any
+            let port = 0
+            if (w.go && w.go.main && w.go.main.App) {
+                port = await w.go.main.App.GetLocalServerPort()
+            }
+            if (!port) {
+                console.warn('LAN server port not available')
+                return
+            }
+
+            const res = await fetch(`http://localhost:${port}/api/lan/files`)
+            if (res.ok) {
+                const files = await res.json()
+                sendMessage({
+                    type: 'lan_list_response',
+                    payload: { files }
+                })
+                console.log(`📂 Relayed ${files.length} files to room`)
+            }
+        } catch (e) {
+            console.error('Failed to handle lan_list_request', e)
         }
     }
 

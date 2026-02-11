@@ -25,7 +25,7 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 			content, _ := payload["content"].(string)
 
 			if id != "" {
-				log.Printf("📝 Notepad update received: id=%s, title=%s", id, title)
+				// log.Printf("📝 Notepad update recv: %s", id)
 				room.UpdateNote(id, title, content)
 				// Broadcast the original message to others
 				room.Broadcast(msg, conn)
@@ -48,7 +48,7 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 		if payload, ok := msg.Payload.(map[string]interface{}); ok {
 			if text, ok := payload["text"].(string); ok {
 				// Log entire payload keys to debug missing ID
-				log.Printf("📥 Clipboard Push Payload Keys: %v", payload)
+				// log.Printf("📥 Clipboard Push Keys: %v", payload)
 
 				// Try to get client-provided ID (Handle both string and number types)
 				var id string
@@ -59,7 +59,7 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 				} else {
 					log.Printf("⚠️ ID Parsing Failed! Payload['id'] is Type: %T, Value: %v", payload["id"], payload["id"])
 				}
-				log.Printf("📥 Clipboard Push: TextLen=%d, ParsedID=%s", len(text), id)
+				// log.Printf("📥 Clipboard Push: Len=%d", len(text))
 
 				item := room.AddClipboardItem(text, id)
 				if item != nil {
@@ -79,7 +79,7 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 						Payload: broadcastPayload,
 					}, nil) // nil sender means broadcast to all
 
-					log.Printf("💾 Saved clipboard item [%s]. Broadcasted to all.", item.ID)
+					// log.Printf("💾 Saved clipboard item [%s]", item.ID)
 				}
 			}
 		}
@@ -116,6 +116,11 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 
 	// --- LAN Discovery ---
 	case "lan_info":
+		room.Broadcast(msg, conn)
+
+	// --- LAN 文件共享信令 ---
+	case "lan_file_offer", "lan_file_request", "lan_file_ready", "lan_file_shared",
+		"lan_list_request", "lan_list_response", "lan_download_request":
 		room.Broadcast(msg, conn)
 
 	// --- 心跳检测 ---

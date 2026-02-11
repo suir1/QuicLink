@@ -48,6 +48,7 @@ export const useConnectionStore = defineStore('connection', () => {
     const onClipboardDelete = ref<((id: number | string) => void) | null>(null) // New Callback
     const onNotepadEvent = ref<((type: string, data: any) => void) | null>(null)
     const onP2PEvent = ref<((type: string, data: any) => void) | null>(null)
+    const onLanEvent = ref<((type: string, data: any) => void) | null>(null)
 
     // P2P State
     const localFiles = ref<Map<string, File>>(new Map())
@@ -489,6 +490,274 @@ export const useConnectionStore = defineStore('connection', () => {
         })
     }
 
+    // --- LAN Lazy File Sharing ---
+    // Share file to LAN: only broadcast metadata, file stays in browser memory
+    function shareLanFile(file: File) {
+        const fileId = `lan-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+        localFiles.value.set(fileId, file)
+
+        // Broadcast metadata only (no upload!)
+        sendMessage({
+            type: 'lan_file_offer',
+            payload: {
+                id: fileId,
+                name: file.name,
+                size: file.size,
+                type: file.type
+            }
+        })
+        ElMessage.success(`📋 已共享: ${file.name} (等待下载)`)
+    }
+
+    // Request a LAN shared file (triggers sender to upload to desktop)
+    function requestLanFile(fileId: string) {
+        sendMessage({
+            type: 'lan_file_request',
+            payload: { id: fileId }
+        })
+        console.log(`📥 Requesting LAN file: ${fileId}`)
+    }
+
+    // Handle lan_file_request: upload file to desktop LAN server on demand
+    async function handleLanFileRequest(fileId: string) {
+        const file = localFiles.value.get(fileId)
+        if (!file) {
+            console.warn(`File ${fileId} not found locally`)
+            return
+        }
+
+        const activeLanServer = Array.from(lanServers.value.values())[0]
+        if (!activeLanServer) {
+            console.error('No LAN server available for upload')
+            return
+        }
+
+        console.log(`📤 Uploading ${file.name} to Desktop LAN server on demand...`)
+        ElMessage.info(`📤 正在上传 ${file.name} 到主机...`)
+
+        try {
+            let uploadedFileId: string | null = null
+
+            // Try Relay Upload (Phase 9: Streaming)
+            if (activeLanServer.httpPort) {
+                // Use original fileId as relayId for simplicity, or generate new one
+                const relayId = `relay-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+
+                // Start upload without awaiting completion (it blocks until download starts!)
+                // Use a promise to catch immediate errors
+                uploadToLanRelay(file, activeLanServer, relayId).catch(e => {
+                    console.error("Relay Upload Aborted", e)
+                })
+
+                // Notify immediately that relay is ready (Sender is waiting)
+                sendMessage({
+                    type: 'lan_file_ready',
+                    payload: {
+                        originalId: fileId,
+                        lanFileId: relayId,
+                        name: file.name,
+                        size: file.size,
+                        ip: activeLanServer.ip,
+                        httpPort: activeLanServer.httpPort,
+                        h3Port: activeLanServer.h3Port,
+                        certHash: activeLanServer.certHash,
+                        isRelay: true // Flag for UI to use relay endpoint
+                    }
+                })
+                ElMessage.success(`✅ ${file.name} 就绪 (流式中转)`)
+                return
+            }
+        } catch (e) {
+            console.error('Failed to upload on demand', e)
+            ElMessage.error('上传失败')
+        }
+    }
+
+    async function uploadToLanRelay(file: File, server: LanServerInfo, relayId: string) {
+        // This request will BLOCK until the receiver connects!
+        // or until server times out (we rely on server timeout)
+        console.log(`🚀 Starting Relay Stream: ${relayId}`)
+        const res = await fetch(`http://${server.ip}:${server.httpPort}/api/lan/relay/upload/${relayId}`, {
+            method: 'POST',
+            body: file,
+            headers: {
+                'X-File-Name': encodeURIComponent(file.name),
+                'X-File-Type': file.type || 'application/octet-stream'
+            }
+        })
+        if (!res.ok) throw new Error(`Relay error: ${res.statusText}`)
+        console.log(`✅ Relay Stream Complete: ${relayId}`)
+    }
+
+    async function uploadToLanWT(file: File, server: LanServerInfo): Promise<string | null> {
+        const url = `https://${server.ip}:${server.h3Port}/wt`
+        const hashBytes = Uint8Array.from(atob(server.certHash!), c => c.charCodeAt(0))
+        const wt = new WebTransport(url, {
+            serverCertificateHashes: [{ algorithm: 'sha-256', value: hashBytes.buffer }]
+        })
+        await wt.ready
+        const stream = await wt.createBidirectionalStream()
+        const writer = stream.writable.getWriter()
+        const reader = stream.readable.getReader()
+
+        const cmd = JSON.stringify({ action: 'upload', name: file.name, size: file.size }) + '\n'
+        await writer.write(new TextEncoder().encode(cmd))
+        await writer.write(new Uint8Array(await file.arrayBuffer()))
+        await writer.close()
+
+        const { value } = await reader.read()
+        wt.close()
+        if (value) {
+            const resp = JSON.parse(new TextDecoder().decode(value))
+            if (resp.status === 'ok') return resp.file.id
+        }
+        return null
+    }
+
+    async function uploadToLanHTTP(file: File, server: LanServerInfo): Promise<string | null> {
+        const formData = new FormData()
+        formData.append('file', file)
+        const res = await fetch(`http://${server.ip}:${server.httpPort}/api/lan/upload`, {
+            method: 'POST', body: formData
+        })
+        if (res.ok) {
+            const data = await res.json()
+            return data.id
+        }
+        return null
+    }
+
+    // --- WebTransport LAN Helpers (bypass Mixed Content) ---
+    function getActiveLanServer(): LanServerInfo | null {
+        return Array.from(lanServers.value.values())[0] || null
+    }
+
+    async function createLanWT(server: LanServerInfo): Promise<any> {
+        const url = `https://${server.ip}:${server.h3Port}/wt`
+        const hashBytes = Uint8Array.from(atob(server.certHash!), c => c.charCodeAt(0))
+        const wt = new WebTransport(url, {
+            serverCertificateHashes: [{ algorithm: 'sha-256', value: hashBytes.buffer }]
+        })
+        await wt.ready
+        return wt
+    }
+
+    // List files via VPS signaling relay (Web -> VPS -> Desktop -> VPS -> Web)
+    // Falls back from WebTransport since direct WT to desktop has cert issues
+    const _lanListResolvers: Array<(files: any[]) => void> = []
+
+    async function listLanFilesWT(): Promise<any[]> {
+        if (!lanServerUrl.value) return []
+
+        return new Promise<any[]>((resolve) => {
+            // Set timeout in case desktop doesn't respond
+            const timeout = setTimeout(() => resolve([]), 5000)
+
+            _lanListResolvers.push((files: any[]) => {
+                clearTimeout(timeout)
+                resolve(files)
+            })
+
+            // Request file list via VPS signaling
+            sendMessage({ type: 'lan_list_request', payload: {} })
+        })
+    }
+
+    function handleLanListResponse(files: any[]): boolean {
+        // Resolve all pending list requests
+        if (_lanListResolvers.length > 0) {
+            while (_lanListResolvers.length > 0) {
+                const resolver = _lanListResolvers.shift()
+                if (resolver) resolver(files)
+            }
+            return true
+        }
+        return false
+    }
+
+    // Upload file via WebTransport
+    async function uploadLanFileWT(file: File): Promise<any> {
+        const server = getActiveLanServer()
+        if (!server?.h3Port || !server?.certHash) throw new Error('No LAN server')
+
+        const wt = await createLanWT(server)
+        const stream = await wt.createBidirectionalStream()
+        const writer = stream.writable.getWriter()
+        const reader = stream.readable.getReader()
+
+        const cmd = JSON.stringify({ action: 'upload', name: file.name, size: file.size }) + '\n'
+        await writer.write(new TextEncoder().encode(cmd))
+        await writer.write(new Uint8Array(await file.arrayBuffer()))
+        await writer.close()
+
+        const { value } = await reader.read()
+        wt.close()
+        if (value) {
+            const resp = JSON.parse(new TextDecoder().decode(value))
+            if (resp.status === 'ok') return resp.file
+        }
+        throw new Error('Upload failed')
+    }
+
+    // Download file via WebTransport
+    async function downloadLanFileWT(fileId: string, fileName: string): Promise<boolean> {
+        const server = getActiveLanServer()
+        if (!server?.h3Port || !server?.certHash) return false
+
+        try {
+            const wt = await createLanWT(server)
+            const stream = await wt.createBidirectionalStream()
+            const writer = stream.writable.getWriter()
+            const reader = stream.readable.getReader()
+
+            await writer.write(new TextEncoder().encode(
+                JSON.stringify({ action: 'download', fileId }) + '\n'
+            ))
+            await writer.close()
+
+            const chunks: Uint8Array[] = []
+            let metaReceived = false
+            let name = fileName
+
+            while (true) {
+                const { value, done } = await reader.read()
+                if (done) break
+                if (!metaReceived) {
+                    const text = new TextDecoder().decode(value)
+                    const nlIdx = text.indexOf('\n')
+                    if (nlIdx >= 0) {
+                        const meta = JSON.parse(text.substring(0, nlIdx))
+                        if (meta.error) { wt.close(); return false }
+                        name = meta.name || name
+                        const rest = value.slice(new TextEncoder().encode(text.substring(0, nlIdx + 1)).length)
+                        if (rest.length > 0) chunks.push(rest)
+                    } else {
+                        try {
+                            const meta = JSON.parse(text)
+                            if (meta.error) { wt.close(); return false }
+                            name = meta.name || name
+                        } catch { chunks.push(value) }
+                    }
+                    metaReceived = true
+                } else {
+                    chunks.push(value)
+                }
+            }
+            wt.close()
+
+            const blob = new Blob(chunks as BlobPart[])
+            const a = document.createElement('a')
+            a.href = URL.createObjectURL(blob)
+            a.download = name
+            a.click()
+            URL.revokeObjectURL(a.href)
+            return true
+        } catch (e) {
+            console.error('WT download failed', e)
+            return false
+        }
+    }
+
     // Phase 2: Smart Send (LAN WebTransport -> HTTP -> P2P -> VPS)
     async function smartSendFile(file: File) {
         // Find active LAN server with full info
@@ -851,16 +1120,49 @@ export const useConnectionStore = defineStore('connection', () => {
                     }
                     break
 
-                // --- P2P Smart Send Support ---
-                case 'lan_file_shared':
-                    // Treat it like a file offer, but mark it as LAN
-                    if (onP2PEvent.value) {
-                        onP2PEvent.value('offer', {
+                // --- LAN Lazy File Sharing ---
+                case 'lan_file_offer':
+                    // Someone shared file metadata (file not uploaded yet)
+                    if (onLanEvent.value) {
+                        onLanEvent.value('lan_offer', {
                             ...msg.payload,
                             isLan: true,
-                            // specific download URL construction handled by UI or store helper?
-                            // For simplicity, let's keep it in UI for now
+                            status: 'pending' // not yet on desktop
                         })
+                    }
+                    break
+
+                case 'lan_file_request':
+                    // Someone wants our file - upload to desktop on demand
+                    handleLanFileRequest(msg.payload.id)
+                    break
+
+                case 'lan_file_ready':
+                    console.log('LAN File Ready:', msg.payload)
+                    // File has been uploaded to desktop, ready to download
+                    if (onLanEvent.value) {
+                        onLanEvent.value('lan_ready', msg.payload)
+                    }
+                    break
+
+                case 'lan_file_shared':
+                    // Legacy: direct upload to desktop (already on server)
+                    if (onLanEvent.value) {
+                        onLanEvent.value('lan_offer', {
+                            ...msg.payload,
+                            isLan: true,
+                            status: 'ready'
+                        })
+                    }
+                    break
+
+                case 'lan_list_response':
+                    // Desktop responded with file list
+                    if (handleLanListResponse(msg.payload?.files || [])) {
+                        // already handled by promise
+                    } else if (onLanEvent.value) {
+                        // fallback event
+                        onLanEvent.value('lan_list', msg.payload?.files || [])
                     }
                     break
             }
@@ -886,8 +1188,11 @@ export const useConnectionStore = defineStore('connection', () => {
         onClipboardDelete, // Export new callback
         onNotepadEvent,
         onP2PEvent,
+        onLanEvent, // Export
         shareFile,
         requestFile,
+        shareLanFile,
+        requestLanFile,
         HTTP_URL,
         disconnect: closeConnection,
         lanServers, // Export
@@ -899,5 +1204,10 @@ export const useConnectionStore = defineStore('connection', () => {
             }
         },
         smartSendFile, // Export
+        // WebTransport LAN operations (bypass Mixed Content)
+        listLanFilesWT,
+        uploadLanFileWT,
+        downloadLanFileWT,
+        getActiveLanServer,
     }
 })

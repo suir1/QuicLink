@@ -30,6 +30,10 @@ export function GetDownloadDir() {
   return window['go']['main']['App']['GetDownloadDir']();
 }
 
+export function GetLocalServerPort() {
+  return window['go']['main']['App']['GetLocalServerPort']();
+}
+
 export function GetP2PStatus() {
   return window['go']['main']['App']['GetP2PStatus']();
 }

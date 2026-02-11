@@ -1,13 +1,11 @@
 <script setup lang="ts">
-import { Cloudy, Delete, Download, Folder, FolderOpened, Monitor, UploadFilled } from '@element-plus/icons-vue'
+import { Cloudy, Delete, Download, Folder, FolderOpened, Monitor, Share, Upload, UploadFilled } from '@element-plus/icons-vue'
 import { ElMessage, type UploadProps } from 'element-plus'
 import { computed, onMounted, ref, watch } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 
 const conn = useConnectionStore()
-const activeTab = ref('cloud')
-const folderOpenedIcon = FolderOpened
-const folderIcon = Folder
+const activeTab = ref('lan')
 const downloadDir = ref('')
 
 const fetchDownloadDir = async () => {
@@ -58,17 +56,28 @@ const fetchCloudFiles = async () => {
 }
 
 // --- LAN Drive Logic ---
-const lanFileList = ref<any[]>([])
-const lanUploadUrl = computed(() => `${conn.lanServerUrl}/api/lan/upload`)
+interface LanSharedFile {
+    id: string
+    name: string
+    size: number
+    status: 'pending' | 'uploading' | 'ready'  // pending=还在发送者 uploading=上传中 ready=在桌面端
+    lanFileId?: string    // File ID on desktop server (when ready)
+    ip?: string
+    httpPort?: number
+    h3Port?: number
+    certHash?: string
+    isRelay?: boolean // Phase 9: Relay Flag
+    source: 'local' | 'remote'  // local=我共享的 remote=别人共享的
+}
 
+const lanFileList = ref<any[]>([])                    // Files already on desktop's LAN server
+const sharedFiles = ref<Map<string, LanSharedFile>>(new Map())  // Lazy shared files
 const isLanAvailable = computed(() => !!conn.lanServerUrl)
-const isLanTrusted = ref(false)
 
 const lanServerList = computed(() => Array.from(conn.lanServers.values()))
 const currentHostId = computed({
     get: () => {
         for (const s of conn.lanServers.values()) {
-            // 比较通过 ip 和 httpPort 构建的 URL
             const serverUrl = `http://${s.ip}:${s.httpPort}`
             if (serverUrl === conn.lanServerUrl) return s.id
         }
@@ -77,30 +86,164 @@ const currentHostId = computed({
     set: (val) => conn.switchLanHost(val)
 })
 
-// Fetch LAN files
+// Fetch files from desktop via WebTransport (bypasses Mixed Content)
 const fetchLanFiles = async () => {
     if (!conn.lanServerUrl) return
     try {
-        const res = await fetch(`${conn.lanServerUrl}/api/lan/files`)
-        if (res.ok) {
-            lanFileList.value = await res.json()
-            isLanTrusted.value = true
-        }
+        lanFileList.value = await conn.listLanFilesWT()
     } catch (e) {
         console.error("Failed to fetch LAN files", e)
-        isLanTrusted.value = false
     }
 }
 
-const checkTrustDelayed = () => {
-    setTimeout(fetchLanFiles, 3000)
-    setTimeout(fetchLanFiles, 8000)
+// --- Lazy Share: Add file to shared list (metadata only) ---
+const shareFileInput = ref<HTMLInputElement | null>(null)
+
+const triggerShareFile = () => {
+    shareFileInput.value?.click()
+}
+
+const onShareFileSelected = (e: Event) => {
+    const input = e.target as HTMLInputElement
+    if (!input.files) return
+    for (const file of input.files) {
+        conn.shareLanFile(file)
+        // Also add to local shared list for display
+        const fileId = `lan-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+        sharedFiles.value.set(fileId, {
+            id: fileId,
+            name: file.name,
+            size: file.size,
+            status: 'pending',
+            source: 'local'
+        })
+    }
+    input.value = '' // reset
+}
+
+// --- Handle P2P events for lazy sharing ---
+// --- Handle LAN events for lazy sharing ---
+const handleLanEvent = (type: string, data: any) => {
+    if (type === 'lan_offer') {
+        const file: LanSharedFile = {
+            id: data.id,
+            name: data.name,
+            size: data.size,
+            status: data.status || 'pending',
+            source: 'remote',
+            ip: data.ip,
+            httpPort: data.httpPort,
+            lanFileId: data.lanFileId,
+            isRelay: data.isRelay
+        }
+        sharedFiles.value.set(data.id, file)
+    } else if (type === 'lan_ready') {
+        const existing = sharedFiles.value.get(data.originalId)
+        if (existing) {
+            existing.status = 'ready'
+            existing.lanFileId = data.lanFileId
+            existing.ip = data.ip
+            existing.httpPort = data.httpPort
+            existing.h3Port = data.h3Port
+            existing.certHash = data.certHash
+            existing.isRelay = data.isRelay
+        }
+        ElMessage.success(`📥 ${data.name} 已就绪，可下载`)
+        fetchLanFiles()
+    } else if (type === 'lan_list') {
+        lanFileList.value = data
+    }
+}
+
+// --- Download logic ---
+const downloadingFiles = ref<Set<string>>(new Set())
+
+// --- Robust Download (WT -> HTTP Fallback) ---
+const downloadLanFile = async (lanFileId: string, name: string, ip?: string, httpPort?: number, isRelay?: boolean) => {
+    // Phase 9: Relay Download (Direct HTTP Stream)
+    if (isRelay) {
+        const server = conn.getActiveLanServer()
+        const targetIp = ip || server?.ip
+        const targetPort = httpPort || server?.httpPort
+
+        if (targetIp && targetPort) {
+            window.open(`http://${targetIp}:${targetPort}/api/lan/relay/download/${lanFileId}`, '_blank')
+            ElMessage.success(`📥 ${name} 开始中转下载 (无硬盘)`)
+        } else {
+            ElMessage.error('无法获取中转地址')
+        }
+        return
+    }
+
+    // 1. Try WebTransport first
+    try {
+        const ok = await conn.downloadLanFileWT(lanFileId, name)
+        if (ok) {
+            ElMessage.success(`📥 ${name} 下载完成 (WT)`)
+            return
+        }
+    } catch (e) {
+        console.warn('WT download failed, falling back to HTTP', e)
+    }
+
+    // 2. Fallback to HTTP (works for Mixed Content via new tab/window)
+    const server = conn.getActiveLanServer()
+    const targetIp = ip || server?.ip
+    const targetPort = httpPort || server?.httpPort
+
+    if (targetIp && targetPort) {
+        window.open(`http://${targetIp}:${targetPort}/api/lan/download/${lanFileId}`, '_blank')
+        ElMessage.success(`📥 ${name} 开始下载 (HTTP)`)
+    } else {
+        ElMessage.error('无法获取下载地址')
+    }
+}
+
+const requestDownload = async (file: LanSharedFile) => {
+    if (file.status === 'ready' && file.lanFileId) {
+        downloadingFiles.value.add(file.id)
+        await downloadLanFile(file.lanFileId, file.name, file.ip, file.httpPort, file.isRelay)
+        downloadingFiles.value.delete(file.id)
+    } else if (file.status === 'pending' && file.source === 'remote') {
+        downloadingFiles.value.add(file.id)
+        file.status = 'uploading'
+        conn.requestLanFile(file.id)
+        ElMessage.info(`⏳ 正在请求 ${file.name}，等待上传到主机...`)
+    }
+}
+
+const openLanDownload = async (file: any) => {
+    downloadingFiles.value.add(file.id)
+    await downloadLanFile(file.id, file.name)
+    downloadingFiles.value.delete(file.id)
+}
+
+// Upload directly to desktop via WebTransport
+const directUploadInput = ref<HTMLInputElement | null>(null)
+
+const triggerDirectUpload = () => {
+    directUploadInput.value?.click()
+}
+
+const onDirectUploadSelected = async (e: Event) => {
+    const input = e.target as HTMLInputElement
+    if (!input.files) return
+    for (const file of input.files) {
+        try {
+            await conn.uploadLanFileWT(file)
+            ElMessage.success(`⚡ ${file.name} 已上传到主机`)
+            fetchLanFiles()
+        } catch (err) {
+            ElMessage.error(`上传失败: ${file.name}`)
+        }
+    }
+    input.value = ''
 }
 
 // Watch for LAN server discovery
 watch(() => conn.lanServerUrl, (newUrl) => {
     if (newUrl) {
-        activeTab.value = 'lan' // Auto switch to LAN if discovered
+        activeTab.value = 'lan'
         fetchLanFiles()
     }
 })
@@ -110,17 +253,24 @@ watch(activeTab, (val) => {
     if (val === 'lan') fetchLanFiles()
 })
 
-const handleLanSuccess: UploadProps['onSuccess'] = (response, uploadFile) => {
-    ElMessage.success('LAN 上传成功')
-    fetchLanFiles() // Refresh list
-}
-
-// Initial fetch if already connected
+// Register event handler
 onMounted(() => {
     fetchCloudFiles()
     if (conn.lanServerUrl) fetchLanFiles()
     if (conn.isDesktop) fetchDownloadDir()
+
+    // Listen for LAN events
+    // Listen for LAN events
+    conn.onLanEvent = handleLanEvent
 })
+
+// Shared files list (remote only)
+const remoteSharedFiles = computed(() =>
+    Array.from(sharedFiles.value.values()).filter(f => f.source === 'remote')
+)
+const localSharedFiles = computed(() =>
+    Array.from(sharedFiles.value.values()).filter(f => f.source === 'local')
+)
 
 // Format helpers
 const formatSize = (bytes: number) => {
@@ -131,17 +281,30 @@ const formatSize = (bytes: number) => {
     return (bytes / Math.pow(k, i)).toPrecision(3) + ' ' + sizes[i]
 }
 
-const openLanDownload = (file: any) => {
-    window.open(`${conn.lanServerUrl}/api/lan/download/${file.id}`, '_blank')
-}
-
 const openDownloadFolder = () => {
-    // Call Backend
     const w = window as any
     if (w.go && w.go.main && w.go.main.App) {
         w.go.main.App.OpenDownloadDir()
     } else {
         ElMessage.warning('仅桌面端支持打开文件夹')
+    }
+}
+
+const statusLabel = (status: string) => {
+    switch (status) {
+        case 'pending': return '等待下载'
+        case 'uploading': return '上传中...'
+        case 'ready': return '可下载'
+        default: return status
+    }
+}
+
+const statusType = (status: string) => {
+    switch (status) {
+        case 'pending': return 'info'
+        case 'uploading': return 'warning'
+        case 'ready': return 'success'
+        default: return 'info'
     }
 }
 </script>
@@ -198,7 +361,6 @@ const openDownloadFolder = () => {
                         <a :href="file.url" target="_blank">
                             <el-button circle :icon="Download" size="small" type="success" plain />
                         </a>
-                        <!-- Delete not implemented on backend yet, so just visual remove -->
                         <el-button circle :icon="Delete" size="small" type="danger" plain @click="cloudFileList.splice(cloudFileList.indexOf(file), 1)"/>
                     </div>
                 </div>
@@ -207,67 +369,88 @@ const openDownloadFolder = () => {
 
         <!-- LAN Drive View -->
         <div v-if="activeTab === 'lan'" class="pane-content">
+            <!-- Offline State -->
             <div v-if="!isLanAvailable" class="lan-offline">
                 <el-empty description="未发现局域网主机 (Desktop)">
                     <p class="sub-tip">请确保电脑端 QuicLink 已启动并在同一 WiFi 下</p>
                 </el-empty>
             </div>
 
-            <div v-else-if="!isLanTrusted" class="lan-trust">
-                 <el-result icon="warning" title="安全证书校验" sub-title="局域网 HTTPS 需要您手动信任证书">
-                    <template #extra>
-                        <a :href="conn.lanServerUrl + '/api/lan/files'" target="_blank" style="text-decoration: none;">
-                            <el-button type="primary" @click="checkTrustDelayed">点击前往信任证书</el-button>
-                        </a>
-                        <div style="margin-top: 10px; font-size: 12px; color: #999;">
-                            (在新标签页点击 "高级 -> 继续访问")
-                        </div>
-                    </template>
-                 </el-result>
-            </div>
-
-            <div v-else>
+            <!-- LAN Connected -->
+            <div v-if="isLanAvailable" class="lan-connected">
                  <!-- Multi-Host Selector -->
                  <div v-if="lanServerList.length > 1" class="host-select-bar">
                     <span class="label">当前主机:</span>
                     <el-select v-model="currentHostId" size="small" style="width: 160px">
-                        <el-option
-                            v-for="host in lanServerList"
-                            :key="host.id"
-                            :label="host.name"
-                            :value="host.id"
-                        />
+                        <el-option v-for="host in lanServerList" :key="host.id" :label="host.name" :value="host.id" />
                     </el-select>
                  </div>
 
-                 <div class="upload-area">
-                    <el-upload
-                        class="upload-demo"
-                        drag
-                        :action="lanUploadUrl"
-                        multiple
-                        :show-file-list="false"
-                        :on-success="handleLanSuccess"
-                    >
-                        <el-icon class="el-icon--upload"><upload-filled /></el-icon>
-                        <div class="el-upload__text">
-                            极速上传到主机 (LAN)
-                        </div>
-                    </el-upload>
-                </div>
+                 <!-- Action Buttons Row -->
+                 <div class="action-row">
+                    <el-button type="primary" :icon="Upload" @click="triggerShareFile" plain>
+                        共享文件到列表
+                    </el-button>
+                    <el-button type="success" :icon="Upload" plain @click="triggerDirectUpload">
+                        直接上传到主机
+                    </el-button>
+                    <input ref="directUploadInput" type="file" multiple hidden @change="onDirectUploadSelected" />
+                    <input ref="shareFileInput" type="file" multiple hidden @change="onShareFileSelected" />
+                 </div>
 
-                <div class="file-list-container">
-                    <div class="list-header">
-                        <span>主机文件列表 ({{ conn.hostIp || 'LAN' }})</span>
-                        <div class="header-actions">
-                             <div class="path-display" v-if="conn.isDesktop && downloadDir">
-                                <span class="path-text" :title="downloadDir">保存至: {{ downloadDir }}</span>
-                                <el-button link type="primary" size="small" @click="changeDownloadDir">修改</el-button>
-                             </div>
-                             <el-button size="small" link @click="fetchLanFiles">刷新</el-button>
+                 <!-- Section: Shared Files (lazy, not yet uploaded) -->
+                 <div v-if="remoteSharedFiles.length > 0 || localSharedFiles.length > 0" class="lan-section">
+                    <div class="section-title">
+                        <el-icon><Share /></el-icon>
+                        <span>共享列表 (点击下载)</span>
+                    </div>
+
+                    <!-- My shared files -->
+                    <div v-for="file in localSharedFiles" :key="file.id" class="file-item shared-item">
+                        <div class="file-info-col">
+                            <div class="fname-row">
+                                <span class="fname">{{ file.name }}</span>
+                                <el-tag size="small" type="info" round>我共享的</el-tag>
+                                <el-tag size="small" :type="statusType(file.status)" round>{{ statusLabel(file.status) }}</el-tag>
+                            </div>
+                            <span class="fsize">{{ formatSize(file.size) }}</span>
                         </div>
                     </div>
-                    <div v-if="lanFileList.length === 0" class="empty-tip">主机暂无共享文件</div>
+
+                    <!-- Others' shared files -->
+                    <div v-for="file in remoteSharedFiles" :key="file.id" class="file-item shared-item">
+                        <div class="file-info-col">
+                            <div class="fname-row">
+                                <span class="fname">{{ file.name }}</span>
+                                <el-tag size="small" :type="statusType(file.status)" round>{{ statusLabel(file.status) }}</el-tag>
+                            </div>
+                            <span class="fsize">{{ formatSize(file.size) }}</span>
+                        </div>
+                        <div class="factions">
+                            <el-button
+                                circle
+                                :icon="Download"
+                                size="small"
+                                type="primary"
+                                plain
+                                :loading="downloadingFiles.has(file.id)"
+                                :disabled="file.status === 'uploading'"
+                                @click="requestDownload(file)"
+                                :title="file.status === 'ready' ? '从主机下载' : '请求下载 (通过主机中转)'"
+                            />
+                        </div>
+                    </div>
+                 </div>
+
+                 <!-- Section: Desktop Server Files -->
+                 <div class="lan-section">
+                    <div class="section-title">
+                        <el-icon><Folder /></el-icon>
+                        <span>主机文件</span>
+                        <el-button size="small" link @click="fetchLanFiles" style="margin-left: auto;">刷新</el-button>
+                    </div>
+
+                    <div v-if="lanFileList.length === 0" class="empty-tip">主机暂无文件</div>
                     <div v-for="file in lanFileList" :key="file.id" class="file-item">
                         <div class="file-info-col">
                             <span class="fname">{{ file.name }}</span>
@@ -277,7 +460,13 @@ const openDownloadFolder = () => {
                             <el-button circle :icon="Download" size="small" type="primary" plain @click="openLanDownload(file)" />
                         </div>
                     </div>
-                </div>
+                 </div>
+
+                 <!-- Desktop path config -->
+                 <div v-if="conn.isDesktop && downloadDir" class="path-bar">
+                    <span class="path-text" :title="downloadDir">📂 {{ downloadDir }}</span>
+                    <el-button link type="primary" size="small" @click="changeDownloadDir">修改</el-button>
+                 </div>
             </div>
         </div>
     </div>
@@ -287,10 +476,9 @@ const openDownloadFolder = () => {
 <style scoped>
 .file-card {
     height: 100%;
-    border: none; /* Let container handle borders */
+    border: none;
 }
 
-/* Custom Tabs in Header */
 .card-header {
     width: 100%;
     display: flex;
@@ -298,20 +486,10 @@ const openDownloadFolder = () => {
     align-items: center;
     padding-right: 15px;
 }
-.file-tabs :deep(.el-tabs__header) {
-    margin: 0;
-}
-.file-tabs :deep(.el-tabs__nav-wrap::after) {
-    display: none;
-}
-.tab-label {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-}
-.lan-tag {
-    transform: scale(0.8);
-}
+.file-tabs :deep(.el-tabs__header) { margin: 0; }
+.file-tabs :deep(.el-tabs__nav-wrap::after) { display: none; }
+.tab-label { display: flex; align-items: center; gap: 6px; }
+.lan-tag { transform: scale(0.8); }
 
 .tab-content {
     flex: 1;
@@ -328,13 +506,8 @@ const openDownloadFolder = () => {
     overflow-y: auto;
 }
 
-.upload-area {
-    margin-bottom: 20px;
-}
-
-.file-list-container {
-    flex: 1;
-}
+.upload-area { margin-bottom: 20px; }
+.file-list-container { flex: 1; }
 
 .file-item {
     display: flex;
@@ -347,36 +520,20 @@ const openDownloadFolder = () => {
     border-radius: 4px;
 }
 
-.file-info-col {
-    display: flex;
-    flex-direction: column;
+.shared-item {
+    border-left: 3px solid var(--el-color-primary-light-3);
 }
 
-.fname {
-    font-size: 14px;
-    font-weight: 500;
-    color: var(--el-text-color-primary);
-}
-
-.fsize {
-    font-size: 12px;
-    color: var(--el-text-color-secondary);
-}
+.file-info-col { display: flex; flex-direction: column; gap: 2px; }
+.fname-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.fname { font-size: 14px; font-weight: 500; color: var(--el-text-color-primary); }
+.fsize { font-size: 12px; color: var(--el-text-color-secondary); }
 
 .empty-tip {
     text-align: center;
     color: var(--el-text-color-placeholder);
     padding: 20px;
     font-size: 13px;
-}
-
-.list-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 10px;
-    font-size: 12px;
-    color: var(--el-text-color-secondary);
 }
 
 .lan-offline {
@@ -401,23 +558,50 @@ const openDownloadFolder = () => {
     font-size: 13px;
     color: var(--el-text-color-regular);
 }
-.header-actions {
+
+/* LAN layout */
+.lan-connected {
     display: flex;
-    align-items: center;
-    gap: 10px;
+    flex-direction: column;
+    gap: 14px;
+    height: 100%;
 }
-.path-display {
+
+.action-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+.lan-section {
+    background: var(--el-bg-color-overlay);
+    border: 1px solid var(--el-border-color-light);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+.section-title {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--el-text-color-regular);
+    margin-bottom: 10px;
+}
+
+.path-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     font-size: 12px;
     color: var(--el-text-color-secondary);
     background: var(--el-fill-color-light);
-    padding: 2px 8px;
-    border-radius: 4px;
+    padding: 6px 10px;
+    border-radius: 6px;
 }
 .path-text {
-    max-width: 150px;
+    max-width: 250px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
