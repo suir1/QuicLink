@@ -1,111 +1,104 @@
-# QuicLink 1.0.0
+# QuicLink 1.0.1
 
-QuicLink is a room-based sync and transfer system for **Web + Desktop**.
-It combines signaling, LAN acceleration, WebRTC, and VPS relay to maximize transfer success across mixed networks.
+QuicLink 是一个面向 **Web + Desktop** 的房间式同步与传输系统，目标是让“同局域网更快、跨网络也能成功”。
 
-Current scope:
-- Clipboard sync
-- Notepad sync
-- File transfer (LAN / P2P / VPS relay / cloud)
+核心能力：
+- 剪切板同步
+- 记事板同步
+- 文件传输（LAN 直连/中转、WebRTC、VPS Relay、云端临时存储）
 
----
+## 当前架构（Mode 1 ~ Mode 4）
 
-## Key Concepts
+| Mode | 数据通道 | 适用场景 | 当前状态 |
+| --- | --- | --- | --- |
+| Mode 1: Desktop LAN Server | HTTP / HTTP3(WebTransport) + Go 原生通道 | 同一局域网，桌面端在线 | 已实现（主路径） |
+| Mode 2: WebRTC P2P | WebRTC DataChannel | 无 LAN 主机或 LAN 握手失败 | 已实现（自动降级） |
+| Mode 3: VPS Relay | `/api/relay/*` | P2P 不可达、跨网兜底 | 已实现（含 meta/ack） |
+| Mode 4: Netdisk/Cloud | `/upload` + `/api/files` | 临时落盘分享/异步下载 | 已实现（基础版） |
 
-### Two file panels with different semantics
+## 两个文件面板的职责
 
-- `FilePanel`
-  - Shared list + persistent storage workflow.
-  - LAN host can store files on disk.
-- `P2PFilePanel`
-  - Relay-first workflow.
-  - Designed for transient transfer and fallback chain.
+### `FilePanel`
+- 目标：共享列表 + 主机可落盘（适合“文件管理/留存”）
+- Web 端支持“懒共享”：先广播元数据，不立即上传。
+- 当接收方点击下载后，才触发发送方向 LAN 主机发起 relay 上传。
+- 对 relay 文件会发出 `lan_consumed`，用于消费后从共享列表清理。
+- 同时保留“直接上传到主机”入口（显式落盘）。
 
-### 4 transfer modes
+### `P2PFilePanel`
+- 目标：即时中转，不做长期存储（适合“快发快收”）
+- 优先走 LAN relay；失败自动切 WebRTC；再失败切 VPS relay。
+- 列表项会跟踪 `relayStatus`（`pending/requesting/ready`）。
 
-1. Desktop LAN server (HTTP / WebTransport)
-2. Browser P2P (WebRTC DataChannel)
-3. VPS relay (`/api/relay/*`)
-4. Cloud storage upload/download (`/upload`, `/api/files`)
+## 当前传输策略（代码已落地）
 
----
+### 1) Web 下载策略
 
-## Transport Strategy (Implemented)
+Web 有两个下载模式：
+- `compat`（默认）
+- `speed`
 
-### Upload / relay (high-level)
+`compat`（兼容优先）：
+1. 优先 URL 交给浏览器下载器接管（可进入浏览器下载列表）
+2. LAN URL 顺序：`HTTPS URL` -> `HTTP URL`
+3. 若 URL 不可用，则本次下载直接报错（不强制切 WT）
 
-- Desktop native path (preferred when available):
-  - Go native LAN relay (`StartNativeRelayUpload`)
-  - fallback to VPS native relay (`UploadVpsRelayFile`)
-- Web path:
-  - LAN WT relay -> WebRTC -> VPS relay fallback
+`speed`（速度优先）：
+1. 优先 WT(JS) 流式下载（LAN WT direct/relay）
+2. 失败后回退 URL（HTTPS -> HTTP）
 
-### Download (web)
+说明：不同浏览器/内嵌 WebView 对 WT、下载器接管、证书策略支持不一致，因此保留双模式。
 
-Web has two download modes:
-- `compat` (default): URL handoff first (browser download manager)
-- `speed`: WT(JS) first, then URL fallback
+### 2) `P2PFilePanel` 发送链路
 
-For LAN URL handoff in `compat` mode:
-- HTTPS URL first
-- HTTP URL second
+优先级：
+1. LAN Relay（WT relay 优先，失败回 HTTP relay）
+2. WebRTC
+3. VPS Relay
 
-### Download (desktop)
+即：**LAN relay 超时/握手失败后会自动切 WebRTC，再切 VPS relay**。
 
-- Go native LAN relay download first
-- WT relay fallback
-- HTTP URL fallback
+### 3) 桌面端（Desktop）传输链路
 
----
+- 桌面端优先使用 Go 原生数据面（减少 JS/WebView 限制）。
+- LAN relay 上传：`StartNativeRelayUpload`（Go 原生）
+- VPS relay 上传：`UploadVpsRelayFile`（返回 `uploadVia`）
+- LAN relay 下载：`DownloadLanRelayFile`（Go 原生）
+- 桌面端诊断栏显示 `path/route/uploadVia/speed/progress`。
 
-## Repository Layout
+## 关键接口
 
-- `src/server` - Go signaling + API server (HTTP/3 + WS + relay APIs)
-- `src/web` - Vue 3 + TypeScript web client
-- `src/desktop` - Wails desktop app (Go backend + Vue frontend)
+### 信令与基础
+- `GET /ws`（WebSocket）
+- `CONNECT /wt`（WebTransport，HTTPS 模式）
+- `POST /upload`
+- `GET /api/files`
+- `GET /api/info`
 
----
+### VPS Relay
+- `POST /api/relay/upload/:id`
+- `GET /api/relay/meta/:id`
+- `GET /api/relay/download/:id`
+- `POST /api/relay/ack/:id`
 
-## Quick Start (Local)
+`/api/relay/meta/:id` 作用：
+- 下载前探测 relay 是否可用（`ready/not_found/expired/missing`）
+- 返回剩余有效期（`remainingSeconds`）
+- 返回大小、下载次数、ack 次数，便于前端做重试与提示
 
-## 1) Start server
+### Desktop LAN Server（本地）
+- `GET /api/lan/files`
+- `POST /api/lan/upload`
+- `GET /api/lan/download/:id`
+- `POST /api/lan/relay/upload/:id`
+- `GET /api/lan/relay/download/:id`
+- `CONNECT /wt`（LAN WebTransport）
 
-```bash
-cd src/server
-go run .
-```
+## 配置
 
-Default behavior:
-- Reads `config.json` in `src/server`
-- If `use_https=true` and cert files are missing, self-signed certs are generated automatically
+服务端配置文件：`/Users/sui/Code/projects/QuicLink/src/server/config.json`
 
-## 2) Start web client (dev)
-
-```bash
-cd src/web
-npm install
-npm run dev
-```
-
-## 3) Start desktop client (dev)
-
-```bash
-cd src/desktop
-wails dev
-```
-
-Prerequisites:
-- Go 1.24+
-- Node.js 18+
-- Wails v2
-
----
-
-## Server Config
-
-Path: `src/server/config.json`
-
-Example:
+示例：
 
 ```json
 {
@@ -125,18 +118,14 @@ Example:
 }
 ```
 
-Notes:
-- `app_mode=private` requires `admin_password`
-- `limits.max_upload_size_mb` affects relay/cloud limits
-- `limits.file_retention_minutes` controls relay TTL
+关键项说明：
+- `use_https`: 开启后启用 HTTP/3 + WebTransport（并对外提供证书 hash）
+- `force_cert_hash`: 自签证书场景下用于 WT certificate hash 校验
+- `limits.max_upload_size_mb`: 限制云端/VPS relay 上传大小
+- `limits.file_retention_minutes`: relay 文件有效期
+- `app_mode=private`: 需要 `admin_password`
 
----
-
-## Web Environment
-
-Path: `src/web/.env`
-
-Example keys:
+Web 环境变量：`/Users/sui/Code/projects/QuicLink/src/web/.env`
 
 ```env
 VITE_VPS_HOST=localhost:3100
@@ -146,69 +135,87 @@ VITE_TURN_CREDENTIAL=
 VITE_ICE_SERVERS=
 ```
 
----
+## 本地开发
 
-## Relay APIs
+前置：
+- Go 1.24+
+- Node.js 18+
+- Wails v2
 
-Server endpoints:
-
-- `POST /api/relay/upload/:id`
-- `GET  /api/relay/meta/:id`
-- `GET  /api/relay/download/:id`
-- `POST /api/relay/ack/:id`
-
-Typical use:
-- upload -> broadcast offer -> receiver downloads -> receiver ack
-
----
-
-## Build
-
-### Web
+### 1) 启动服务端
 
 ```bash
-cd src/web
-npm run build
+cd /Users/sui/Code/projects/QuicLink/src/server
+go run .
 ```
 
-### Desktop frontend
+说明：
+- `use_https=true` 且证书不存在时会自动生成自签证书。
+- 服务端静态目录是 `./dist`（生产部署时需把 web 构建产物放到与服务进程工作目录匹配的位置）。
+
+### 2) 启动 Web
 
 ```bash
-cd src/desktop/frontend
-npm run build
+cd /Users/sui/Code/projects/QuicLink/src/web
+npm install
+npm run dev
 ```
 
-### Desktop Go
+### 3) 启动 Desktop
 
 ```bash
-cd src/desktop
-go build ./...
+cd /Users/sui/Code/projects/QuicLink/src/desktop
+wails dev
 ```
 
-### Server
+## 构建与部署
+
+### 构建
 
 ```bash
-cd src/server
-go build .
+cd /Users/sui/Code/projects/QuicLink/src/server && go build .
+cd /Users/sui/Code/projects/QuicLink/src/web && npm run build
+cd /Users/sui/Code/projects/QuicLink/src/desktop && go build ./...
+cd /Users/sui/Code/projects/QuicLink/src/desktop && wails build
 ```
 
----
+### Makefile 常用命令
 
-## Deployment
+```bash
+cd /Users/sui/Code/projects/QuicLink
+make build-server
+make build-web
+make deploy-vps VPS_HOST=<ip>
+make start-vps VPS_HOST=<ip>
+make stop-vps VPS_HOST=<ip>
+```
 
-- `Makefile` includes VPS build/deploy helpers
-- `docker-compose.yml` and `docker-compose.prod.yml` are provided
-- For public WT/HTTP3 usage, TLS and UDP exposure are required
+## 常见问题（当前实现相关）
 
----
+### 1) Mixed Content（HTTPS 页面请求 HTTP LAN）
+- 浏览器会拦截 `https://...` 页面直接 `fetch(http://192.168.x.x...)`
+- 已采用 URL 导航/新窗口接管的降级策略规避
 
-## Operational Notes
+### 2) `QUIC_TLS_CERTIFICATE_UNKNOWN`
+- LAN WT 使用自签证书时，必须提供正确 `certificateHashes`
+- 若浏览器/WebView 不支持该能力，会自动回退 HTTP/WebRTC/VPS relay
 
-- Browser mixed-content restrictions still apply to HTTPS page -> HTTP fetch.
-- URL navigation handoff and QR/open-new-tab flows are used where browser policy blocks fetch.
-- Some embedded webviews do not support WebTransport; fallback paths are required.
+### 3) `webview_no_webtransport`
+- 常见于部分嵌入式 WebView（尤其 Safari/WebKit 容器）
+- 建议使用 `compat` 下载模式或桌面端 Go 原生路径
 
----
+### 4) 速度低于预期
+- 先看诊断栏 `通道/链路/uploadVia/速率/进度`
+- 若显示 `LAN HTTP Relay`，通常受 WebView/浏览器能力限制
+- 大文件更能体现 WT/原生通道优势，小文件容易被握手与调度开销掩盖
+
+## 仓库结构
+
+- `/Users/sui/Code/projects/QuicLink/src/server`：Go 服务端（信令 + API + HTTP/3 + WT）
+- `/Users/sui/Code/projects/QuicLink/src/web`：Vue 3 + TS Web 客户端
+- `/Users/sui/Code/projects/QuicLink/src/desktop`：Wails Desktop（Go + Vue）
+- `/Users/sui/Code/projects/QuicLink/scripts`：部署脚本
+- `/Users/sui/Code/projects/QuicLink/Makefile`：构建与部署快捷命令
 
 ## License
 
