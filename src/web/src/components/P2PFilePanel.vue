@@ -15,6 +15,15 @@ interface P2PFile {
   progress?: number
   isLan?: boolean // Phase 2: LAN Flag
   baseUrl?: string // Phase 5: Multi-Host URL
+  isNetdisk?: boolean
+  netdiskUrl?: string
+  isRelay?: boolean
+  relayStatus?: 'pending' | 'requesting' | 'ready'
+  lanFileId?: string
+  ip?: string
+  httpPort?: number
+  h3Port?: number
+  certHash?: string
 }
 
 const fileList = ref<P2PFile[]>([])
@@ -53,12 +62,13 @@ function processFiles(files: FileList) {
   for (let i = 0; i < files.length; i++) {
     const file = files[i]
     if (!file) continue
-    if (file.size > 10 * 1024 * 1024) {
-      ElMessage.warning(`文件 ${file.name} 过大 (暂限10MB)，建议使用上方文件中转`)
-      continue
-    }
-    // 调用 Store Smart Send
-    conn.smartSendFile(file)
+    if (!file) continue
+    // Limit removed by user request
+    // 调用 Store Relay-Only Send
+    // 调用 Store Relay-Only Send
+    conn.smartRelaySendFile(file).catch((e: any) => {
+      console.error('Relay-only send failed', e)
+    })
     addFileToList({
       id: 'local-' + Date.now(),
       name: file.name,
@@ -78,14 +88,54 @@ function addFileToList(file: P2PFile) {
   }, 100)
 }
 
-function handleDownload(file: P2PFile) {
+async function handleDownload(file: P2PFile) {
   if (file.fromSelf) return
+
+  if (file.isRelay) {
+      if (!file.lanFileId || file.relayStatus !== 'ready') {
+          file.relayStatus = 'requesting'
+          conn.requestP2PRelayFile(file.id)
+          ElMessage.info('已请求发送方启动 LAN 中转，请稍候...')
+          return
+      }
+
+      try {
+          const ok = await conn.downloadLanRelayWT(
+              file.lanFileId,
+              file.name,
+              file.ip,
+              file.h3Port,
+              file.certHash
+          )
+          if (ok) {
+              ElMessage.success(`下载完成: ${file.name} (WT Relay)`)
+              return
+          }
+      } catch (e) {
+          console.warn('WT relay download failed, fallback to HTTP', e)
+      }
+
+      if (file.ip && file.httpPort) {
+          window.open(`http://${file.ip}:${file.httpPort}/api/lan/relay/download/${file.lanFileId}`, '_blank')
+          ElMessage.info(`已切换 HTTP Relay 下载: ${file.name}`)
+          return
+      }
+      ElMessage.error('无法获取中转下载地址')
+      return
+  }
+
+  if (file.isNetdisk && file.netdiskUrl) {
+      window.open(file.netdiskUrl, '_blank')
+      ElMessage.info(`正在云端下载: ${file.name}`)
+      return
+  }
 
   // Phase 2: LAN Download
   if (file.isLan) {
       const baseUrl = file.baseUrl || conn.lanServerUrl
       if (baseUrl) {
           window.open(`${baseUrl}/api/lan/download/${file.id}`, '_blank')
+          ElMessage.info(`正在 LAN 直连下载: ${file.name}`)
           return
       }
   }
@@ -108,8 +158,32 @@ onMounted(() => {
         type: payload.type,
         fromSelf: false,
         isLan: payload.isLan, // Phase 2
-        baseUrl: payload.baseUrl // Phase 5
+        baseUrl: payload.baseUrl, // Phase 5
+        isNetdisk: payload.isNetdisk,
+        netdiskUrl: payload.url,
+        isRelay: payload.isRelay,
+        relayStatus: payload.isRelay ? (payload.status || 'pending') : undefined,
+        lanFileId: payload.lanFileId,
+        ip: payload.ip,
+        httpPort: payload.httpPort,
+        h3Port: payload.h3Port,
+        certHash: payload.certHash
       })
+    } else if (type === 'relay_ready') {
+      const item = fileList.value.find(f => f.id === payload.originalId)
+      if (item) {
+        const autoDownload = item.relayStatus === 'requesting'
+        item.relayStatus = 'ready'
+        item.lanFileId = payload.lanFileId
+        item.ip = payload.ip
+        item.httpPort = payload.httpPort
+        item.h3Port = payload.h3Port
+        item.certHash = payload.certHash
+        if (autoDownload) {
+          void handleDownload(item)
+        }
+      }
+      ElMessage.success(`📥 ${payload.name} 已就绪，可开始下载`)
     } else if (type === 'progress') {
       // payload: { id, received, total }
       const item = fileList.value.find(f => f.id === payload.id)
@@ -133,7 +207,7 @@ function deleteFile(index: number) {
   <el-card class="p2p-card" body-style="display: flex; flex-direction: column; height: 100%; padding: 0;" shadow="never">
     <template #header>
       <div class="card-header">
-        <span>⚡ 局域网直传</span>
+        <span>⚡ 点对点传输</span>
         <el-tag size="small" type="success" effect="plain">P2P Stream</el-tag>
       </div>
     </template>
@@ -144,7 +218,7 @@ function deleteFile(index: number) {
 
       <el-empty
         v-if="fileList.length === 0"
-        description="点击或拖入文件开启直传 (Max 10MB)"
+        description="点击或拖入文件开始中转传输 (LAN Relay/P2P/VPS Relay)"
         image-size="50"
         @click="triggerUpload"
         class="clickable-empty"
@@ -165,6 +239,8 @@ function deleteFile(index: number) {
           <div class="file-meta">
             <span>{{ formatSize(file.size) }}</span>
             <span v-if="file.fromSelf" class="tag-me">我发送的</span>
+            <span v-else-if="file.isNetdisk" class="tag-peer">云端</span>
+            <span v-else-if="file.isRelay" class="tag-lan">{{ file.relayStatus === 'ready' ? '点击下载' : '等待下载' }}</span>
             <span v-else-if="file.isLan" class="tag-lan">LAN加速</span>
             <span v-else class="tag-peer">来自伙伴</span>
           </div>

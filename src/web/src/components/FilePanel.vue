@@ -103,20 +103,42 @@ const triggerShareFile = () => {
     shareFileInput.value?.click()
 }
 
-const onShareFileSelected = (e: Event) => {
+const onShareFileSelected = async (e: Event) => {
     const input = e.target as HTMLInputElement
     if (!input.files) return
     for (const file of input.files) {
-        conn.shareLanFile(file)
-        // Also add to local shared list for display
-        const fileId = `lan-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
-        sharedFiles.value.set(fileId, {
-            id: fileId,
+        const localId = `lan-local-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+        sharedFiles.value.set(localId, {
+            id: localId,
             name: file.name,
             size: file.size,
-            status: 'pending',
+            status: 'uploading',
             source: 'local'
         })
+
+        try {
+            const shared = await conn.shareLanFilePersistent(file)
+            const existing = sharedFiles.value.get(localId)
+            if (existing) sharedFiles.value.delete(localId)
+            sharedFiles.value.set(shared.id, {
+                id: shared.id,
+                name: file.name,
+                size: file.size,
+                status: 'ready',
+                lanFileId: shared.lanFileId,
+                ip: shared.ip,
+                httpPort: shared.httpPort,
+                h3Port: shared.h3Port,
+                certHash: shared.certHash,
+                isRelay: false,
+                source: 'local'
+            })
+            ElMessage.success(`📤 ${file.name} 已上传到主机并共享`)
+            fetchLanFiles()
+        } catch (err) {
+            sharedFiles.value.delete(localId)
+            ElMessage.error(`共享失败: ${file.name}`)
+        }
     }
     input.value = '' // reset
 }
@@ -125,6 +147,18 @@ const onShareFileSelected = (e: Event) => {
 // --- Handle LAN events for lazy sharing ---
 const handleLanEvent = (type: string, data: any) => {
     if (type === 'lan_offer') {
+        const existing = sharedFiles.value.get(data.id)
+        if (existing && existing.source === 'local') {
+            existing.status = data.status || existing.status
+            existing.lanFileId = data.lanFileId || existing.lanFileId
+            existing.ip = data.ip || existing.ip
+            existing.httpPort = data.httpPort || existing.httpPort
+            existing.h3Port = data.h3Port || existing.h3Port
+            existing.certHash = data.certHash || existing.certHash
+            existing.isRelay = data.isRelay ?? existing.isRelay
+            return
+        }
+
         const file: LanSharedFile = {
             id: data.id,
             name: data.name,
@@ -133,6 +167,8 @@ const handleLanEvent = (type: string, data: any) => {
             source: 'remote',
             ip: data.ip,
             httpPort: data.httpPort,
+            h3Port: data.h3Port,
+            certHash: data.certHash,
             lanFileId: data.lanFileId,
             isRelay: data.isRelay
         }
@@ -159,12 +195,38 @@ const handleLanEvent = (type: string, data: any) => {
 const downloadingFiles = ref<Set<string>>(new Set())
 
 // --- Robust Download (WT -> HTTP Fallback) ---
-const downloadLanFile = async (lanFileId: string, name: string, ip?: string, httpPort?: number, isRelay?: boolean) => {
+const downloadLanFile = async (
+    lanFileId: string,
+    name: string,
+    ip?: string,
+    httpPort?: number,
+    isRelay?: boolean,
+    h3Port?: number,
+    certHash?: string
+) => {
     // Phase 9: Relay Download (Direct HTTP Stream)
     if (isRelay) {
         const server = conn.getActiveLanServer()
         const targetIp = ip || server?.ip
         const targetPort = httpPort || server?.httpPort
+        const targetH3Port = h3Port || server?.h3Port
+        const targetCertHash = certHash || server?.certHash
+
+        try {
+            const ok = await conn.downloadLanRelayWT(
+                lanFileId,
+                name,
+                targetIp,
+                targetH3Port,
+                targetCertHash
+            )
+            if (ok) {
+                ElMessage.success(`📥 ${name} 下载完成 (WT Relay)`)
+                return
+            }
+        } catch (e) {
+            console.warn('WT relay download failed, falling back to HTTP', e)
+        }
 
         if (targetIp && targetPort) {
             window.open(`http://${targetIp}:${targetPort}/api/lan/relay/download/${lanFileId}`, '_blank')
@@ -202,7 +264,7 @@ const downloadLanFile = async (lanFileId: string, name: string, ip?: string, htt
 const requestDownload = async (file: LanSharedFile) => {
     if (file.status === 'ready' && file.lanFileId) {
         downloadingFiles.value.add(file.id)
-        await downloadLanFile(file.lanFileId, file.name, file.ip, file.httpPort, file.isRelay)
+        await downloadLanFile(file.lanFileId, file.name, file.ip, file.httpPort, file.isRelay, file.h3Port, file.certHash)
         downloadingFiles.value.delete(file.id)
     } else if (file.status === 'pending' && file.source === 'remote') {
         downloadingFiles.value.add(file.id)

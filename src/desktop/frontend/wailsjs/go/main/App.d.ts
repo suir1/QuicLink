@@ -15,6 +15,8 @@ export function GetConnectionStatus():Promise<boolean>;
 
 export function GetDownloadDir():Promise<string>;
 
+export function GetLocalLanInfo():Promise<Record<string, any>>;
+
 export function GetLocalServerPort():Promise<number>;
 
 export function GetP2PStatus():Promise<boolean>;

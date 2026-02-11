@@ -122,6 +122,15 @@ func (a *App) sendLanInfo() {
 		"certHash": a.lanServerInfo.CertHash, // For browser WebTransport
 		"name":     hostname,                 // Friendly name
 	}
+	log.Printf(
+		"📡 Broadcasting lan_info: id=%s ip=%s http=%d h3=%d certHashLen=%d certPrefix=%s...",
+		a.deviceID,
+		ip,
+		a.lanServerInfo.HTTPPort,
+		a.lanServerInfo.H3Port,
+		len(a.lanServerInfo.CertHash),
+		truncate(a.lanServerInfo.CertHash, 12),
+	)
 	a.sendMessage(map[string]interface{}{
 		"type":    "lan_info",
 		"payload": payload,
@@ -194,6 +203,24 @@ func (a *App) GetLocalServerPort() int {
 		return a.lanServerInfo.HTTPPort
 	}
 	return 0
+}
+
+// GetLocalLanInfo returns local LAN server info for frontend relay logic.
+func (a *App) GetLocalLanInfo() map[string]interface{} {
+	if a.lanServerInfo == nil {
+		return map[string]interface{}{
+			"ip":       "",
+			"httpPort": 0,
+			"h3Port":   0,
+			"certHash": "",
+		}
+	}
+	return map[string]interface{}{
+		"ip":       a.getLocalIP(),
+		"httpPort": a.lanServerInfo.HTTPPort,
+		"h3Port":   a.lanServerInfo.H3Port,
+		"certHash": a.lanServerInfo.CertHash,
+	}
 }
 
 // GetClipboard returns current clipboard text

@@ -30,6 +30,10 @@ export function GetDownloadDir() {
   return window['go']['main']['App']['GetDownloadDir']();
 }
 
+export function GetLocalLanInfo() {
+  return window['go']['main']['App']['GetLocalLanInfo']();
+}
+
 export function GetLocalServerPort() {
   return window['go']['main']['App']['GetLocalServerPort']();
 }

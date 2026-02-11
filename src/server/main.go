@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -37,6 +38,16 @@ type responseWriterWrapper struct {
 func (w *responseWriterWrapper) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+func addH3AltSvcHeader(w http.ResponseWriter, r *http.Request) {
+	port := "443"
+	if host := r.Host; host != "" {
+		if _, p, err := net.SplitHostPort(host); err == nil && p != "" {
+			port = p
+		}
+	}
+	w.Header().Set("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
 }
 
 func main() {
@@ -77,7 +88,7 @@ func main() {
 	// SPA Handler: Serves index.html for unknown paths
 	http.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if config.Current.UseHTTPS {
-			w.Header().Add("Alt-Svc", `h3=":443"; ma=2592000`)
+			addH3AltSvcHeader(w, r)
 		}
 
 		path := "./dist" + r.URL.Path
@@ -93,19 +104,19 @@ func main() {
 	// API
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		if config.Current.UseHTTPS {
-			w.Header().Add("Alt-Svc", `h3=":443"; ma=2592000`)
+			addH3AltSvcHeader(w, r)
 		}
 		handlers.HandleWebSocket(w, r)
 	})
 	http.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
 		if config.Current.UseHTTPS {
-			w.Header().Add("Alt-Svc", `h3=":443"; ma=2592000`)
+			addH3AltSvcHeader(w, r)
 		}
 		handlers.HandleUpload(w, r)
 	})
 	http.HandleFunc("/api/files", func(w http.ResponseWriter, r *http.Request) {
 		if config.Current.UseHTTPS {
-			w.Header().Add("Alt-Svc", `h3=":443"; ma=2592000`)
+			addH3AltSvcHeader(w, r)
 		}
 		handlers.HandleListFiles(w, r)
 	})
@@ -116,7 +127,7 @@ func main() {
 			http.Error(w, "WebTransport requires HTTPS mode", http.StatusBadRequest)
 			return
 		}
-		w.Header().Add("Alt-Svc", `h3=":443"; ma=2592000`)
+		addH3AltSvcHeader(w, r)
 		handlers.HandleWebTransport(w, r)
 	})
 
@@ -124,8 +135,7 @@ func main() {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Content-Type", "application/json")
 		if config.Current.UseHTTPS {
-			// Advertise external port 443 for HTTP/3, not internal port 3100
-			w.Header().Add("Alt-Svc", `h3=":443"; ma=2592000`)
+			addH3AltSvcHeader(w, r)
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"mode":     config.Current.AppMode,
@@ -236,11 +246,13 @@ func main() {
 		redirectPort := "3101"
 		fmt.Printf("🔀 Redirect Server running on :%s (HTTP -> HTTPS)\n", redirectPort)
 		http.ListenAndServe(":"+redirectPort, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			target := "https://" + r.Host + r.URL.Path
-			if len(r.URL.RawQuery) > 0 {
-				target += "?" + r.URL.RawQuery
+			targetURL := url.URL{
+				Scheme:   "https",
+				Host:     r.Host,
+				Path:     r.URL.Path,
+				RawQuery: r.URL.RawQuery,
 			}
-			http.Redirect(w, r, target, http.StatusMovedPermanently)
+			http.Redirect(w, r, targetURL.String(), http.StatusMovedPermanently)
 		}))
 	}()
 
