@@ -1,186 +1,215 @@
-# QuicLink (Fast-Run) ⚡
+# QuicLink 1.0.0
 
-A high-performance P2P Sync Engine built on **HTTP/3 (WebTransport)** and **WebSocket** for private data orchestration.
-QuicLink allows real-time synchronization of **Clipboard**, **Notepad**, and **Files** across your Browser, Windows, macOS, and Linux devices.
+QuicLink is a room-based sync and transfer system for **Web + Desktop**.
+It combines signaling, LAN acceleration, WebRTC, and VPS relay to maximize transfer success across mixed networks.
 
-**Current Status:** Active Development (Beta).
+Current scope:
+- Clipboard sync
+- Notepad sync
+- File transfer (LAN / P2P / VPS relay / cloud)
 
 ---
 
-## ✨ Features
+## Key Concepts
 
-- **Real-time Clipboard Sync**: Copy on one device, paste on another instantly.
-- **Live Notepad**: Real-time collaborative notepad editing across all connected devices.
-- **P2P File Transfer**: High-speed, direct file transfer between devices using WebTransport (or WebSocket fallback).
-- **Cross-Platform**:
-    - **Web**: Access via any modern browser (Chrome/Edge recommended for HTTP/3).
-    - **Desktop**: Native-like experience on Windows, macOS, and Linux (via Wails).
+### Two file panels with different semantics
 
-## 🚀 Installation & Usage
+- `FilePanel`
+  - Shared list + persistent storage workflow.
+  - LAN host can store files on disk.
+- `P2PFilePanel`
+  - Relay-first workflow.
+  - Designed for transient transfer and fallback chain.
 
-### 📦 Desktop Client (Windows / macOS / Linux)
+### 4 transfer modes
 
-1.  **Download**: Go to the [Releases](../../releases) page and download the client for your OS.
-    -   **Windows**: `.zip` (Extract and run `QuicLink.exe`)
-    -   **macOS**: `.zip` (Extract and run `QuicLink.app`)
-    -   **Linux**: `.tar.gz` (Extract and run `QuicLink`)
-2.  **Configuration**:
-    -   On first launch, click the **Settings (⚙️)** icon in the top toolbar to configure your server address.
-    -   Default: `localhost:3100` (If you are running your own server).
-3.  **Connection**:
-    -   **Public Mode**: Enter any room name (e.g., `my-room`) or generate a random one to join.
-    -   **Private Mode**: If the server is in private mode, you will be prompted for a password.
+1. Desktop LAN server (HTTP / WebTransport)
+2. Browser P2P (WebRTC DataChannel)
+3. VPS relay (`/api/relay/*`)
+4. Cloud storage upload/download (`/upload`, `/api/files`)
 
-### 🌐 Web Client
+---
 
-1.  Access the web client via your browser: `https://your-server-domain.com`.
-2.  If running locally: `http://localhost:3100`.
-3.  **Room Access**:
-    -   Enter a room name to join.
-    -   You can also use a direct link: `https://your-server-domain.com/#/my-room`.
+## Transport Strategy (Implemented)
 
-### 🖥️ Self-Hosting Server (Go)
+### Upload / relay (high-level)
 
-You can run your own QuicLink server for complete privacy and control.
+- Desktop native path (preferred when available):
+  - Go native LAN relay (`StartNativeRelayUpload`)
+  - fallback to VPS native relay (`UploadVpsRelayFile`)
+- Web path:
+  - LAN WT relay -> WebRTC -> VPS relay fallback
 
-#### Option 1: Run from Source
+### Download (web)
 
-1.  **Prerequisites**: Go 1.24+
-2.  **Clone & Run**:
-    ```bash
-    git clone https://github.com/suir1/QuicLink.git
-    cd QuicLink/src/server
-    go run .
-    ```
-3.  **Configuration**:
-    The server looks for `config.json` in the working directory.
-    Example `config.json`:
-    ```json
-    {
-      "host": "0.0.0.0",
-      "port": 3100,
-      "mode": "public",  // "public" or "private"
-      "password": "your-secret-password", // Required if mode is "private"
-      "cert_file": "./cert.pem", // SSL Cert (Optional for localhost, Required for Public WebTransport)
-      "key_file": "./key.pem"    // SSL Key
-    }
-    ```
+Web has two download modes:
+- `compat` (default): URL handoff first (browser download manager)
+- `speed`: WT(JS) first, then URL fallback
 
-#### Option 2: Deploy on VPS with Domain & SSL (Recommended)
+For LAN URL handoff in `compat` mode:
+- HTTPS URL first
+- HTTP URL second
 
-To use WebTransport over the internet, you **must** use a valid SSL certificate (browser requirement).
+### Download (desktop)
 
-1.  **Install Certbot** (Ubuntu/Debian):
-    ```bash
-    sudo apt update
-    sudo apt install certbot
-    ```
+- Go native LAN relay download first
+- WT relay fallback
+- HTTP URL fallback
 
-2.  **Generate Certificate**:
-    Replace `your-domain.com` with your actual domain.
-    ```bash
-    # Stop any running server on port 80 first
-    sudo certbot certonly --standalone -d your-domain.com
-    ```
-    This will generate certificates in `/etc/letsencrypt/live/your-domain.com/`.
+---
 
-3.  **Configure Server**:
-    Update `config.json` to point to your new certificates.
-    *Note: You may need to copy the certs to your app directory if permission issues arise, or run the server with appropriate read permissions.*
+## Repository Layout
 
-    ```bash
-    # Example: Copy certs to current directory (Automation recommended for renewals)
-    sudo cp /etc/letsencrypt/live/your-domain.com/fullchain.pem ./cert.pem
-    sudo cp /etc/letsencrypt/live/your-domain.com/privkey.pem ./key.pem
-    sudo chown $USER:$USER cert.pem key.pem
-    ```
+- `src/server` - Go signaling + API server (HTTP/3 + WS + relay APIs)
+- `src/web` - Vue 3 + TypeScript web client
+- `src/desktop` - Wails desktop app (Go backend + Vue frontend)
 
-    Or update `config.json` directly if permissions allow:
-    ```json
-    {
-      "port": 3100,
-      "cert_file": "/etc/letsencrypt/live/your-domain.com/fullchain.pem",
-      "key_file": "/etc/letsencrypt/live/your-domain.com/privkey.pem"
-    }
-    ```
+---
 
-#### Option 3: Docker Deployment
+## Quick Start (Local)
 
-You can either build the image locally on your VPS (Option A) or use the pre-built image from GitHub Container Registry (Option B).
+## 1) Start server
 
-**Option A: Build Locally (Recommended for dev)**
-As described above:
 ```bash
-docker-compose up -d --build
+cd src/server
+go run .
 ```
 
-**Option B: Use Pre-built Image (Fastest for prod)**
+Default behavior:
+- Reads `config.json` in `src/server`
+- If `use_https=true` and cert files are missing, self-signed certs are generated automatically
 
-1.  **Pull Image**:
-    ```bash
-    # Replace 'suir1' with your username if you forked
-    docker pull ghcr.io/suir1/quiclink:latest
-    ```
+## 2) Start web client (dev)
 
-2.  **Run with Docker Compose**:
-    Create a `docker-compose.yml`:
-    ```yaml
-    version: '3.8'
-    services:
-      quiclink:
-        image: ghcr.io/suir1/quiclink:latest
-        container_name: quiclink-server
-        restart: unless-stopped
-        ports:
-          - "443:3100"  # HTTPS (Main App)
-          - "80:3101"   # HTTP -> HTTPS Redirect
-        volumes:
-          - ./src/server/config.json:/app/config.json
-          - ./uploads:/app/uploads
-          - ./cert.pem:/app/cert.pem
-          - ./key.pem:/app/key.pem
-    ```
+```bash
+cd src/web
+npm install
+npm run dev
+```
 
-    Then run:
-    ```bash
-    docker-compose up -d
-    ```
+## 3) Start desktop client (dev)
 
-## 🛠️ Development
+```bash
+cd src/desktop
+wails dev
+```
 
-### Prerequisites
+Prerequisites:
+- Go 1.24+
+- Node.js 18+
+- Wails v2
 
-- **Go**: 1.21+
-- **Node.js**: 18+
-- **Wails**: `go install github.com/wailsapp/wails/v2/cmd/wails@latest`
+---
 
-### Run Locally
+## Server Config
 
-1.  **Server**:
-    ```bash
-    cd src/server
-    go run .
-    ```
+Path: `src/server/config.json`
 
-2.  **Web Client**:
-    ```bash
-    cd src/web
-    npm install
-    npm run dev
-    ```
+Example:
 
-3.  **Desktop Client**:
-    ```bash
-    cd src/desktop
-    wails dev
-    ```
+```json
+{
+  "app_mode": "public",
+  "admin_password": "",
+  "use_https": true,
+  "port": 3100,
+  "room_ttl_hours": 48,
+  "cert_file": "cert.pem",
+  "key_file": "key.pem",
+  "force_cert_hash": true,
+  "limits": {
+    "max_upload_size_mb": 10,
+    "file_retention_minutes": 10,
+    "allow_p2p_relay": false
+  }
+}
+```
 
-## 🏗️ Architecture
+Notes:
+- `app_mode=private` requires `admin_password`
+- `limits.max_upload_size_mb` affects relay/cloud limits
+- `limits.file_retention_minutes` controls relay TTL
 
-- **Server (`src/server`)**: Go (HTTP/3 + WebSocket signaling).
-- **Web Frontend (`src/web`)**: Vue 3 + TypeScript + Element Plus.
-- **Desktop Client (`src/desktop`)**: Wails (Go + Vue 3).
+---
 
-## 📜 License
+## Web Environment
 
-MIT License.
+Path: `src/web/.env`
+
+Example keys:
+
+```env
+VITE_VPS_HOST=localhost:3100
+VITE_TURN_URL=
+VITE_TURN_USERNAME=
+VITE_TURN_CREDENTIAL=
+VITE_ICE_SERVERS=
+```
+
+---
+
+## Relay APIs
+
+Server endpoints:
+
+- `POST /api/relay/upload/:id`
+- `GET  /api/relay/meta/:id`
+- `GET  /api/relay/download/:id`
+- `POST /api/relay/ack/:id`
+
+Typical use:
+- upload -> broadcast offer -> receiver downloads -> receiver ack
+
+---
+
+## Build
+
+### Web
+
+```bash
+cd src/web
+npm run build
+```
+
+### Desktop frontend
+
+```bash
+cd src/desktop/frontend
+npm run build
+```
+
+### Desktop Go
+
+```bash
+cd src/desktop
+go build ./...
+```
+
+### Server
+
+```bash
+cd src/server
+go build .
+```
+
+---
+
+## Deployment
+
+- `Makefile` includes VPS build/deploy helpers
+- `docker-compose.yml` and `docker-compose.prod.yml` are provided
+- For public WT/HTTP3 usage, TLS and UDP exposure are required
+
+---
+
+## Operational Notes
+
+- Browser mixed-content restrictions still apply to HTTPS page -> HTTP fetch.
+- URL navigation handoff and QR/open-new-tab flows are used where browser policy blocks fetch.
+- Some embedded webviews do not support WebTransport; fallback paths are required.
+
+---
+
+## License
+
+MIT
