@@ -214,6 +214,7 @@ make stop-vps VPS_HOST=<ip>
 - `/Users/sui/Code/projects/QuicLink/src/server`：Go 服务端（信令 + API + HTTP/3 + WT）
 - `/Users/sui/Code/projects/QuicLink/src/web`：Vue 3 + TS Web 客户端
 - `/Users/sui/Code/projects/QuicLink/src/desktop`：Wails Desktop（Go + Vue）
+- `/Users/sui/Code/projects/QuicLink/src/android`：Android Scaffold（Capacitor + Kotlin bridge + Go lanhost 占位）
 - `/Users/sui/Code/projects/QuicLink/scripts`：部署脚本
 - `/Users/sui/Code/projects/QuicLink/Makefile`：构建与部署快捷命令
 

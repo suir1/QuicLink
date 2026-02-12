@@ -192,7 +192,7 @@ func (a *App) watchClipboard() {
 
 			log.Printf("📋 Clipboard changed (detected): %s", truncate(content, 50))
 
-			id := fmt.Sprintf("%d", time.Now().UnixMilli())
+			id := fmt.Sprintf("%d-%s", time.Now().UnixMilli(), uuid.NewString()[:8])
 			if !a.sendClipboardPush(content, id) {
 				a.setPendingClipboard(content, id)
 			}
@@ -940,7 +940,7 @@ func (a *App) SendClipboard() {
 	content, sig := a.readClipboardSnapshot()
 	if content != "" && sig != "" {
 		a.tryMarkClipboardSeen(sig, content)
-		id := fmt.Sprintf("%d", time.Now().UnixMilli())
+		id := fmt.Sprintf("%d-%s", time.Now().UnixMilli(), uuid.NewString()[:8])
 		if !a.sendClipboardPush(content, id) {
 			a.setPendingClipboard(content, id)
 		}

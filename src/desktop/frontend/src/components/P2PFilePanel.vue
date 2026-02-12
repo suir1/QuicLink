@@ -32,6 +32,9 @@ interface P2PFile {
 }
 
 const fileList = ref<P2PFile[]>([])
+const dismissedOfferIds = ref<Set<string>>(new Set())
+const dismissedTempSignatures = ref<Map<string, number>>(new Map())
+const TEMP_SIGNATURE_TTL_MS = 30_000
 const transfer = computed(() => conn.transferTelemetry)
 
 const transferPathLabel = computed(() => {
@@ -180,7 +183,53 @@ function addFileToList(file: P2PFile) {
   }, 100)
 }
 
+function pruneDismissedTempSignatures(now = Date.now()) {
+  for (const [key, ts] of dismissedTempSignatures.value.entries()) {
+    if (now - ts > TEMP_SIGNATURE_TTL_MS) {
+      dismissedTempSignatures.value.delete(key)
+    }
+  }
+}
+
+function fileSignature(name: string, size: number) {
+  return `${String(name || '').trim()}::${Number(size || 0)}`
+}
+
+function markFileDismissed(file: P2PFile) {
+  const ids = [file.id, file.relayId, file.originalId, file.lanFileId]
+    .map((v) => String(v || '').trim())
+    .filter(Boolean)
+  for (const id of ids) dismissedOfferIds.value.add(id)
+
+  if (file.fromSelf && file.id.startsWith('local-')) {
+    pruneDismissedTempSignatures()
+    dismissedTempSignatures.value.set(fileSignature(file.name, file.size), Date.now())
+  }
+}
+
+function shouldIgnoreOffer(payload: any): boolean {
+  pruneDismissedTempSignatures()
+
+  const offerId = String(payload?.id || '').trim()
+  const relayId = String(payload?.relayId || '').trim()
+  const originalId = String(payload?.originalId || '').trim()
+  const lanFileId = String(payload?.lanFileId || '').trim()
+  if (
+    (offerId && dismissedOfferIds.value.has(offerId)) ||
+    (relayId && dismissedOfferIds.value.has(relayId)) ||
+    (originalId && dismissedOfferIds.value.has(originalId)) ||
+    (lanFileId && dismissedOfferIds.value.has(lanFileId))
+  ) {
+    return true
+  }
+
+  const sig = fileSignature(payload?.name, Number(payload?.size || 0))
+  return dismissedTempSignatures.value.has(sig)
+}
+
 function upsertOfferFile(payload: any) {
+  if (shouldIgnoreOffer(payload)) return
+
   const offerId = String(payload?.id || '')
   const relayId = String(payload?.relayId || '')
   const originalId = String(payload?.originalId || '')
@@ -284,15 +333,18 @@ async function handleDownload(file: P2PFile) {
       ElMessage.info('已请求发送方启动 LAN 中转，请稍候...')
       return
     }
+    const relayId = file.lanFileId
 
     if (conn.isDesktop) {
       const nativeOk = await conn.downloadLanRelayNative(
-        file.lanFileId,
+        relayId,
         file.name,
         file.ip,
         file.httpPort
       )
       if (nativeOk) {
+        file.relayStatus = 'pending'
+        file.lanFileId = undefined
         ElMessage.success(`下载完成: ${file.name} (Go Native Relay)`)
         return
       }
@@ -300,13 +352,15 @@ async function handleDownload(file: P2PFile) {
 
     try {
       const ok = await conn.downloadLanRelayWT(
-        file.lanFileId,
+        relayId,
         file.name,
         file.ip,
         file.h3Port,
         file.certHash
       )
       if (ok) {
+        file.relayStatus = 'pending'
+        file.lanFileId = undefined
         ElMessage.success(`下载完成: ${file.name} (WT Relay)`)
         return
       }
@@ -314,7 +368,9 @@ async function handleDownload(file: P2PFile) {
       console.warn('WT relay download failed, fallback to HTTP', e)
     }
 
-    if (conn.downloadLanRelayHTTP(file.lanFileId, file.name, file.ip, file.httpPort)) {
+    if (conn.downloadLanRelayHTTP(relayId, file.name, file.ip, file.httpPort)) {
+      file.relayStatus = 'pending'
+      file.lanFileId = undefined
       ElMessage.info(`已切换 HTTP Relay 下载: ${file.name}`)
       return
     }
@@ -391,7 +447,18 @@ function includePercentage(received: number, total: number) {
 }
 
 function deleteFile(index: number) {
+  const file = fileList.value[index]
+  if (!file) return
+
+  markFileDismissed(file)
   fileList.value.splice(index, 1)
+
+  if (file.fromSelf && conn.removeSharedOffer) {
+    const ids = [file.id, file.relayId, file.originalId, file.lanFileId]
+      .map((v) => String(v || '').trim())
+      .filter(Boolean)
+    for (const id of ids) conn.removeSharedOffer(id)
+  }
 }
 </script>
 

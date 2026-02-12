@@ -138,11 +138,8 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 
 // SendInitState 发送房间初始化状态
 func SendInitState(room *store.Room, conn store.Connection, roomId string) error {
-	// 获取所有笔记列表
-	notesList := make([]*store.Note, 0, len(room.Notes))
-	for _, n := range room.Notes {
-		notesList = append(notesList, n)
-	}
+	notesList := room.SnapshotNotes()
+	clipboardHistory := room.SnapshotClipboardHistory()
 
 	initMsg := Message{
 		Type: "init",
@@ -150,10 +147,10 @@ func SendInitState(room *store.Room, conn store.Connection, roomId string) error
 			"room_id":          roomId,
 			"hostInfo":         room.HostInfo,
 			"notes":            notesList,
-			"clipboardHistory": room.ClipboardHistory,
+			"clipboardHistory": clipboardHistory,
 			"createdAt":        room.CreatedAt.Unix(),
 		},
 	}
-	log.Printf("📤 Sending Init State to client. History Size: %d", len(room.ClipboardHistory))
+	log.Printf("📤 Sending Init State to client. History Size: %d", len(clipboardHistory))
 	return conn.WriteJSON(initMsg)
 }

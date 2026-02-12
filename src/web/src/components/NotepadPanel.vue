@@ -19,6 +19,14 @@ const saveStatus = ref('已同步')
 // 防抖定时器映射 (id -> timer)
 const timers: Record<string, number> = {}
 
+function clearNoteTimer(noteId: string) {
+  if (!noteId) return
+  if (timers[noteId]) {
+    clearTimeout(timers[noteId])
+    delete timers[noteId]
+  }
+}
+
 // 初始化
 onMounted(() => {
   // 注册事件监听
@@ -52,6 +60,7 @@ onMounted(() => {
       saveStatus.value = '收到更新'
     } else if (type === 'notepad_delete') {
       // payload: { id }
+      clearNoteTimer(payload.id)
       const idx = notes.value.findIndex(n => n.id === payload.id)
       if (idx !== -1) {
         notes.value.splice(idx, 1)
@@ -68,9 +77,13 @@ onMounted(() => {
 function onContentChange(note: Note) {
   saveStatus.value = '输入中...'
 
-  if (timers[note.id]) clearTimeout(timers[note.id])
-  timers[note.id] = setTimeout(() => {
-    sendUpdate(note)
+  const noteId = note.id
+  clearNoteTimer(noteId)
+  timers[noteId] = window.setTimeout(() => {
+    delete timers[noteId]
+    const latest = notes.value.find(n => n.id === noteId)
+    if (!latest) return
+    sendUpdate(latest)
   }, 1000)
 }
 
@@ -89,7 +102,7 @@ function sendUpdate(note: Note) {
 // 添加新笔记
 function handleTabsEdit(targetName: string | undefined, action: 'remove' | 'add') {
   if (action === 'add') {
-    const newId = `note-${Date.now()}`
+    const newId = `note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     const newNote = { id: newId, title: '新笔记', content: '' }
     notes.value.push(newNote)
     activeTab.value = newId
@@ -102,6 +115,7 @@ function handleTabsEdit(targetName: string | undefined, action: 'remove' | 'add'
       cancelButtonText: '取消',
       type: 'warning'
     }).then(() => {
+      clearNoteTimer(noteId)
       // 本地先删
       const idx = notes.value.findIndex(n => n.id === noteId)
       if (idx !== -1) notes.value.splice(idx, 1)
@@ -300,7 +314,50 @@ html.dark .title-input :deep(.el-input__wrapper) {
   background-color: transparent;
   box-shadow: none;
 }
+/* Mobile Responsive Adjustments */
+@media (max-width: 768px) {
+  .header-controls {
+    position: static;
+    transform: none;
+    margin: 10px 10px 5px;
+    align-self: flex-end; /* Align right */
+  }
+
+  :deep(.el-tabs__header) {
+    padding-right: 0;
+  }
+}
+
 html.dark .title-input :deep(.el-input__inner) {
   color: #E5EAF3;
+}
+
+/* Dark mode for Quill Editor */
+html.dark :deep(.ql-toolbar) {
+  background-color: #1d1e1f;
+  border-color: #4c4d4f;
+}
+html.dark :deep(.ql-toolbar .ql-stroke) {
+  stroke: #cfd3dc;
+}
+html.dark :deep(.ql-toolbar .ql-fill) {
+  fill: #cfd3dc;
+}
+html.dark :deep(.ql-toolbar .ql-picker) {
+  color: #cfd3dc;
+}
+
+html.dark :deep(.ql-container.ql-snow) {
+  border-color: #4c4d4f;
+  background-color: #141414;
+}
+
+html.dark :deep(.ql-editor) {
+  color: #cfd3dc;
+}
+
+html.dark :deep(.ql-editor.ql-blank::before) {
+  color: #606266;
+  font-style: normal;
 }
 </style>

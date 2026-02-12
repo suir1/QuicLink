@@ -171,6 +171,32 @@ func (r *Room) DeleteNote(id string) {
 	r.LastUpdate = time.Now()
 }
 
+// SnapshotNotes returns a thread-safe copy of notes for init sync.
+func (r *Room) SnapshotNotes() []*Note {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	notes := make([]*Note, 0, len(r.Notes))
+	for _, n := range r.Notes {
+		if n == nil {
+			continue
+		}
+		copied := *n
+		notes = append(notes, &copied)
+	}
+	return notes
+}
+
+// SnapshotClipboardHistory returns a thread-safe copy of clipboard history.
+func (r *Room) SnapshotClipboardHistory() []ClipboardItem {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	history := make([]ClipboardItem, len(r.ClipboardHistory))
+	copy(history, r.ClipboardHistory)
+	return history
+}
+
 // SetPassword 设置房间密码 (用于 Private 模式)
 func (r *Room) SetPassword(password string) {
 	r.mutex.Lock()

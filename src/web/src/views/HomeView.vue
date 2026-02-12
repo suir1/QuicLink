@@ -428,27 +428,40 @@ html.dark .clipboard-sidebar {
     justify-content: center;
   }
 
-  .main-workspace {
+  /* Separate the container on mobile */
+  .main-workspace, .file-workspace {
     flex-direction: column;
+    height: auto !important;
+    gap: 15px; /* Add gap between panels */
+    background: transparent !important;
+    box-shadow: none !important;
+    overflow: visible !important;
+  }
+
+  /* Restore card look for children */
+  .notepad-area, .file-area, .clipboard-sidebar, .p2p-sidebar {
+    height: 500px;
+    border-radius: 8px;
+    box-shadow: var(--el-box-shadow-light);
+    overflow: hidden;
+    background: var(--el-bg-color);
+  }
+
+  .file-area, .p2p-sidebar {
+     height: 400px;
   }
 
   .clipboard-sidebar, .p2p-sidebar {
     max-width: none;
-    border-left: none;
-    border-top: 1px solid #ebeef5;
+    border-left: none; /* No separator border needed */
+    border-top: none;
   }
 
-  .file-workspace {
-    flex-direction: column;
-    height: auto;
-  }
-
-  .file-area {
-    height: 400px; /* 小屏幕固定高度 */
-  }
-
-  .p2p-sidebar {
-    height: 400px;
+  /* Deep overrides to restore borders/radius inside components */
+  .file-area :deep(.el-card), .p2p-sidebar :deep(.el-card), .notepad-card, .clipboard-card {
+      border: 1px solid var(--el-border-color-light) !important;
+      border-radius: 8px !important;
+      box-shadow: none !important; /* Outer container has shadow already */
   }
 }
 /* Dark Mode QR Code Inversion */

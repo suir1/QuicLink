@@ -648,6 +648,14 @@ export const useConnectionStore = defineStore('connection', () => {
         })
     }
 
+    function removeSharedOffer(fileId: string) {
+        const id = String(fileId || '').trim()
+        if (!id) return
+        localFiles.value.delete(id)
+        relaySources.value.delete(id)
+        vpsRelayOffers.value.delete(id)
+    }
+
     async function uploadToLocalRelay(file: File, port: number, relayId: string, fallbackNote = '') {
         const note = fallbackNote
             ? `LAN HTTP relay (fallback: ${fallbackNote})`
@@ -1522,6 +1530,7 @@ export const useConnectionStore = defineStore('connection', () => {
         smartRelaySendNativeFile,
         pickNativeRelayFiles,
         requestP2PRelayFile,
+        removeSharedOffer,
         requestFile,
         lanServerUrl,
         lanServers,

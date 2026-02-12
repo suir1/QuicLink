@@ -953,6 +953,13 @@ export const useConnectionStore = defineStore('connection', () => {
         })
     }
 
+    function removeSharedOffer(fileId: string) {
+        const id = String(fileId || '').trim()
+        if (!id) return
+        localFiles.value.delete(id)
+        vpsRelayOffers.value.delete(id)
+    }
+
     async function handleP2PRelayRequest(fileId: string, requesterId?: string) {
         const file = localFiles.value.get(fileId)
         if (!file) return
@@ -1360,38 +1367,86 @@ export const useConnectionStore = defineStore('connection', () => {
             : `/api/lan/download/${fileId}`
 
         const openUrl = (url: string) => {
-            const a = document.createElement('a')
-            a.href = url
-            a.target = '_blank'
-            a.rel = 'noopener'
-            document.body.appendChild(a)
-            a.click()
-            document.body.removeChild(a)
+            // Prefer window.open so we can detect popup blocking.
+            const opened = window.open(url, '_blank', 'noopener')
+            if (!opened) return false
+            try {
+                opened.opener = null
+            } catch {
+                // ignore cross-origin access errors
+            }
             return true
         }
 
-        if (h3Port) {
-            const httpsUrl = `https://${ip}:${h3Port}${path}`
-            if (openUrl(httpsUrl)) {
-                setTransferRoute('lan-url-https')
-                console.info(`📥 Download route: lan-url-https -> ${httpsUrl}`)
-                finishTransferTelemetry('handoff', `URL handoff: HTTPS${isRelay ? ' relay' : ''}`)
-                return Promise.resolve('https')
+        const probeLanHttps = async (): Promise<boolean> => {
+            if (!h3Port) return false
+            const controller = new AbortController()
+            const timer = window.setTimeout(() => controller.abort(), 1800)
+            try {
+                const probeUrl = `https://${ip}:${h3Port}/api/lan/files`
+                const res = await fetch(probeUrl, {
+                    method: 'GET',
+                    cache: 'no-store',
+                    signal: controller.signal
+                })
+                return res.ok
+            } catch {
+                return false
+            } finally {
+                window.clearTimeout(timer)
             }
         }
 
-        if (httpPort) {
-            const httpUrl = `http://${ip}:${httpPort}${path}`
-            if (openUrl(httpUrl)) {
+        const pushHttp = () => {
+            if (!httpPort) return
+            return {
+                kind: 'http' as const,
+                url: `http://${ip}:${httpPort}${path}`
+            }
+        }
+        const pushHttps = () => {
+            if (!h3Port) return
+            return {
+                kind: 'https' as const,
+                url: `https://${ip}:${h3Port}${path}`
+            }
+        }
+
+        return (async () => {
+            const candidates: Array<{ kind: 'http' | 'https'; url: string }> = []
+            const httpsReachable = await probeLanHttps()
+            if (httpsReachable) {
+                const https = pushHttps()
+                if (https) candidates.push(https)
+                const http = pushHttp()
+                if (http) candidates.push(http)
+            } else {
+                const http = pushHttp()
+                if (http) candidates.push(http)
+                // If only H3 exists, keep a best-effort HTTPS handoff.
+                if (!http) {
+                    const https = pushHttps()
+                    if (https) candidates.push(https)
+                }
+            }
+
+            for (const candidate of candidates) {
+                if (!openUrl(candidate.url)) continue
+                if (candidate.kind === 'https') {
+                    setTransferRoute('lan-url-https')
+                    console.info(`📥 Download route: lan-url-https -> ${candidate.url}`)
+                    finishTransferTelemetry('handoff', `URL handoff: HTTPS${isRelay ? ' relay' : ''}`)
+                    return 'https'
+                }
                 setTransferRoute('lan-url-http')
-                console.info(`📥 Download route: lan-url-http -> ${httpUrl}`)
+                console.info(`📥 Download route: lan-url-http -> ${candidate.url}`)
                 finishTransferTelemetry('handoff', `URL handoff: HTTP${isRelay ? ' relay' : ''}`)
-                return Promise.resolve('http')
+                return 'http'
             }
-        }
 
-        finishTransferTelemetry('error', 'No LAN URL available')
-        return Promise.resolve(null)
+            finishTransferTelemetry('error', 'No LAN URL available')
+            return null
+        })()
     }
 
     function sleep(ms: number): Promise<void> {
@@ -1441,14 +1496,16 @@ export const useConnectionStore = defineStore('connection', () => {
             startTransferTelemetry('browser-url', 'download', fallbackName, totalSizeHint || 0, 'Browser download manager')
             setTransferRoute('vps-url')
             console.info(`📥 Download route: vps-url -> ${downloadUrl}`)
-            const a = document.createElement('a')
-            a.href = downloadUrl
-            a.target = '_blank'
-            a.rel = 'noopener'
-            a.download = fallbackName
-            document.body.appendChild(a)
-            a.click()
-            document.body.removeChild(a)
+            const opened = window.open(downloadUrl, '_blank', 'noopener')
+            if (!opened) {
+                finishTransferTelemetry('error', 'Browser blocked download popup')
+                return false
+            }
+            try {
+                opened.opener = null
+            } catch {
+                // ignore cross-origin access errors
+            }
             finishTransferTelemetry('handoff', 'URL handoff: VPS relay')
             return true
         }
@@ -2586,6 +2643,7 @@ export const useConnectionStore = defineStore('connection', () => {
         requestLanFile,
         notifyLanFileConsumed,
         requestP2PRelayFile,
+        removeSharedOffer,
         HTTP_URL,
         disconnect: closeConnection,
         lanServers, // Export

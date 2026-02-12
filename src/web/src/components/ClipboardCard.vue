@@ -13,54 +13,79 @@ interface ClipboardItem {
 const conn = useConnectionStore()
 const clipboardList = ref<ClipboardItem[]>([])
 
-// 监听远程历史记录
-conn.onClipboardHistory = (history: any[]) => {
-  if (history && history.length > 0) {
-    clipboardList.value = history.map(item => ({
-      id: item.id || Date.now().toString() + Math.random().toString().substr(2, 5),
-      text: item.text,
-      time: item.time || getTime()
-    }))
-    scrollToBottom()
-    ElMessage.success(`已同步 ${history.length} 条已保存记录`)
+function makeLocalId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+function normalizeIncomingClipboard(data: any): ClipboardItem | null {
+  if (typeof data === 'string') {
+    const text = data.trim()
+    if (!text) return null
+    return { id: makeLocalId(), text, time: getTime() }
+  }
+  if (typeof data === 'object' && data?.text) {
+    const text = String(data.text).trim()
+    if (!text) return null
+    return {
+      id: String(data.id || '').trim() || makeLocalId(),
+      text,
+      time: String(data.time || '').trim() || getTime()
+    }
+  }
+  return null
+}
+
+function upsertClipboardItem(item: ClipboardItem, moveToTail = true): void {
+  const byId = item.id
+    ? clipboardList.value.findIndex(existing => existing.id === item.id)
+    : -1
+  const byText = clipboardList.value.findIndex(existing => existing.text === item.text)
+  const idx = byId !== -1 ? byId : byText
+
+  if (idx === -1) {
+    clipboardList.value.push(item)
+    return
+  }
+
+  const existing = clipboardList.value[idx]
+  if (!existing) {
+    clipboardList.value.push(item)
+    return
+  }
+
+  const merged: ClipboardItem = {
+    id: item.id || existing.id,
+    text: item.text || existing.text,
+    time: item.time || existing.time
+  }
+
+  if (moveToTail) {
+    clipboardList.value.splice(idx, 1)
+    clipboardList.value.push(merged)
+  } else {
+    clipboardList.value[idx] = merged
   }
 }
 
-// 监听单条数据 (实时同步) - Changed to accept Object
+// 监听远程历史记录
+conn.onClipboardHistory = (history: any[]) => {
+  const incoming = Array.isArray(history) ? history : []
+  clipboardList.value = incoming
+    .map(item => ({
+      id: String(item?.id || '').trim() || makeLocalId(),
+      text: String(item?.text || ''),
+      time: String(item?.time || '').trim() || getTime()
+    }))
+    .filter(item => !!item.text)
+  scrollToBottom()
+  ElMessage.success(`已同步 ${clipboardList.value.length} 条已保存记录`)
+}
+
+// 监听单条数据 (实时同步)
 conn.onClipboardData = (data: any) => {
-  // Check if it's a full item object or just text string (legacy/direct)
-  let text = ''
-  let id = ''
-  let time = ''
-
-  if (typeof data === 'string') {
-     text = data
-  } else if (typeof data === 'object' && data.text) {
-     text = data.text
-     id = data.id
-     time = data.time
-  }
-
-  if (!text) return
-
-  // Check duplicate
-  const lastIndex = clipboardList.value.findIndex(item => item.text === text)
-  if (lastIndex !== -1) {
-      // If we found a match (text same), update its ID to Server ID!
-      if (id && clipboardList.value[lastIndex]) {
-          clipboardList.value[lastIndex].id = id
-          console.log(`🔄 Updated local item ID to Server ID: ${id}`)
-      }
-      return
-  }
-
-  // If new, push it
-  clipboardList.value.push({
-    id: id || Date.now().toString() + Math.random().toString().substr(2, 5),
-    text: text,
-    time: time || getTime()
-  })
-
+  const item = normalizeIncomingClipboard(data)
+  if (!item) return
+  upsertClipboardItem(item, true)
   scrollToBottom()
 }
 
@@ -109,7 +134,7 @@ function sendToHost() {
   isSending.value = true
 
   const text = inputContent.value
-  const id = Date.now().toString() // Use local timestamp as ID base
+  const id = makeLocalId()
 
   // 发送
   conn.sendMessage({
@@ -135,7 +160,7 @@ function addBullet(text: string, fromRemote = false, customId?: string) {
   const last = clipboardList.value[clipboardList.value.length - 1]
   if (last && last.text === text) return
 
-  const finalId = customId || Date.now().toString() + Math.random().toString().substr(2, 5)
+  const finalId = customId || makeLocalId()
 
   clipboardList.value.push({
     id: finalId,
@@ -170,7 +195,7 @@ function handlePaste(event: ClipboardEvent) {
       reader.onload = (e) => {
         const base64 = e.target?.result as string
         if (base64) {
-          const id = Date.now().toString()
+          const id = makeLocalId()
           // 直接发送 Base64 图片
           conn.sendMessage({
             type: 'clipboard_push',
@@ -203,7 +228,7 @@ async function readLocalClipboard() {
           reader.onload = (e) => {
             const base64 = e.target?.result as string
             if (base64) {
-              const id = Date.now().toString()
+              const id = makeLocalId()
               conn.sendMessage({ type: 'clipboard_push', payload: { text: base64, id } })
               addBullet(base64, false, id)
             }
@@ -219,7 +244,7 @@ async function readLocalClipboard() {
     // 2. 尝试读取纯文本
     const text = await navigator.clipboard.readText()
     if (text) {
-      const id = Date.now().toString()
+      const id = makeLocalId()
       conn.sendMessage({ type: 'clipboard_push', payload: { text, id } })
       addBullet(text, false, id)
       ElMessage.success('已读取本机剪切板')
