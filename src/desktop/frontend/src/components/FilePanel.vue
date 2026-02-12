@@ -94,7 +94,26 @@ const uploadLanNative = async () => {
 }
 
 const openLanDownload = (file: any) => {
-    window.open(`http://localhost:${lanPort.value}/api/lan/download/${file.id}`, '_blank')
+    const url = `http://localhost:${lanPort.value}/api/lan/download/${file.id}`
+    try {
+        const opened = window.open('', '_blank')
+        if (opened) {
+            try {
+                opened.opener = null
+            } catch {
+                // ignore
+            }
+            opened.location.href = url
+            return
+        }
+    } catch {
+        // ignore
+    }
+    try {
+        window.location.assign(url)
+    } catch {
+        ElMessage.error('系统阻止了下载，请重试')
+    }
 }
 
 // --- Cloud Drive Logic ---
@@ -156,6 +175,23 @@ const fetchCloudFiles = async () => {
         }
     } catch (e) {
         console.error("Fetch Cloud Files Failed", e)
+    }
+}
+
+const deleteCloudFile = async (file: any) => {
+    const fileId = String(file?.uid || '').trim()
+    if (!fileId) return
+    try {
+        const baseUrl = resolveCloudBaseURL()
+        const res = await fetch(`${baseUrl}/api/files/${encodeURIComponent(fileId)}`, {
+            method: 'DELETE'
+        })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        ElMessage.success('云端文件已删除')
+        fetchCloudFiles()
+    } catch (e) {
+        console.error('Delete cloud file failed', e)
+        ElMessage.error('删除失败')
     }
 }
 
@@ -256,7 +292,7 @@ onMounted(async () => {
                         <a :href="file.url" target="_blank">
                             <el-button circle :icon="Download" size="small" type="success" plain />
                         </a>
-                        <el-button circle :icon="Delete" size="small" type="danger" plain @click="cloudFileList.splice(cloudFileList.indexOf(file), 1)"/>
+                        <el-button circle :icon="Delete" size="small" type="danger" plain @click="deleteCloudFile(file)"/>
                     </div>
                 </div>
             </div>

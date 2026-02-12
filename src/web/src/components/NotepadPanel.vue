@@ -17,11 +17,28 @@ const activeTab = ref('default')
 const notes = ref<Note[]>([])
 const saveStatus = ref('已同步')
 const NOTE_ACK_TIMEOUT_MS = 10_000
+const NOTE_RETRY_DELAY_MS = 1_500
+const NOTE_MAX_RETRIES = 3
+const NOTE_DELETE_ACK_TIMEOUT_MS = 8_000
 
 // 防抖定时器映射 (id -> timer)
 const timers: Record<string, number> = {}
 let notepadHandler: ((type: string, payload: any) => void) | null = null
-const noteSyncState = new Map<string, { inFlight: boolean; pending: boolean; timer?: number }>()
+type NoteSyncState = {
+  inFlight: boolean
+  pending: boolean
+  timer?: number
+  retryCount: number
+  retryTimer?: number
+}
+type PendingDeleteState = {
+  note: Note
+  index: number
+  activeBeforeDelete: boolean
+  timer: number
+}
+const noteSyncState = new Map<string, NoteSyncState>()
+const pendingDeleteState = new Map<string, PendingDeleteState>()
 
 function normalizeUpdatedAt(input: unknown): number {
   const n = Number(input)
@@ -40,9 +57,17 @@ function normalizeNote(payload: any): Note | null {
   }
 }
 
-function applyRemoteNote(payload: any) {
+function hasLocalPendingChanges(noteId: string): boolean {
+  if (!noteId) return false
+  if (timers[noteId]) return true
+  const state = noteSyncState.get(noteId)
+  return !!state?.inFlight || !!state?.pending
+}
+
+function applyRemoteNote(payload: any, preserveLocalIfDirty = true) {
   const incoming = normalizeNote(payload)
   if (!incoming) return
+  if (pendingDeleteState.has(incoming.id)) return
 
   const idx = notes.value.findIndex(n => n.id === incoming.id)
   if (idx === -1) {
@@ -56,6 +81,17 @@ function applyRemoteNote(payload: any) {
   const incomingTs = normalizeUpdatedAt(incoming.updatedAt)
 
   if (incomingTs > 0 && currentTs > 0 && incomingTs < currentTs) {
+    return
+  }
+
+  if (
+    preserveLocalIfDirty &&
+    hasLocalPendingChanges(incoming.id) &&
+    (current.content !== incoming.content || current.title !== incoming.title)
+  ) {
+    if (incomingTs > currentTs) {
+      current.updatedAt = incomingTs
+    }
     return
   }
 
@@ -78,7 +114,13 @@ function clearNoteTimer(noteId: string) {
 function getNoteSyncState(noteId: string) {
   const existing = noteSyncState.get(noteId)
   if (existing) return existing
-  const created = { inFlight: false, pending: false, timer: undefined as number | undefined }
+  const created: NoteSyncState = {
+    inFlight: false,
+    pending: false,
+    timer: undefined,
+    retryCount: 0,
+    retryTimer: undefined
+  }
   noteSyncState.set(noteId, created)
   return created
 }
@@ -90,8 +132,16 @@ function clearNoteSyncTimer(noteId: string) {
   state.timer = undefined
 }
 
+function clearNoteRetryTimer(noteId: string) {
+  const state = noteSyncState.get(noteId)
+  if (!state?.retryTimer) return
+  window.clearTimeout(state.retryTimer)
+  state.retryTimer = undefined
+}
+
 function clearNoteSyncState(noteId: string) {
   clearNoteSyncTimer(noteId)
+  clearNoteRetryTimer(noteId)
   noteSyncState.delete(noteId)
 }
 
@@ -110,12 +160,36 @@ function onNoteSyncSettled(noteId: string) {
   const state = noteSyncState.get(noteId)
   if (!state) return
   clearNoteSyncTimer(noteId)
+  clearNoteRetryTimer(noteId)
   state.inFlight = false
+  state.retryCount = 0
   if (!state.pending) return
   state.pending = false
   const latest = notes.value.find(n => n.id === noteId)
   if (!latest) return
-  queueSend(latest)
+  sendUpdate(latest)
+}
+
+function clearPendingDeleteState(noteId: string) {
+  const state = pendingDeleteState.get(noteId)
+  if (!state) return
+  window.clearTimeout(state.timer)
+  pendingDeleteState.delete(noteId)
+}
+
+function restorePendingDelete(noteId: string) {
+  const state = pendingDeleteState.get(noteId)
+  if (!state) return
+
+  const exists = notes.value.some(n => n.id === noteId)
+  if (!exists) {
+    const insertAt = Math.max(0, Math.min(state.index, notes.value.length))
+    notes.value.splice(insertAt, 0, state.note)
+  }
+  if (state.activeBeforeDelete) {
+    activeTab.value = noteId
+  }
+  clearPendingDeleteState(noteId)
 }
 
 // 初始化
@@ -124,8 +198,14 @@ onMounted(() => {
   notepadHandler = (type, payload) => {
     console.log(`📝 NotepadPanel received: ${type}`, payload)
     if (type === 'init') {
+      for (const key of Object.keys(timers)) {
+        clearNoteTimer(key)
+      }
       for (const [id] of noteSyncState) {
         clearNoteSyncState(id)
+      }
+      for (const [id] of pendingDeleteState) {
+        clearPendingDeleteState(id)
       }
       const initNotes = Array.isArray(payload)
         ? payload.map(normalizeNote).filter((n): n is Note => !!n)
@@ -144,8 +224,14 @@ onMounted(() => {
       saveStatus.value = '已同步至云端'
       const ackId = String(payload?.id || '')
       if (ackId) onNoteSyncSettled(ackId)
+    } else if (type === 'notepad_delete_ack') {
+      const ackId = String(payload?.id || '')
+      if (ackId) {
+        clearPendingDeleteState(ackId)
+      }
+      saveStatus.value = '已同步至云端'
     } else if (type === 'notepad_conflict') {
-      applyRemoteNote(payload)
+      applyRemoteNote(payload, false)
       saveStatus.value = '检测到并发修改，已回滚到远端版本'
       ElMessage.warning('记事本发生并发编辑，已同步为最新远端版本')
       const conflictId = String(payload?.id || '')
@@ -153,11 +239,13 @@ onMounted(() => {
     } else if (type === 'notepad_delete') {
       // payload: { id }
       clearNoteTimer(payload.id)
-      clearNoteSyncState(String(payload?.id || ''))
-      const idx = notes.value.findIndex(n => n.id === payload.id)
+      const noteId = String(payload?.id || '')
+      clearNoteSyncState(noteId)
+      clearPendingDeleteState(noteId)
+      const idx = notes.value.findIndex(n => n.id === noteId)
       if (idx !== -1) {
         notes.value.splice(idx, 1)
-        if (activeTab.value === payload.id) {
+        if (activeTab.value === noteId) {
           activeTab.value = notes.value[0]?.id || ''
         }
       }
@@ -174,6 +262,9 @@ onBeforeUnmount(() => {
   }
   for (const [id] of noteSyncState) {
     clearNoteSyncState(id)
+  }
+  for (const [id] of pendingDeleteState) {
+    clearPendingDeleteState(id)
   }
   if (conn.onNotepadEvent === notepadHandler) {
     conn.onNotepadEvent = null
@@ -202,15 +293,29 @@ function sendUpdate(note: Note) {
   state.inFlight = true
   state.pending = false
   clearNoteSyncTimer(noteId)
+  clearNoteRetryTimer(noteId)
   state.timer = window.setTimeout(() => {
     const current = noteSyncState.get(noteId)
     if (!current || !current.inFlight) return
     current.inFlight = false
-    saveStatus.value = '同步超时，稍后重试'
+    clearNoteSyncTimer(noteId)
+    saveStatus.value = '同步超时，重试中...'
     if (current.pending) {
       current.pending = false
       const latest = notes.value.find(n => n.id === noteId)
-      if (latest) queueSend(latest)
+      if (latest) sendUpdate(latest)
+      return
+    }
+
+    if (current.retryCount < NOTE_MAX_RETRIES) {
+      current.retryCount += 1
+      current.retryTimer = window.setTimeout(() => {
+        const latest = notes.value.find(n => n.id === noteId)
+        if (!latest) return
+        sendUpdate(latest)
+      }, NOTE_RETRY_DELAY_MS)
+    } else {
+      saveStatus.value = '同步失败，请继续编辑后重试'
     }
   }, NOTE_ACK_TIMEOUT_MS)
   saveStatus.value = '同步中...'
@@ -243,14 +348,34 @@ function handleTabsEdit(targetName: string | undefined, action: 'remove' | 'add'
     }).then(() => {
       clearNoteTimer(noteId)
       clearNoteSyncState(noteId)
-      // 本地先删
       const idx = notes.value.findIndex(n => n.id === noteId)
-      if (idx !== -1) notes.value.splice(idx, 1)
+      if (idx === -1) return
+      const note = notes.value[idx]
+      if (!note) return
+      const snapshot: Note = { ...note }
+      const activeBeforeDelete = activeTab.value === noteId
+
+      // 本地先删
+      notes.value.splice(idx, 1)
 
       // 切换 tab
       if (activeTab.value === noteId) {
         activeTab.value = notes.value[0]?.id || ''
       }
+
+      const rollbackTimer = window.setTimeout(() => {
+        const pending = pendingDeleteState.get(noteId)
+        if (!pending) return
+        restorePendingDelete(noteId)
+        ElMessage.warning('删除同步超时，已恢复该笔记')
+      }, NOTE_DELETE_ACK_TIMEOUT_MS)
+
+      pendingDeleteState.set(noteId, {
+        note: snapshot,
+        index: idx,
+        activeBeforeDelete,
+        timer: rollbackTimer
+      })
 
       // 通知服务器
       conn.sendMessage({

@@ -65,6 +65,9 @@ export const useConnectionStore = defineStore('connection', () => {
     const onClipboardHistory = ref<((items: any[]) => void) | null>(null)
     const onClipboardDelete = ref<((id: number | string) => void) | null>(null) // New Callback
     const onNotepadEvent = ref<((type: string, data: any) => void) | null>(null)
+    const pendingClipboardHistory = ref<any[] | null>(null)
+    const pendingClipboardEvents = ref<Array<{ type: 'data' | 'delete'; payload: any }>>([])
+    const MAX_PENDING_CLIPBOARD_EVENTS = 100
     const pendingNotepadInit = ref<any[] | null>(null)
     const pendingNotepadEvents = ref<Array<{ type: string, payload: any }>>([])
     const MAX_PENDING_NOTEPAD_EVENTS = 100
@@ -103,6 +106,69 @@ export const useConnectionStore = defineStore('connection', () => {
         pendingNotepadEvents.value = []
         for (const evt of buffered) {
             onNotepadEvent.value(evt.type, evt.payload)
+        }
+    }
+
+    function dispatchClipboardHistory(history: any[]) {
+        const payload = Array.isArray(history) ? history : []
+        if (onClipboardHistory.value) {
+            onClipboardHistory.value(payload)
+            return
+        }
+        pendingClipboardHistory.value = payload
+    }
+
+    function dispatchClipboardData(payload: any) {
+        if (onClipboardData.value) {
+            onClipboardData.value(payload)
+            return
+        }
+        pendingClipboardEvents.value.push({ type: 'data', payload })
+        if (pendingClipboardEvents.value.length > MAX_PENDING_CLIPBOARD_EVENTS) {
+            pendingClipboardEvents.value.shift()
+        }
+    }
+
+    function dispatchClipboardDelete(id: number | string) {
+        if (onClipboardDelete.value) {
+            onClipboardDelete.value(id)
+            return
+        }
+        pendingClipboardEvents.value.push({ type: 'delete', payload: id })
+        if (pendingClipboardEvents.value.length > MAX_PENDING_CLIPBOARD_EVENTS) {
+            pendingClipboardEvents.value.shift()
+        }
+    }
+
+    function replayPendingClipboardEvents() {
+        if (pendingClipboardHistory.value && onClipboardHistory.value) {
+            onClipboardHistory.value(pendingClipboardHistory.value)
+            pendingClipboardHistory.value = null
+        }
+
+        if (pendingClipboardEvents.value.length === 0) return
+
+        const buffered = [...pendingClipboardEvents.value]
+        pendingClipboardEvents.value = []
+        for (const evt of buffered) {
+            if (evt.type === 'data') {
+                if (onClipboardData.value) {
+                    onClipboardData.value(evt.payload)
+                } else {
+                    pendingClipboardEvents.value.push(evt)
+                }
+                continue
+            }
+
+            if (onClipboardDelete.value) {
+                onClipboardDelete.value(evt.payload)
+            } else {
+                pendingClipboardEvents.value.push(evt)
+            }
+        }
+
+        if (pendingClipboardEvents.value.length > MAX_PENDING_CLIPBOARD_EVENTS) {
+            pendingClipboardEvents.value = pendingClipboardEvents.value.slice(-MAX_PENDING_CLIPBOARD_EVENTS)
         }
     }
 
@@ -1194,10 +1260,32 @@ export const useConnectionStore = defineStore('connection', () => {
         return fileId
     }
 
-    function requestP2PRelayFile(fileId: string) {
+    function requestP2PRelayFile(fileId: string, options?: { preferDirect?: boolean; reason?: string }) {
         sendMessage({
             type: 'p2p_relay_request',
-            payload: { id: fileId, requesterId: selfPeerId }
+            payload: {
+                id: fileId,
+                requesterId: selfPeerId,
+                preferDirect: !!options?.preferDirect,
+                reason: String(options?.reason || '')
+            }
+        })
+    }
+
+    function notifyP2POfferRemoved(ids: string[]) {
+        const cleanIds = Array.from(new Set(
+            (ids || [])
+                .map((id) => String(id || '').trim())
+                .filter(Boolean)
+        ))
+        if (cleanIds.length === 0) return
+        sendMessage({
+            type: 'p2p_offer_removed',
+            payload: {
+                ids: cleanIds,
+                from: selfPeerId,
+                at: Date.now()
+            }
         })
     }
 
@@ -1208,7 +1296,12 @@ export const useConnectionStore = defineStore('connection', () => {
         vpsRelayOffers.value.delete(id)
     }
 
-    async function handleP2PRelayRequest(fileId: string, requesterId?: string) {
+    async function handleP2PRelayRequest(
+        fileId: string,
+        requesterId?: string,
+        preferDirect = false,
+        requestReason = ''
+    ) {
         const file = localFiles.value.get(fileId)
         if (!file) return
 
@@ -1237,6 +1330,12 @@ export const useConnectionStore = defineStore('connection', () => {
                 console.error('VPS relay fallback failed', err)
                 ElMessage.error(`LAN/WebRTC 均失败，且 VPS 中转不可用: ${file.name}`)
             }
+        }
+
+        if (preferDirect) {
+            const reason = requestReason ? `requester_prefer_direct:${requestReason}` : 'requester_prefer_direct'
+            await fallbackToWebRTC(reason)
+            return
         }
 
         const activeLanServer = getActiveLanServer()
@@ -1352,6 +1451,14 @@ export const useConnectionStore = defineStore('connection', () => {
 
         console.log(`📤 Uploading ${file.name} to Desktop LAN server on demand...`)
         ElMessage.info(`📤 正在上传 ${file.name} 到主机...`)
+        if (onLanEvent.value) {
+            onLanEvent.value('lan_offer', {
+                id: fileId,
+                name: file.name,
+                size: file.size,
+                status: 'uploading'
+            })
+        }
 
         try {
             const relayId = `relay-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
@@ -1359,22 +1466,25 @@ export const useConnectionStore = defineStore('connection', () => {
             const sendLanReady = () => {
                 if (readySent) return
                 readySent = true
+                const readyPayload = {
+                    originalId: fileId,
+                    lanFileId: relayId,
+                    name: file.name,
+                    size: file.size,
+                    ip: activeLanServer.ip,
+                    httpPort: activeLanServer.httpPort,
+                    h3Port: activeLanServer.h3Port,
+                    certHash: activeLanServer.certHash,
+                    isRelay: true,
+                    from: selfPeerId,
+                    to: requesterId
+                }
                 sendMessage({
                     type: 'lan_file_ready',
-                    payload: {
-                        originalId: fileId,
-                        lanFileId: relayId,
-                        name: file.name,
-                        size: file.size,
-                        ip: activeLanServer.ip,
-                        httpPort: activeLanServer.httpPort,
-                        h3Port: activeLanServer.h3Port,
-                        certHash: activeLanServer.certHash,
-                        isRelay: true,
-                        from: selfPeerId,
-                        to: requesterId
-                    }
+                    payload: readyPayload
                 })
+                // Sender also needs local status sync (server broadcasts to others only).
+                if (onLanEvent.value) onLanEvent.value('lan_ready', readyPayload)
             }
 
             if (activeLanServer.h3Port && activeLanServer.certHash) {
@@ -1389,6 +1499,14 @@ export const useConnectionStore = defineStore('connection', () => {
                 uploadToLanRelay(file, activeLanServer, relayId, true).catch(e => {
                     console.error("HTTP Relay Upload Aborted", e)
                     notifyLanFileFailed(fileId, 'http_relay_upload_failed', requesterId)
+                    if (onLanEvent.value) {
+                        onLanEvent.value('lan_offer', {
+                            id: fileId,
+                            name: file.name,
+                            size: file.size,
+                            status: 'pending'
+                        })
+                    }
                 })
                 // HTTP relay has no explicit ready ack; send ready once upload request starts.
                 sendLanReady()
@@ -1398,15 +1516,39 @@ export const useConnectionStore = defineStore('connection', () => {
 
             if (window.location.protocol === 'https:') {
                 notifyLanFileFailed(fileId, 'https_http_relay_blocked', requesterId)
+                if (onLanEvent.value) {
+                    onLanEvent.value('lan_offer', {
+                        id: fileId,
+                        name: file.name,
+                        size: file.size,
+                        status: 'pending'
+                    })
+                }
                 ElMessage.warning('当前为 HTTPS 页面，HTTP 中转被浏览器拦截；请确保 LAN WebTransport 可用')
             } else {
                 notifyLanFileFailed(fileId, 'no_lan_transport', requesterId)
+                if (onLanEvent.value) {
+                    onLanEvent.value('lan_offer', {
+                        id: fileId,
+                        name: file.name,
+                        size: file.size,
+                        status: 'pending'
+                    })
+                }
                 ElMessage.error('没有可用的 LAN 中转通道')
             }
             return
         } catch (e) {
             console.error('Failed to upload on demand', e)
             notifyLanFileFailed(fileId, 'relay_start_failed', requesterId)
+            if (onLanEvent.value) {
+                onLanEvent.value('lan_offer', {
+                    id: fileId,
+                    name: file.name,
+                    size: file.size,
+                    status: 'pending'
+                })
+            }
             ElMessage.error('上传失败')
         }
     }
@@ -1416,7 +1558,7 @@ export const useConnectionStore = defineStore('connection', () => {
         // or until server times out (we rely on server timeout)
         console.log(`🚀 Starting Relay Stream: ${relayId}`)
         startTransferTelemetry('lan-http-relay', 'upload', file.name, file.size, 'LAN HTTP relay')
-        const relayUrl = `http://${server.ip}:${server.httpPort}/api/lan/relay/upload/${relayId}?name=${encodeURIComponent(file.name)}&persist=${persistToHost ? '1' : '0'}`
+        const relayUrl = `http://${server.ip}:${server.httpPort}/api/lan/relay/upload/${relayId}?name=${encodeURIComponent(file.name)}&persist=${persistToHost ? '1' : '0'}&size=${file.size}`
         const res = await fetch(relayUrl, { method: 'POST', body: file })
         if (!res.ok) {
             finishTransferTelemetry('error', `HTTP ${res.status}`)
@@ -1600,6 +1742,49 @@ export const useConnectionStore = defineStore('connection', () => {
         return !isDesktop.value && downloadMode.value === 'speed'
     }
 
+    function triggerBrowserDownloadURL(url: string, suggestedName = ''): boolean {
+        const target = String(url || '').trim()
+        if (!target) return false
+
+        try {
+            const a = document.createElement('a')
+            a.href = target
+            a.target = '_blank'
+            a.rel = 'noopener noreferrer'
+            if (suggestedName) {
+                a.download = suggestedName
+            }
+            a.style.display = 'none'
+            document.body.appendChild(a)
+            a.click()
+            document.body.removeChild(a)
+            return true
+        } catch {
+            // ignore
+        }
+
+        try {
+            const opened = window.open(target, '_blank')
+            if (opened) {
+                try {
+                    opened.opener = null
+                } catch {
+                    // ignore cross-origin access errors
+                }
+                return true
+            }
+        } catch {
+            // ignore
+        }
+
+        try {
+            window.location.assign(target)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     function openLanDownloadURL(
         fileId: string,
         fileName: string,
@@ -1613,37 +1798,6 @@ export const useConnectionStore = defineStore('connection', () => {
         const path = isRelay
             ? `/api/lan/relay/download/${fileId}`
             : `/api/lan/download/${fileId}`
-
-        const openUrl = (url: string) => {
-            // Prefer window.open so we can detect popup blocking.
-            const opened = window.open(url, '_blank', 'noopener')
-            if (!opened) return false
-            try {
-                opened.opener = null
-            } catch {
-                // ignore cross-origin access errors
-            }
-            return true
-        }
-
-        const probeLanHttps = async (): Promise<boolean> => {
-            if (!h3Port) return false
-            const controller = new AbortController()
-            const timer = window.setTimeout(() => controller.abort(), 1800)
-            try {
-                const probeUrl = `https://${ip}:${h3Port}/api/lan/files`
-                const res = await fetch(probeUrl, {
-                    method: 'GET',
-                    cache: 'no-store',
-                    signal: controller.signal
-                })
-                return res.ok
-            } catch {
-                return false
-            } finally {
-                window.clearTimeout(timer)
-            }
-        }
 
         const pushHttp = () => {
             if (!httpPort) return
@@ -1660,41 +1814,67 @@ export const useConnectionStore = defineStore('connection', () => {
             }
         }
 
+        const probeLanHttpsReachable = async (): Promise<boolean> => {
+            if (!h3Port) return false
+            const controller = new AbortController()
+            const timer = window.setTimeout(() => controller.abort(), 1200)
+            try {
+                // no-cors probe: resolves for reachable HTTPS endpoint, rejects on TLS/network failures.
+                await fetch(`https://${ip}:${h3Port}/api/lan/files`, {
+                    method: 'GET',
+                    mode: 'no-cors',
+                    cache: 'no-store',
+                    signal: controller.signal
+                })
+                return true
+            } catch {
+                return false
+            } finally {
+                window.clearTimeout(timer)
+            }
+        }
+
+        const candidates: Array<{ kind: 'http' | 'https'; url: string }> = []
+        const https = pushHttps()
+        if (https) candidates.push(https)
+        const http = pushHttp()
+        if (http) candidates.push(http)
+
         return (async () => {
-            const candidates: Array<{ kind: 'http' | 'https'; url: string }> = []
-            const httpsReachable = await probeLanHttps()
-            if (httpsReachable) {
-                const https = pushHttps()
-                if (https) candidates.push(https)
-                const http = pushHttp()
-                if (http) candidates.push(http)
-            } else {
-                const http = pushHttp()
-                if (http) candidates.push(http)
-                // If only H3 exists, keep a best-effort HTTPS handoff.
-                if (!http) {
-                    const https = pushHttps()
-                    if (https) candidates.push(https)
+            let selected: { kind: 'http' | 'https'; url: string } | null = null
+
+            if (https) {
+                if (http) {
+                    const httpsReachable = await probeLanHttpsReachable()
+                    selected = httpsReachable ? https : http
+                } else {
+                    selected = https
                 }
+            } else if (http) {
+                selected = http
             }
 
-            for (const candidate of candidates) {
-                if (!openUrl(candidate.url)) continue
-                if (candidate.kind === 'https') {
-                    setTransferRoute('lan-url-https')
-                    console.info(`📥 Download route: lan-url-https -> ${candidate.url}`)
-                    finishTransferTelemetry('handoff', `URL handoff: HTTPS${isRelay ? ' relay' : ''}`)
-                    return 'https'
-                }
-                setTransferRoute('lan-url-http')
-                console.info(`📥 Download route: lan-url-http -> ${candidate.url}`)
-                finishTransferTelemetry('handoff', `URL handoff: HTTP${isRelay ? ' relay' : ''}`)
-                return 'http'
+            if (!selected) {
+                finishTransferTelemetry('error', 'No LAN URL available')
+                return null
             }
 
+            const opened = triggerBrowserDownloadURL(selected.url, fileName)
+            if (!opened) {
+                finishTransferTelemetry('error', 'Browser blocked download navigation')
+                return null
+            }
+
+            setTransferRoute(selected.kind === 'https' ? 'lan-url-https' : 'lan-url-http')
+            console.info(`📥 Download route: lan-url-${selected.kind} -> ${selected.url}`)
+            finishTransferTelemetry('handoff', `URL handoff: ${selected.kind.toUpperCase()}${isRelay ? ' relay' : ''}`)
+            return selected.kind
+
+        })().catch((err) => {
+            console.warn('openLanDownloadURL failed', err)
             finishTransferTelemetry('error', 'No LAN URL available')
             return null
-        })()
+        })
     }
 
     function sleep(ms: number): Promise<void> {
@@ -1744,15 +1924,10 @@ export const useConnectionStore = defineStore('connection', () => {
             startTransferTelemetry('browser-url', 'download', fallbackName, totalSizeHint || 0, 'Browser download manager')
             setTransferRoute('vps-url')
             console.info(`📥 Download route: vps-url -> ${downloadUrl}`)
-            const opened = window.open(downloadUrl, '_blank', 'noopener')
+            const opened = triggerBrowserDownloadURL(downloadUrl, fallbackName)
             if (!opened) {
-                finishTransferTelemetry('error', 'Browser blocked download popup')
+                finishTransferTelemetry('error', 'Browser blocked download navigation')
                 return false
-            }
-            try {
-                opened.opener = null
-            } catch {
-                // ignore cross-origin access errors
             }
             finishTransferTelemetry('handoff', 'URL handoff: VPS relay')
             return true
@@ -2537,7 +2712,7 @@ export const useConnectionStore = defineStore('connection', () => {
         if (!file) return
 
         const CHUNK_SIZE = 16 * 1024 // 16KB chunks to be safe with WebSocket frames
-        const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
+        const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE))
 
         // Read and send
         for (let i = 0; i < totalChunks; i++) {
@@ -2628,9 +2803,9 @@ export const useConnectionStore = defineStore('connection', () => {
                         if (msg.payload.notes) {
                             dispatchNotepadEvent('init', msg.payload.notes)
                         }
-                        if (msg.payload.clipboardHistory && onClipboardHistory.value) {
+                        if (msg.payload.clipboardHistory) {
                             console.log('📜 Init: History received', msg.payload.clipboardHistory)
-                            onClipboardHistory.value(msg.payload.clipboardHistory)
+                            dispatchClipboardHistory(msg.payload.clipboardHistory)
                         } else {
                             console.log('📜 Init: No history in payload', msg.payload)
                         }
@@ -2640,6 +2815,7 @@ export const useConnectionStore = defineStore('connection', () => {
                 case 'notepad_update':
                 case 'notepad_ack':
                 case 'notepad_conflict':
+                case 'notepad_delete_ack':
                 case 'notepad_delete':
                     console.log(`📝 Store handling ${msg.type}`, msg.payload)
                     dispatchNotepadEvent(msg.type, msg.payload)
@@ -2648,15 +2824,15 @@ export const useConnectionStore = defineStore('connection', () => {
                 case 'clipboard_data':
                 case 'clipboard_push': // 接收其它端的剪切板推送
                     // Unified: Pass full payload (with ID) to UI
-                    if (msg.payload && onClipboardData.value) {
-                        onClipboardData.value(msg.payload)
+                    if (msg.payload) {
+                        dispatchClipboardData(msg.payload)
                     }
                     break
 
                 case 'clipboard_delete':
                     console.log('🔄 Store: Received clipboard_delete message', msg.payload)
-                    if (msg.payload && msg.payload.id && onClipboardDelete.value) {
-                        onClipboardDelete.value(msg.payload.id)
+                    if (msg.payload && msg.payload.id) {
+                        dispatchClipboardDelete(msg.payload.id)
                     } else {
                         console.warn('⚠️ Store: clipboard_delete missing ID or handler not set', {
                             payload: msg.payload,
@@ -2916,8 +3092,26 @@ export const useConnectionStore = defineStore('connection', () => {
                     }
                     break
 
+                case 'p2p_offer_removed':
+                    if (Array.isArray(msg.payload?.ids)) {
+                        for (const id of msg.payload.ids) {
+                            removeSharedOffer(id)
+                        }
+                    } else {
+                        removeSharedOffer(msg.payload?.id)
+                    }
+                    if (onP2PEvent.value) {
+                        onP2PEvent.value('offer_removed', msg.payload)
+                    }
+                    break
+
                 case 'p2p_relay_request':
-                    void handleP2PRelayRequest(msg.payload.id, msg.payload.requesterId || msg.payload.from)
+                    void handleP2PRelayRequest(
+                        msg.payload.id,
+                        msg.payload.requesterId || msg.payload.from,
+                        !!msg.payload?.preferDirect,
+                        String(msg.payload?.reason || '')
+                    )
                     break
 
                 case 'p2p_relay_ready':
@@ -2959,6 +3153,7 @@ export const useConnectionStore = defineStore('connection', () => {
         onClipboardData,
         onClipboardHistory,
         onClipboardDelete, // Export new callback
+        replayPendingClipboardEvents,
         onNotepadEvent,
         replayPendingNotepadEvents,
         onP2PEvent,
@@ -2970,6 +3165,7 @@ export const useConnectionStore = defineStore('connection', () => {
         requestLanFile,
         notifyLanFileConsumed,
         requestP2PRelayFile,
+        notifyP2POfferRemoved,
         removeSharedOffer,
         HTTP_URL,
         disconnect: closeConnection,

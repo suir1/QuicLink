@@ -98,6 +98,43 @@ function formatSize(bytes: number) {
   return (bytes / Math.pow(k, i)).toPrecision(3) + ' ' + sizes[i]
 }
 
+function safeOpenDownloadURL(url: string): boolean {
+  const target = String(url || '').trim()
+  if (!target) return false
+  try {
+    const a = document.createElement('a')
+    a.href = target
+    a.target = '_blank'
+    a.rel = 'noopener noreferrer'
+    a.style.display = 'none'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    return true
+  } catch {
+    // ignore
+  }
+  try {
+    const opened = window.open(target, '_blank')
+    if (opened) {
+      try {
+        opened.opener = null
+      } catch {
+        // ignore
+      }
+      return true
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    window.location.assign(target)
+    return true
+  } catch {
+    return false
+  }
+}
+
 // 监听 Drag & Drop
 function handleDrop(e: DragEvent) {
   e.preventDefault()
@@ -202,6 +239,32 @@ function markFileDismissed(file: P2PFile) {
     pruneDismissedTempSignatures()
     dismissedTempSignatures.value.set(fileSignature(file.name, file.size), Date.now())
   }
+}
+
+function collectOfferIds(file: P2PFile): string[] {
+  return Array.from(new Set(
+    [file.id, file.relayId, file.originalId, file.lanFileId]
+      .map((v) => String(v || '').trim())
+      .filter(Boolean)
+  ))
+}
+
+function removeOffersByIds(ids: string[]) {
+  const cleanIds = Array.from(new Set(
+    (ids || [])
+      .map((id) => String(id || '').trim())
+      .filter(Boolean)
+  ))
+  if (cleanIds.length === 0) return
+
+  for (const id of cleanIds) dismissedOfferIds.value.add(id)
+  const idSet = new Set(cleanIds)
+  fileList.value = fileList.value.filter((f) => {
+    const keys = [f.id, f.relayId, f.originalId, f.lanFileId]
+      .map((v) => String(v || '').trim())
+      .filter(Boolean)
+    return !keys.some((k) => idSet.has(k))
+  })
 }
 
 function shouldIgnoreOffer(payload: any): boolean {
@@ -316,18 +379,19 @@ function upsertOfferFile(payload: any) {
 async function handleDownload(file: P2PFile, fromRelayReady = false) {
   if (file.fromSelf) return
 
+  const requestDirectFallback = (reason: string) => {
+      file.relayStatus = 'requesting'
+      file.lanFileId = undefined
+      conn.requestP2PRelayFile(file.id, {
+          preferDirect: true,
+          reason
+      })
+      ElMessage.warning('LAN 中转不可达，已请求发送方切换 WebRTC/VPS')
+  }
+
   if (file.isRelay) {
       if (!fromRelayReady && file.relayStatus === 'requesting') {
           ElMessage.info('正在请求发送方准备中转，请稍候...')
-          return
-      }
-
-      const browserCompatMode = !conn.isDesktop && !conn.isSpeedDownloadMode()
-      if (browserCompatMode && !fromRelayReady) {
-          file.relayStatus = 'requesting'
-          file.lanFileId = undefined
-          conn.requestP2PRelayFile(file.id)
-          ElMessage.info('已请求发送方启动新的 LAN 中转，请稍候...')
           return
       }
 
@@ -392,19 +456,27 @@ async function handleDownload(file: P2PFile, fromRelayReady = false) {
           }
       }
       if (file.ip && file.httpPort) {
-          window.open(`http://${file.ip}:${file.httpPort}/api/lan/relay/download/${relayId}`, '_blank')
+          const opened = safeOpenDownloadURL(`http://${file.ip}:${file.httpPort}/api/lan/relay/download/${relayId}`)
+          if (!opened) {
+              requestDirectFallback('relay_http_open_failed')
+              return
+          }
           file.relayStatus = 'pending'
           file.lanFileId = undefined
           ElMessage.info(`已切换 HTTP Relay 下载: ${file.name}`)
           return
       }
-      ElMessage.error('无法获取中转下载地址')
+      requestDirectFallback('relay_download_unreachable')
       return
   }
 
   if (file.isVpsRelay && file.vpsRelayUrl) {
       if (!conn.isDesktop && !conn.isSpeedDownloadMode()) {
-          window.open(file.vpsRelayUrl, '_blank')
+          const opened = safeOpenDownloadURL(file.vpsRelayUrl)
+          if (!opened) {
+              ElMessage.error('浏览器阻止了下载，请允许弹窗后重试')
+              return
+          }
           ElMessage.info(`已转浏览器下载: ${file.name}`)
           return
       }
@@ -419,14 +491,22 @@ async function handleDownload(file: P2PFile, fromRelayReady = false) {
       if (ok) {
           ElMessage.success(`下载完成: ${file.name} (VPS Relay)`)
       } else {
-          window.open(file.vpsRelayUrl, '_blank')
-          ElMessage.warning(`流式下载失败，已降级浏览器直链下载: ${file.name}`)
+          const opened = safeOpenDownloadURL(file.vpsRelayUrl)
+          if (opened) {
+              ElMessage.warning(`流式下载失败，已降级浏览器直链下载: ${file.name}`)
+          } else {
+              ElMessage.error(`流式下载失败，且浏览器拦截了直链下载: ${file.name}`)
+          }
       }
       return
   }
 
   if (file.isNetdisk && file.netdiskUrl) {
-      window.open(file.netdiskUrl, '_blank')
+      const opened = safeOpenDownloadURL(file.netdiskUrl)
+      if (!opened) {
+          ElMessage.error('浏览器阻止了下载，请允许弹窗后重试')
+          return
+      }
       ElMessage.info(`正在云端下载: ${file.name}`)
       return
   }
@@ -449,7 +529,11 @@ async function handleDownload(file: P2PFile, fromRelayReady = false) {
       }
       const baseUrl = file.baseUrl || conn.lanServerUrl
       if (baseUrl) {
-          window.open(`${baseUrl}/api/lan/download/${file.id}`, '_blank')
+          const opened = safeOpenDownloadURL(`${baseUrl}/api/lan/download/${file.id}`)
+          if (!opened) {
+              ElMessage.error('浏览器阻止了下载，请允许弹窗后重试')
+              return
+          }
           ElMessage.info(`正在 LAN 直连下载: ${file.name}`)
           return
       }
@@ -481,8 +565,11 @@ onMounted(() => {
         item.httpPort = payload.httpPort
         item.h3Port = payload.h3Port
         item.certHash = payload.certHash
-        if (autoDownload) {
+        const canAutoDownload = autoDownload && (conn.isDesktop || conn.isSpeedDownloadMode())
+        if (canAutoDownload) {
           void handleDownload(item, true)
+        } else if (autoDownload) {
+          ElMessage.info(`📥 ${payload.name} 已就绪，请点击下载`)
         }
       }
       ElMessage.success(`📥 ${payload.name} 已就绪，可开始下载`)
@@ -499,6 +586,11 @@ onMounted(() => {
       if (item && item.fromSelf && item.isVpsRelay) {
         item.progress = 100
       }
+    } else if (type === 'offer_removed') {
+      const ids = Array.isArray(payload?.ids)
+        ? payload.ids
+        : [payload?.id, payload?.relayId, payload?.originalId, payload?.lanFileId]
+      removeOffersByIds(ids)
     }
   }
   conn.onP2PEvent = p2pHandler
@@ -518,13 +610,15 @@ function deleteFile(index: number) {
   const file = fileList.value[index]
   if (!file) return
 
+  const ids = collectOfferIds(file)
   markFileDismissed(file)
   fileList.value.splice(index, 1)
 
+  if (conn.notifyP2POfferRemoved) {
+    conn.notifyP2POfferRemoved(ids)
+  }
+
   if (file.fromSelf && conn.removeSharedOffer) {
-    const ids = [file.id, file.relayId, file.originalId, file.lanFileId]
-      .map((v) => String(v || '').trim())
-      .filter(Boolean)
     for (const id of ids) conn.removeSharedOffer(id)
   }
 }

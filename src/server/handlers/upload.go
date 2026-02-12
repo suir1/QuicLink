@@ -121,3 +121,39 @@ func HandleListFiles(w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(files)
 }
+
+func HandleDeleteFile(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "DELETE, OPTIONS")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/api/files/")
+	id = strings.TrimSpace(id)
+	if id == "" || strings.Contains(id, "/") || id == "." || id == ".." {
+		http.Error(w, "Invalid file id", http.StatusBadRequest)
+		return
+	}
+
+	target := filepath.Join(UploadDir, filepath.Base(id))
+	if err := os.Remove(target); err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "File not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "Delete failed", http.StatusInternalServerError)
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status": "ok",
+		"id":     id,
+	})
+}

@@ -847,7 +847,9 @@ func (a *App) handleIncomingMessage(msgType string, payload map[string]interface
 		// Keep for compatibility if needed, but logic is moved to clipboard_data
 		if content, ok := payload["text"].(string); ok {
 			log.Printf("📋 Received clipboard_push (legacy): %s", truncate(content, 50))
-			a.SetClipboard(content)
+			if a.GetAutoSyncRemoteClipboard() {
+				a.SetClipboard(content)
+			}
 			wailsRuntime.EventsEmit(a.ctx, "clipboard:remote", content)
 		}
 	case "clipboard_data":

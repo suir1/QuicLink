@@ -11,7 +11,9 @@ services:
       # Map host port 3100 to container port 3100
       # Change the left number to expose a different port (e.g., "9000:3100")
       - "3100:3100"
-      - "443:3100"
+      - "443:3100/tcp"
+      - "443:3100/udp"
+      - "80:3101"
     volumes:
       # Mount config file for easy editing (HTTP/HTTPS toggle)
       - ./src/server/config.json:/app/config.json

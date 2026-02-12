@@ -33,10 +33,19 @@ type Room struct {
 
 	// --- 新增：剪贴板历史 ---
 	ClipboardHistory []ClipboardItem
+	DeletedNotes     map[string]int64
 
 	// 读写锁：保证并发安全
 	mutex sync.RWMutex
 }
+
+type NoteUpdateStatus int
+
+const (
+	NoteUpdateApplied NoteUpdateStatus = iota
+	NoteUpdateConflict
+	NoteUpdateDeleted
+)
 
 // Note 记事本单页结构
 type Note struct {
@@ -77,6 +86,7 @@ func GetOrCreateRoom(roomId string) *Room {
 		Clients:          make(map[Connection]bool),
 		Notes:            make(map[string]*Note),
 		ClipboardHistory: make([]ClipboardItem, 0),
+		DeletedNotes:     make(map[string]int64),
 		LastUpdate:       time.Now(),
 		CreatedAt:        time.Now(),
 	}
@@ -145,18 +155,26 @@ func (r *Room) SetHost(conn Connection, info interface{}) {
 
 // UpdateNote updates/creates a note with optimistic concurrency control.
 // If baseUpdatedAt > 0 and doesn't match current note timestamp, update is rejected.
-func (r *Room) UpdateNote(id, title, content string, baseUpdatedAt int64) (Note, bool) {
+// If note was deleted or the update targets a missing note with a historical base timestamp,
+// treat it as stale and return NoteUpdateDeleted.
+func (r *Room) UpdateNote(id, title, content string, baseUpdatedAt int64) (Note, NoteUpdateStatus) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
 	note, exists := r.Notes[id]
 	if !exists {
+		if _, deleted := r.DeletedNotes[id]; deleted {
+			return Note{ID: id}, NoteUpdateDeleted
+		}
+		if baseUpdatedAt > 0 {
+			return Note{ID: id}, NoteUpdateDeleted
+		}
 		note = &Note{ID: id}
 		r.Notes[id] = note
 	}
 
 	if exists && baseUpdatedAt > 0 && note.UpdatedAt != baseUpdatedAt {
-		return *note, false
+		return *note, NoteUpdateConflict
 	}
 
 	now := time.Now().UnixMilli()
@@ -168,8 +186,9 @@ func (r *Room) UpdateNote(id, title, content string, baseUpdatedAt int64) (Note,
 	note.Content = content
 	note.UpdatedAt = now
 
+	delete(r.DeletedNotes, id)
 	r.LastUpdate = time.Now()
-	return *note, true
+	return *note, NoteUpdateApplied
 }
 
 // DeleteNote 删除笔记
@@ -177,6 +196,7 @@ func (r *Room) DeleteNote(id string) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 	delete(r.Notes, id)
+	r.DeletedNotes[id] = time.Now().UnixMilli()
 	r.LastUpdate = time.Now()
 }
 

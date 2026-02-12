@@ -94,6 +94,22 @@ const fetchCloudFiles = async () => {
     }
 }
 
+const deleteCloudFile = async (file: any) => {
+    const fileId = String(file?.uid || '').trim()
+    if (!fileId) return
+    try {
+        const res = await fetch(`${conn.HTTP_URL}/api/files/${encodeURIComponent(fileId)}`, {
+            method: 'DELETE'
+        })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        ElMessage.success('云端文件已删除')
+        fetchCloudFiles()
+    } catch (e) {
+        console.error('Delete cloud file failed', e)
+        ElMessage.error('删除失败')
+    }
+}
+
 // --- LAN Drive Logic ---
 interface LanSharedFile {
     id: string
@@ -208,8 +224,12 @@ const handleLanEvent = (type: string, data: any) => {
             existing.isRelay = data.isRelay
         }
         ElMessage.success(`📥 ${data.name} 已就绪，可下载`)
-        if (autoDownload && existing) {
+        const canAutoDownload = autoDownload && (conn.isDesktop || conn.isSpeedDownloadMode())
+        if (canAutoDownload && existing) {
             void requestDownload(existing)
+        } else if (autoDownload && existing) {
+            downloadingFiles.value.delete(existing.id)
+            ElMessage.info(`📥 ${data.name} 已就绪，请点击下载`)
         }
         if (data?.originalId) {
             clearLanRequestTimeout(data.originalId)
@@ -257,6 +277,38 @@ const clearLanRequestTimeout = (id: string) => {
         window.clearTimeout(timer)
         lanRequestTimers.value.delete(id)
     }
+}
+
+const resetLanPanelState = (clearLocalOffers = false) => {
+    for (const timer of lanRequestTimers.value.values()) {
+        window.clearTimeout(timer)
+    }
+    lanRequestTimers.value.clear()
+    downloadingFiles.value.clear()
+    if (clearLocalOffers) {
+        for (const file of sharedFiles.value.values()) {
+            if (file.source === 'local') {
+                conn.removeSharedOffer(file.id)
+            }
+        }
+    }
+    sharedFiles.value.clear()
+    lanFileList.value = []
+}
+
+const removeLocalSharedFile = (file: LanSharedFile) => {
+    if (file.source !== 'local') return
+    if (file.status === 'uploading') {
+        ElMessage.warning('文件正在上传中，请稍后再试')
+        return
+    }
+    clearLanRequestTimeout(file.id)
+    downloadingFiles.value.delete(file.id)
+    sharedFiles.value.delete(file.id)
+    conn.removeSharedOffer(file.id)
+    // Reuse consumed signal to clear stale remote entries.
+    conn.notifyLanFileConsumed(file.id, file.lanFileId)
+    ElMessage.success(`已移除共享项: ${file.name}`)
 }
 
 const scheduleLanRequestTimeout = (file: LanSharedFile) => {
@@ -405,13 +457,16 @@ const requestDownload = async (file: LanSharedFile) => {
         const autoTriggered = downloadingFiles.value.has(file.id)
         downloadingFiles.value.add(file.id)
         const result = await downloadLanFile(file.lanFileId, file.name, file.ip, file.httpPort, file.isRelay, file.h3Port, file.certHash, autoTriggered)
-        if (result.ok && file.source === 'remote') {
-            // URL handoff has no reliable completion callback, so treat successful handoff
-            // as user-consumed intent and let lan_consumed event drive final cleanup.
-            conn.notifyLanFileConsumed(file.id, file.lanFileId)
-        }
         if (result.ok && file.source === 'remote' && !result.handoff) {
+            // Only mark consumed after a confirmed in-app stream download succeeds.
+            // URL handoff has no completion callback; keep the item for retry.
+            conn.notifyLanFileConsumed(file.id, file.lanFileId)
             sharedFiles.value.delete(file.id)
+        } else if (!result.ok && file.source === 'remote' && file.isRelay) {
+            // Relay tokens may expire or be consumed by failed handoffs, force a fresh request next click.
+            file.status = 'pending'
+            file.lanFileId = undefined
+            clearLanRequestTimeout(file.id)
         }
         downloadingFiles.value.delete(file.id)
     } else if (file.status === 'pending' && file.source === 'remote') {
@@ -459,6 +514,20 @@ watch(() => conn.lanServerUrl, (newUrl) => {
     }
 })
 
+watch(() => conn.isConnected, (connected) => {
+    if (!connected) {
+        resetLanPanelState(true)
+    }
+})
+
+watch(() => conn.currentRoom, (newRoom, oldRoom) => {
+    if (newRoom === oldRoom) return
+    resetLanPanelState(true)
+    if (newRoom && conn.isConnected && conn.lanServerUrl && activeTab.value === 'lan') {
+        fetchLanFiles()
+    }
+})
+
 watch(activeTab, (val) => {
     if (val === 'cloud') fetchCloudFiles()
     if (val === 'lan') fetchLanFiles()
@@ -476,10 +545,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
-    for (const timer of lanRequestTimers.value.values()) {
-        window.clearTimeout(timer)
-    }
-    lanRequestTimers.value.clear()
+    resetLanPanelState(false)
     if (conn.onLanEvent === handleLanEvent) {
         conn.onLanEvent = null
     }
@@ -589,7 +655,7 @@ const statusType = (status: string) => {
                         <a :href="file.url" target="_blank">
                             <el-button circle :icon="Download" size="small" type="success" plain />
                         </a>
-                        <el-button circle :icon="Delete" size="small" type="danger" plain @click="cloudFileList.splice(cloudFileList.indexOf(file), 1)"/>
+                        <el-button circle :icon="Delete" size="small" type="danger" plain @click="deleteCloudFile(file)"/>
                     </div>
                 </div>
             </div>
@@ -650,6 +716,18 @@ const statusType = (status: string) => {
                                 <el-tag size="small" :type="statusType(file.status)" round>{{ statusLabel(file.status) }}</el-tag>
                             </div>
                             <span class="fsize">{{ formatSize(file.size) }}</span>
+                        </div>
+                        <div class="factions">
+                            <el-button
+                                circle
+                                :icon="Delete"
+                                size="small"
+                                type="danger"
+                                plain
+                                :disabled="file.status === 'uploading'"
+                                @click="removeLocalSharedFile(file)"
+                                title="移除共享项"
+                            />
                         </div>
                     </div>
 

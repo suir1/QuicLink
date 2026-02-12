@@ -27,8 +27,8 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 			baseUpdatedAt := parseInt64(payload["baseUpdatedAt"])
 
 			if id != "" {
-				updated, applied := room.UpdateNote(id, title, content, baseUpdatedAt)
-				if applied {
+				updated, status := room.UpdateNote(id, title, content, baseUpdatedAt)
+				if status == store.NoteUpdateApplied {
 					_ = conn.WriteJSON(Message{
 						Type:    "notepad_ack",
 						Payload: updated,
@@ -37,22 +37,35 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 						Type:    "notepad_update",
 						Payload: updated,
 					}, conn)
-				} else {
+				} else if status == store.NoteUpdateConflict {
 					_ = conn.WriteJSON(Message{
 						Type:    "notepad_conflict",
 						Payload: updated,
+					})
+				} else if status == store.NoteUpdateDeleted {
+					_ = conn.WriteJSON(Message{
+						Type: "notepad_delete",
+						Payload: map[string]interface{}{
+							"id": id,
+						},
 					})
 				}
 			}
 		}
 
-	// --- 记事本删除 (Notepad Delete) ---
+		// --- 记事本删除 (Notepad Delete) ---
 	case "notepad_delete":
 		payload, ok := msg.Payload.(map[string]interface{})
 		if ok {
 			id, _ := payload["id"].(string)
 			if id != "" {
 				room.DeleteNote(id)
+				_ = conn.WriteJSON(Message{
+					Type: "notepad_delete_ack",
+					Payload: map[string]interface{}{
+						"id": id,
+					},
+				})
 				room.Broadcast(msg, conn)
 			}
 		}
@@ -139,7 +152,7 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 	// --- LAN 文件共享信令 ---
 	case "lan_file_offer", "lan_file_request", "lan_file_ready", "lan_file_shared",
 		"lan_file_consumed", "lan_file_failed", "lan_list_request", "lan_list_response", "lan_download_request",
-		"p2p_relay_offer", "p2p_relay_request", "p2p_relay_ready",
+		"p2p_relay_offer", "p2p_relay_request", "p2p_relay_ready", "p2p_offer_removed",
 		"netdisk_file", "vps_relay_offer", "vps_relay_ack":
 		room.Broadcast(msg, conn)
 

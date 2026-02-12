@@ -64,6 +64,9 @@ export const useConnectionStore = defineStore('connection', () => {
     const onClipboardHistory = ref<((items: any[]) => void) | null>(null)
     const onClipboardDelete = ref<((id: number | string) => void) | null>(null) // New Callback
     const onNotepadEvent = ref<((type: string, data: any) => void) | null>(null)
+    const pendingClipboardHistory = ref<any[] | null>(null)
+    const pendingClipboardEvents = ref<Array<{ type: 'data' | 'delete'; payload: any }>>([])
+    const MAX_PENDING_CLIPBOARD_EVENTS = 100
     const pendingNotepadInit = ref<any[] | null>(null)
     const pendingNotepadEvents = ref<Array<{ type: string, payload: any }>>([])
     const MAX_PENDING_NOTEPAD_EVENTS = 100
@@ -101,6 +104,69 @@ export const useConnectionStore = defineStore('connection', () => {
         pendingNotepadEvents.value = []
         for (const evt of buffered) {
             onNotepadEvent.value(evt.type, evt.payload)
+        }
+    }
+
+    function dispatchClipboardHistory(history: any[]) {
+        const payload = Array.isArray(history) ? history : []
+        if (onClipboardHistory.value) {
+            onClipboardHistory.value(payload)
+            return
+        }
+        pendingClipboardHistory.value = payload
+    }
+
+    function dispatchClipboardData(payload: any) {
+        if (onClipboardData.value) {
+            onClipboardData.value(payload)
+            return
+        }
+        pendingClipboardEvents.value.push({ type: 'data', payload })
+        if (pendingClipboardEvents.value.length > MAX_PENDING_CLIPBOARD_EVENTS) {
+            pendingClipboardEvents.value.shift()
+        }
+    }
+
+    function dispatchClipboardDelete(id: number | string) {
+        if (onClipboardDelete.value) {
+            onClipboardDelete.value(id)
+            return
+        }
+        pendingClipboardEvents.value.push({ type: 'delete', payload: id })
+        if (pendingClipboardEvents.value.length > MAX_PENDING_CLIPBOARD_EVENTS) {
+            pendingClipboardEvents.value.shift()
+        }
+    }
+
+    function replayPendingClipboardEvents() {
+        if (pendingClipboardHistory.value && onClipboardHistory.value) {
+            onClipboardHistory.value(pendingClipboardHistory.value)
+            pendingClipboardHistory.value = null
+        }
+
+        if (pendingClipboardEvents.value.length === 0) return
+
+        const buffered = [...pendingClipboardEvents.value]
+        pendingClipboardEvents.value = []
+        for (const evt of buffered) {
+            if (evt.type === 'data') {
+                if (onClipboardData.value) {
+                    onClipboardData.value(evt.payload)
+                } else {
+                    pendingClipboardEvents.value.push(evt)
+                }
+                continue
+            }
+
+            if (onClipboardDelete.value) {
+                onClipboardDelete.value(evt.payload)
+            } else {
+                pendingClipboardEvents.value.push(evt)
+            }
+        }
+
+        if (pendingClipboardEvents.value.length > MAX_PENDING_CLIPBOARD_EVENTS) {
+            pendingClipboardEvents.value = pendingClipboardEvents.value.slice(-MAX_PENDING_CLIPBOARD_EVENTS)
         }
     }
 
@@ -690,10 +756,32 @@ export const useConnectionStore = defineStore('connection', () => {
         }
     }
 
-    function requestP2PRelayFile(fileId: string) {
+    function requestP2PRelayFile(fileId: string, options?: { preferDirect?: boolean; reason?: string }) {
         sendMessage({
             type: 'p2p_relay_request',
-            payload: { id: fileId, requesterId: selfPeerId }
+            payload: {
+                id: fileId,
+                requesterId: selfPeerId,
+                preferDirect: !!options?.preferDirect,
+                reason: String(options?.reason || '')
+            }
+        })
+    }
+
+    function notifyP2POfferRemoved(ids: string[]) {
+        const cleanIds = Array.from(new Set(
+            (ids || [])
+                .map((id) => String(id || '').trim())
+                .filter(Boolean)
+        ))
+        if (cleanIds.length === 0) return
+        sendMessage({
+            type: 'p2p_offer_removed',
+            payload: {
+                ids: cleanIds,
+                from: selfPeerId,
+                at: Date.now()
+            }
         })
     }
 
@@ -711,7 +799,7 @@ export const useConnectionStore = defineStore('connection', () => {
             : 'LAN HTTP relay'
         startTransferTelemetry('lan-http-relay', 'upload', file.name, file.size, note)
         try {
-            const url = `http://localhost:${port}/api/lan/relay/upload/${relayId}?name=${encodeURIComponent(file.name)}&persist=0`
+            const url = `http://localhost:${port}/api/lan/relay/upload/${relayId}?name=${encodeURIComponent(file.name)}&persist=0&size=${file.size}`
             const res = await fetch(url, {
                 method: 'POST',
                 body: file
@@ -882,13 +970,16 @@ export const useConnectionStore = defineStore('connection', () => {
         }
     }
 
-    async function handleP2PRelayRequest(fileId: string, requesterId?: string) {
+    async function handleP2PRelayRequest(
+        fileId: string,
+        requesterId?: string,
+        preferDirect = false,
+        requestReason = ''
+    ) {
         const source = relaySources.value.get(fileId)
         if (!source) return
 
-        const localInfo = await getLocalLanInfoNative()
-        const port = localInfo?.httpPort || await getLocalServerPortNative()
-        if (!port) {
+        const fallbackToNonLan = async (reason: string): Promise<boolean> => {
             if (source.nativePath) {
                 try {
                     await shareViaVpsRelayNative(
@@ -898,18 +989,32 @@ export const useConnectionStore = defineStore('connection', () => {
                         source.type,
                         fileId
                     )
-                    ElMessage.warning(`LAN 中转不可用，已切换 VPS 中转: ${source.name}`)
-                    return
+                    ElMessage.warning(`LAN 中转不可用(${reason})，已切换 VPS 中转: ${source.name}`)
+                    return true
                 } catch (e) {
                     console.error('VPS relay fallback failed', e)
                 }
             }
             if (source.file) {
-                // Fallback to existing signaling relay when local LAN server is unavailable.
+                // Fallback to existing signaling relay when LAN relay is unavailable.
                 shareFile(source.file)
-                ElMessage.warning(`LAN 中转不可用，已切换普通中转: ${source.name}`)
-                return
+                ElMessage.warning(`LAN 中转不可用(${reason})，已切换普通中转: ${source.name}`)
+                return true
             }
+            return false
+        }
+
+        if (preferDirect) {
+            const reason = requestReason ? `requester_prefer_direct:${requestReason}` : 'requester_prefer_direct'
+            if (await fallbackToNonLan(reason)) return
+            ElMessage.error(`LAN 中转不可用，且当前文件仅支持原生中转: ${source.name}`)
+            return
+        }
+
+        const localInfo = await getLocalLanInfoNative()
+        const port = localInfo?.httpPort || await getLocalServerPortNative()
+        if (!port) {
+            if (await fallbackToNonLan('no_local_server')) return
             ElMessage.error(`LAN 中转不可用，且当前文件仅支持原生中转: ${source.name}`)
             return
         }
@@ -1006,7 +1111,7 @@ export const useConnectionStore = defineStore('connection', () => {
         if (!file) return
 
         const CHUNK_SIZE = 16 * 1024 // 16KB chunks to be safe with WebSocket frames
-        const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
+        const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE))
 
         // Read and send
         for (let i = 0; i < totalChunks; i++) {
@@ -1097,9 +1202,9 @@ export const useConnectionStore = defineStore('connection', () => {
                         if (msg.payload.notes) {
                             dispatchNotepadEvent('init', msg.payload.notes)
                         }
-                        if (msg.payload.clipboardHistory && onClipboardHistory.value) {
+                        if (msg.payload.clipboardHistory) {
                             console.log('📜 Init: History received', msg.payload.clipboardHistory)
-                            onClipboardHistory.value(msg.payload.clipboardHistory)
+                            dispatchClipboardHistory(msg.payload.clipboardHistory)
                         } else {
                             console.log('📜 Init: No history in payload', msg.payload)
                         }
@@ -1109,6 +1214,7 @@ export const useConnectionStore = defineStore('connection', () => {
                 case 'notepad_update':
                 case 'notepad_ack':
                 case 'notepad_conflict':
+                case 'notepad_delete_ack':
                 case 'notepad_delete':
                     console.log(`📝 Store handling ${msg.type}`, msg.payload)
                     dispatchNotepadEvent(msg.type, msg.payload)
@@ -1116,16 +1222,16 @@ export const useConnectionStore = defineStore('connection', () => {
 
                 case 'clipboard_data':
                 case 'clipboard_push': // 接收其它端的剪切板推送
-                    if (msg.payload && onClipboardData.value) {
+                    if (msg.payload) {
                         // Keep full payload so UI can preserve id/time/type.
-                        onClipboardData.value(msg.payload)
+                        dispatchClipboardData(msg.payload)
                     }
                     break
 
                 case 'clipboard_delete':
                     console.log('🔄 Store: Received clipboard_delete message', msg.payload)
-                    if (msg.payload && msg.payload.id && onClipboardDelete.value) {
-                        onClipboardDelete.value(msg.payload.id)
+                    if (msg.payload && msg.payload.id) {
+                        dispatchClipboardDelete(msg.payload.id)
                     } else {
                         console.warn('⚠️ Store: clipboard_delete missing ID or handler not set', {
                             payload: msg.payload,
@@ -1276,6 +1382,17 @@ export const useConnectionStore = defineStore('connection', () => {
                     }
                     break
 
+                case 'p2p_offer_removed':
+                    if (Array.isArray(msg.payload?.ids)) {
+                        for (const id of msg.payload.ids) {
+                            removeSharedOffer(id)
+                        }
+                    } else {
+                        removeSharedOffer(msg.payload?.id)
+                    }
+                    if (onP2PEvent.value) onP2PEvent.value('offer_removed', msg.payload)
+                    break
+
                 case 'vps_relay_offer':
                     if (onP2PEvent.value) {
                         onP2PEvent.value('offer', {
@@ -1295,7 +1412,12 @@ export const useConnectionStore = defineStore('connection', () => {
                     break
 
                 case 'p2p_relay_request':
-                    handleP2PRelayRequest(msg.payload.id, msg.payload.requesterId || msg.payload.from)
+                    handleP2PRelayRequest(
+                        msg.payload.id,
+                        msg.payload.requesterId || msg.payload.from,
+                        !!msg.payload?.preferDirect,
+                        String(msg.payload?.reason || '')
+                    )
                     break
 
                 case 'p2p_relay_ready':
@@ -1579,10 +1701,29 @@ export const useConnectionStore = defineStore('connection', () => {
         const targetIp = ip || server?.ip
         const targetPort = httpPort || server?.httpPort
         if (!targetIp || !targetPort) return false
+        const url = `http://${targetIp}:${targetPort}/api/lan/relay/download/${relayId}`
         startTransferTelemetry('browser-url', 'download', fileName, 0, 'Browser download manager')
         finishTransferTelemetry('handoff', 'URL handoff: LAN HTTP relay')
-        window.open(`http://${targetIp}:${targetPort}/api/lan/relay/download/${relayId}`, '_blank')
-        return true
+        try {
+            const opened = window.open('', '_blank')
+            if (opened) {
+                try {
+                    opened.opener = null
+                } catch {
+                    // ignore
+                }
+                opened.location.href = url
+                return true
+            }
+        } catch {
+            // ignore
+        }
+        try {
+            window.location.assign(url)
+            return true
+        } catch {
+            return false
+        }
     }
 
     // --- Desktop Specific Methods ---
@@ -1594,13 +1735,13 @@ export const useConnectionStore = defineStore('connection', () => {
             // @ts-ignore
             window.runtime.EventsOn('clipboard:history', (history: any[]) => {
                 console.log('🖥️ Desktop: Clipboard history received', history)
-                if (onClipboardHistory.value) onClipboardHistory.value(history)
+                dispatchClipboardHistory(history)
             })
 
             // @ts-ignore
             window.runtime.EventsOn('clipboard:remote', (payload: any) => {
                 // console.log('🖥️ Desktop: Remote clipboard received', payload)
-                if (onClipboardData.value) onClipboardData.value(payload)
+                dispatchClipboardData(payload)
             })
 
             // @ts-ignore
@@ -1662,6 +1803,7 @@ export const useConnectionStore = defineStore('connection', () => {
         onClipboardData,
         onClipboardHistory,
         onClipboardDelete, // Export new callback
+        replayPendingClipboardEvents,
         onNotepadEvent,
         replayPendingNotepadEvents,
         onP2PEvent,
@@ -1670,6 +1812,7 @@ export const useConnectionStore = defineStore('connection', () => {
         smartRelaySendNativeFile,
         pickNativeRelayFiles,
         requestP2PRelayFile,
+        notifyP2POfferRemoved,
         removeSharedOffer,
         requestFile,
         lanServerUrl,

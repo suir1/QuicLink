@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Close, Promotion, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { nextTick, onBeforeUnmount, ref } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 
 interface ClipboardItem {
@@ -14,6 +14,7 @@ const conn = useConnectionStore()
 const clipboardList = ref<ClipboardItem[]>([])
 const CLIPBOARD_DELETE_ACK_TIMEOUT_MS = 3000
 const CLIPBOARD_INCOMING_DEDUP_WINDOW_MS = 1500
+const CLIPBOARD_MAX_ITEMS = 20
 const pendingDeletes = new Map<string, { item: ClipboardItem; index: number; timerId: number }>()
 const recentIncoming = new Map<string, number>()
 
@@ -40,20 +41,25 @@ function normalizeIncomingClipboard(data: any): ClipboardItem | null {
 }
 
 function upsertClipboardItem(item: ClipboardItem, moveToTail = true): void {
-  const byId = item.id
+  const hasId = !!String(item.id || '').trim()
+  const byId = hasId
     ? clipboardList.value.findIndex(existing => existing.id === item.id)
     : -1
-  const byText = clipboardList.value.findIndex(existing => existing.text === item.text)
+  const byText = byId === -1 && !hasId
+    ? clipboardList.value.findIndex(existing => existing.text === item.text)
+    : -1
   const idx = byId !== -1 ? byId : byText
 
   if (idx === -1) {
     clipboardList.value.push(item)
+    trimClipboardList()
     return
   }
 
   const existing = clipboardList.value[idx]
   if (!existing) {
     clipboardList.value.push(item)
+    trimClipboardList()
     return
   }
 
@@ -69,6 +75,12 @@ function upsertClipboardItem(item: ClipboardItem, moveToTail = true): void {
   } else {
     clipboardList.value[idx] = merged
   }
+  trimClipboardList()
+}
+
+function trimClipboardList(): void {
+  if (clipboardList.value.length <= CLIPBOARD_MAX_ITEMS) return
+  clipboardList.value = clipboardList.value.slice(-CLIPBOARD_MAX_ITEMS)
 }
 
 function makeContentFingerprint(text: string): string {
@@ -90,22 +102,28 @@ function isDuplicateIncoming(item: ClipboardItem): boolean {
   const now = Date.now()
   pruneRecentIncoming(now)
 
-  const keys = [makeContentFingerprint(item.text)]
-  if (item.id) keys.push(`id:${item.id}`)
-
-  const duplicated = keys.some((key) => {
+  const id = String(item.id || '').trim()
+  if (id) {
+    const key = `id:${id}`
     const ts = recentIncoming.get(key)
-    return typeof ts === 'number' && now-ts <= CLIPBOARD_INCOMING_DEDUP_WINDOW_MS
-  })
-
-  for (const key of keys) {
+    const duplicated = typeof ts === 'number' && now-ts <= CLIPBOARD_INCOMING_DEDUP_WINDOW_MS
     recentIncoming.set(key, now)
+    return duplicated
   }
+
+  const contentKey = makeContentFingerprint(item.text)
+  const ts = recentIncoming.get(contentKey)
+  const duplicated = typeof ts === 'number' && now-ts <= CLIPBOARD_INCOMING_DEDUP_WINDOW_MS
+  recentIncoming.set(contentKey, now)
   return duplicated
 }
 
-// 监听远程历史记录
-conn.onClipboardHistory = (history: any[]) => {
+const handleClipboardHistory = (history: any[]) => {
+  for (const pending of pendingDeletes.values()) {
+    clearTimeout(pending.timerId)
+  }
+  pendingDeletes.clear()
+
   const incoming = Array.isArray(history) ? history : []
   clipboardList.value = incoming
     .map(item => ({
@@ -114,18 +132,22 @@ conn.onClipboardHistory = (history: any[]) => {
       time: String(item?.time || '').trim() || getTime()
     }))
     .filter(item => !!item.text)
+  trimClipboardList()
+  recentIncoming.clear()
   scrollToBottom()
   ElMessage.success(`已同步 ${clipboardList.value.length} 条已保存记录`)
 }
+conn.onClipboardHistory = handleClipboardHistory
 
 // 监听单条数据 (实时同步)
-conn.onClipboardData = (data: any) => {
+const handleClipboardData = (data: any) => {
   const item = normalizeIncomingClipboard(data)
   if (!item) return
   if (isDuplicateIncoming(item)) return
   upsertClipboardItem(item, true)
   scrollToBottom()
 }
+conn.onClipboardData = handleClipboardData
 
 function removeItemById(id: string): boolean {
   const index = clipboardList.value.findIndex(item => item.id.toString() === id)
@@ -144,11 +166,16 @@ function clearPendingDelete(id: string): void {
 }
 
 // 监听实时删除 (也作为本端删除 ACK)
-conn.onClipboardDelete = (id: number | string) => {
+const handleClipboardDelete = (id: number | string) => {
   const normalizedId = String(id)
   clearPendingDelete(normalizedId)
   removeItemById(normalizedId)
 }
+conn.onClipboardDelete = handleClipboardDelete
+
+onMounted(() => {
+  conn.replayPendingClipboardEvents()
+})
 
 const inputContent = ref('')
 const isSending = ref(false)
@@ -208,6 +235,7 @@ function addBullet(text: string, fromRemote = false, customId?: string) {
     text: text,
     time: getTime()
   })
+  trimClipboardList()
 
   scrollToBottom()
   if (fromRemote) {
@@ -350,8 +378,10 @@ function deleteItem(index: number, item: ClipboardItem) {
     const pending = pendingDeletes.get(id)
     if (!pending) return
     pendingDeletes.delete(id)
+    if (clipboardList.value.some(entry => String(entry.id) === id)) return
     const restoreIndex = Math.max(0, Math.min(pending.index, clipboardList.value.length))
     clipboardList.value.splice(restoreIndex, 0, pending.item)
+    trimClipboardList()
     ElMessage.warning('删除同步超时，已恢复该条记录')
   }, CLIPBOARD_DELETE_ACK_TIMEOUT_MS)
   pendingDeletes.set(id, {
@@ -372,6 +402,9 @@ onBeforeUnmount(() => {
     clearTimeout(pending.timerId)
   }
   pendingDeletes.clear()
+  if (conn.onClipboardHistory === handleClipboardHistory) conn.onClipboardHistory = null
+  if (conn.onClipboardData === handleClipboardData) conn.onClipboardData = null
+  if (conn.onClipboardDelete === handleClipboardDelete) conn.onClipboardDelete = null
 })
 
 // 暴露给父组件

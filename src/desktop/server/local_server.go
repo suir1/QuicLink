@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -460,7 +461,7 @@ func (s *LocalServer) handleWTStream(stream *webtransport.Stream) {
 		// Pass bufReader so it can read remaining buffered data + stream
 		s.wtHandleUpload(stream, bufReader, cmd.Name, cmd.Size)
 	case "relay_upload":
-		s.wtHandleRelayUpload(stream, bufReader, cmd.RelayID, cmd.Name, cmd.Persist)
+		s.wtHandleRelayUpload(stream, bufReader, cmd.RelayID, cmd.Name, cmd.Size, cmd.Persist)
 	case "relay_download":
 		s.wtHandleRelayDownload(stream, cmd.RelayID)
 	default:
@@ -583,7 +584,7 @@ func (s *LocalServer) wtHandleUpload(stream *webtransport.Stream, bufReader *buf
 	})
 }
 
-func (s *LocalServer) wtHandleRelayUpload(stream *webtransport.Stream, bufReader *bufio.Reader, relayID, name string, persist bool) {
+func (s *LocalServer) wtHandleRelayUpload(stream *webtransport.Stream, bufReader *bufio.Reader, relayID, name string, size int64, persist bool) {
 	if relayID == "" {
 		json.NewEncoder(stream).Encode(map[string]string{"error": "missing relayId"})
 		return
@@ -617,6 +618,7 @@ func (s *LocalServer) wtHandleRelayUpload(stream *webtransport.Stream, bufReader
 		Writer: pw,
 		Done:   make(chan struct{}),
 		Name:   name,
+		Size:   normalizeRelaySize(size),
 	}
 
 	s.relayMu.Lock()
@@ -822,6 +824,7 @@ func (s *LocalServer) handleRelayUpload(w http.ResponseWriter, r *http.Request) 
 	}
 	decodedName = filepath.Base(decodedName)
 	persist := isTruthy(r.URL.Query().Get("persist"))
+	relaySize := parseRelaySize(r)
 
 	var (
 		fileID    string
@@ -845,7 +848,7 @@ func (s *LocalServer) handleRelayUpload(w http.ResponseWriter, r *http.Request) 
 		Writer: pw,
 		Done:   make(chan struct{}),
 		Name:   decodedName,
-		// Size:   r.ContentLength, // optional
+		Size:   relaySize,
 	}
 
 	// Register session
@@ -921,6 +924,11 @@ func (s *LocalServer) handleRelayUpload(w http.ResponseWriter, r *http.Request) 
 // handleRelayDownload sends the file stream to Receiver
 // GET /api/lan/relay/download/:id
 func (s *LocalServer) handleRelayDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	id := r.URL.Path[len("/api/lan/relay/download/"):]
 	if id == "" {
 		http.Error(w, "Missing Relay ID", http.StatusBadRequest)
@@ -937,6 +945,15 @@ func (s *LocalServer) handleRelayDownload(w http.ResponseWriter, r *http.Request
 
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", session.Name))
 	w.Header().Set("Content-Type", "application/octet-stream")
+	if session.Size > 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(session.Size, 10))
+	}
+
+	// Important: HEAD must not consume relay stream, otherwise subsequent GET gets 0 bytes.
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 
 	// Stream from Pipe Reader
 	// This UNBLOCKs the writer
@@ -1003,6 +1020,33 @@ func isTruthy(raw string) bool {
 	default:
 		return false
 	}
+}
+
+func normalizeRelaySize(size int64) int64 {
+	if size <= 0 {
+		return 0
+	}
+	return size
+}
+
+func parseRelaySize(r *http.Request) int64 {
+	if r == nil {
+		return 0
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("size")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	if raw := strings.TrimSpace(r.Header.Get("X-File-Size")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	if r.ContentLength > 0 {
+		return r.ContentLength
+	}
+	return 0
 }
 
 // ImportFileFromPath copies a local file into LAN shared storage and registers it.
@@ -1086,6 +1130,9 @@ func (s *LocalServer) StartRelayFromFile(relayID, filePath, displayName string, 
 		Writer: pw,
 		Done:   make(chan struct{}),
 		Name:   name,
+	}
+	if info, statErr := src.Stat(); statErr == nil && !info.IsDir() {
+		session.Size = normalizeRelaySize(info.Size())
 	}
 
 	s.relayMu.Lock()

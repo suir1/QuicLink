@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,6 +49,26 @@ func addH3AltSvcHeader(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Header().Set("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=2592000`, port))
+}
+
+func buildHTTPSRedirectHost(rawHost string) string {
+	host := strings.TrimSpace(rawHost)
+	if host == "" {
+		return ""
+	}
+	parsed, err := url.Parse("http://" + host)
+	if err != nil {
+		return host
+	}
+	hostname := parsed.Hostname()
+	if hostname == "" {
+		return host
+	}
+	port := parsed.Port()
+	if port == "" || port == "80" || port == "3101" {
+		return hostname
+	}
+	return net.JoinHostPort(hostname, port)
 }
 
 func main() {
@@ -120,6 +141,12 @@ func main() {
 			addH3AltSvcHeader(w, r)
 		}
 		handlers.HandleListFiles(w, r)
+	})
+	http.HandleFunc("/api/files/", func(w http.ResponseWriter, r *http.Request) {
+		if config.Current.UseHTTPS {
+			addH3AltSvcHeader(w, r)
+		}
+		handlers.HandleDeleteFile(w, r)
 	})
 	http.HandleFunc("/api/relay/upload/", func(w http.ResponseWriter, r *http.Request) {
 		if config.Current.UseHTTPS {
@@ -277,9 +304,13 @@ func main() {
 		redirectPort := "3101"
 		fmt.Printf("🔀 Redirect Server running on :%s (HTTP -> HTTPS)\n", redirectPort)
 		http.ListenAndServe(":"+redirectPort, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			targetHost := buildHTTPSRedirectHost(r.Host)
+			if targetHost == "" {
+				targetHost = r.Host
+			}
 			targetURL := url.URL{
 				Scheme:   "https",
-				Host:     r.Host,
+				Host:     targetHost,
 				Path:     r.URL.Path,
 				RawQuery: r.URL.RawQuery,
 			}

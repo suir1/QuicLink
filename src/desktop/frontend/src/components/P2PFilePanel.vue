@@ -104,6 +104,31 @@ function formatSize(bytes: number) {
   return (bytes / Math.pow(k, i)).toPrecision(3) + ' ' + sizes[i]
 }
 
+function safeOpenDownloadURL(url: string): boolean {
+  const target = String(url || '').trim()
+  if (!target) return false
+  try {
+    const opened = window.open('', '_blank')
+    if (opened) {
+      try {
+        opened.opener = null
+      } catch {
+        // ignore
+      }
+      opened.location.href = target
+      return true
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    window.location.assign(target)
+    return true
+  } catch {
+    return false
+  }
+}
+
 // 监听 Drag & Drop
 function handleDrop(e: DragEvent) {
   e.preventDefault()
@@ -255,6 +280,32 @@ function markFileDismissed(file: P2PFile) {
   }
 }
 
+function collectOfferIds(file: P2PFile): string[] {
+  return Array.from(new Set(
+    [file.id, file.relayId, file.originalId, file.lanFileId]
+      .map((v) => String(v || '').trim())
+      .filter(Boolean)
+  ))
+}
+
+function removeOffersByIds(ids: string[]) {
+  const cleanIds = Array.from(new Set(
+    (ids || [])
+      .map((id) => String(id || '').trim())
+      .filter(Boolean)
+  ))
+  if (cleanIds.length === 0) return
+
+  for (const id of cleanIds) dismissedOfferIds.value.add(id)
+  const idSet = new Set(cleanIds)
+  fileList.value = fileList.value.filter((f) => {
+    const keys = [f.id, f.relayId, f.originalId, f.lanFileId]
+      .map((v) => String(v || '').trim())
+      .filter(Boolean)
+    return !keys.some((k) => idSet.has(k))
+  })
+}
+
 function shouldIgnoreOffer(payload: any): boolean {
   pruneDismissedTempSignatures()
 
@@ -375,6 +426,16 @@ function upsertOfferFile(payload: any) {
 async function handleDownload(file: P2PFile) {
   if (file.fromSelf) return
 
+  const requestDirectFallback = (reason: string) => {
+    file.relayStatus = 'requesting'
+    file.lanFileId = undefined
+    conn.requestP2PRelayFile(file.id, {
+      preferDirect: true,
+      reason
+    })
+    ElMessage.warning('LAN 中转不可达，已请求发送方切换普通中转/VPS')
+  }
+
   if (file.isRelay) {
     if (file.relayStatus === 'requesting') {
       ElMessage.info('正在请求发送方准备中转，请稍候...')
@@ -428,18 +489,26 @@ async function handleDownload(file: P2PFile) {
       ElMessage.info(`已切换 HTTP Relay 下载: ${file.name}`)
       return
     }
-    ElMessage.error('无法获取中转下载地址')
+    requestDirectFallback('relay_download_unreachable')
     return
   }
 
   if (file.isVpsRelay && file.vpsRelayUrl) {
-    window.open(file.vpsRelayUrl, '_blank')
+    const opened = safeOpenDownloadURL(file.vpsRelayUrl)
+    if (!opened) {
+      ElMessage.error('系统阻止了下载，请重试')
+      return
+    }
     ElMessage.info(`正在 VPS 中转下载: ${file.name}`)
     return
   }
 
   if (file.isNetdisk && file.netdiskUrl) {
-    window.open(file.netdiskUrl, '_blank')
+    const opened = safeOpenDownloadURL(file.netdiskUrl)
+    if (!opened) {
+      ElMessage.error('系统阻止了下载，请重试')
+      return
+    }
     ElMessage.info(`正在云端下载: ${file.name}`)
     return
   }
@@ -447,7 +516,11 @@ async function handleDownload(file: P2PFile) {
   if (file.isLan) {
     const baseUrl = file.baseUrl || conn.lanServerUrl
     if (baseUrl) {
-      window.open(`${baseUrl}/api/lan/download/${file.id}`, '_blank')
+      const opened = safeOpenDownloadURL(`${baseUrl}/api/lan/download/${file.id}`)
+      if (!opened) {
+        ElMessage.error('系统阻止了下载，请重试')
+        return
+      }
       ElMessage.info(`正在 LAN 直连下载: ${file.name}`)
       return
     }
@@ -497,6 +570,11 @@ onMounted(() => {
       if (item && item.fromSelf && item.isVpsRelay) {
         item.progress = 100
       }
+    } else if (type === 'offer_removed') {
+      const ids = Array.isArray(payload?.ids)
+        ? payload.ids
+        : [payload?.id, payload?.relayId, payload?.originalId, payload?.lanFileId]
+      removeOffersByIds(ids)
     }
   }
   conn.onP2PEvent = p2pHandler
@@ -516,13 +594,15 @@ function deleteFile(index: number) {
   const file = fileList.value[index]
   if (!file) return
 
+  const ids = collectOfferIds(file)
   markFileDismissed(file)
   fileList.value.splice(index, 1)
 
+  if (conn.notifyP2POfferRemoved) {
+    conn.notifyP2POfferRemoved(ids)
+  }
+
   if (file.fromSelf && conn.removeSharedOffer) {
-    const ids = [file.id, file.relayId, file.originalId, file.lanFileId]
-      .map((v) => String(v || '').trim())
-      .filter(Boolean)
     for (const id of ids) conn.removeSharedOffer(id)
   }
 }
