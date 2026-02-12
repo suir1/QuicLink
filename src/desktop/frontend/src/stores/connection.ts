@@ -17,6 +17,8 @@ export const useConnectionStore = defineStore('connection', () => {
         | 'cloud'
     type TransferStatus = 'idle' | 'active' | 'handoff' | 'done' | 'error'
     type TransferDirection = 'upload' | 'download'
+    const LAN_WT_READY_TIMEOUT_MS = 8000
+    const TRANSFER_UI_UPDATE_INTERVAL_MS = 80
 
     // --- 状态定义 ---
     const isConnected = ref(false)
@@ -64,6 +66,7 @@ export const useConnectionStore = defineStore('connection', () => {
     const onP2PEvent = ref<((type: string, data: any) => void) | null>(null)
 
     // P2P State
+    const selfPeerId = `peer-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`
     const localFiles = ref<Map<string, File>>(new Map())
     const relaySources = ref<Map<string, {
         name: string
@@ -144,11 +147,16 @@ export const useConnectionStore = defineStore('connection', () => {
 
         session.bytes += deltaBytes
         const now = Date.now()
+        const prev = transferTelemetry.value
+        const reachedTotal = typeof total === 'number' && total > 0 && session.bytes >= total
+        if (!reachedTotal && now - prev.updatedAt < TRANSFER_UI_UPDATE_INTERVAL_MS) {
+            return
+        }
         const elapsedSec = Math.max(0.001, (now - session.startedAt) / 1000)
         transferTelemetry.value = {
-            ...transferTelemetry.value,
+            ...prev,
             bytes: session.bytes,
-            total: typeof total === 'number' && total > 0 ? total : transferTelemetry.value.total,
+            total: typeof total === 'number' && total > 0 ? total : prev.total,
             speedBps: session.bytes / elapsedSec,
             updatedAt: now
         }
@@ -644,7 +652,7 @@ export const useConnectionStore = defineStore('connection', () => {
     function requestP2PRelayFile(fileId: string) {
         sendMessage({
             type: 'p2p_relay_request',
-            payload: { id: fileId }
+            payload: { id: fileId, requesterId: selfPeerId }
         })
     }
 
@@ -735,13 +743,13 @@ export const useConnectionStore = defineStore('connection', () => {
         readyTimeoutMs = 8000
     ) {
         startTransferTelemetry('lan-wt-relay', 'upload', file.name, file.size, 'LAN WT relay')
+        let wt: any = null
         try {
             const targets = Array.from(new Set(
                 ['localhost', hostIp || '', '127.0.0.1']
                     .map(v => (v || '').trim())
                     .filter(Boolean)
             ))
-            let wt: any = null
             let connectedTarget = ''
             let lastErr: any = null
             for (const target of targets) {
@@ -783,12 +791,10 @@ export const useConnectionStore = defineStore('connection', () => {
             }) as any
 
             if (readyResp?.error) {
-                wt.close()
                 finishTransferTelemetry('error', readyResp.error || 'WT relay ready failed')
                 throw new Error(readyResp.error)
             }
             if (!readyResp || readyResp.status !== 'ready') {
-                wt.close()
                 finishTransferTelemetry('error', 'WT relay ready missing')
                 throw new Error('WT relay ready response missing')
             }
@@ -797,14 +803,19 @@ export const useConnectionStore = defineStore('connection', () => {
             await streamFileToWriter(file, writer, (bytes) => bumpTransferTelemetry(bytes, file.size))
             await writer.close()
             finishTransferTelemetry('done')
-            wt.close()
         } catch (e) {
             finishTransferTelemetry('error', 'LAN WT relay upload failed')
             throw e
+        } finally {
+            try {
+                wt?.close?.()
+            } catch {
+                // ignore close errors
+            }
         }
     }
 
-    async function handleP2PRelayRequest(fileId: string) {
+    async function handleP2PRelayRequest(fileId: string, requesterId?: string) {
         const source = relaySources.value.get(fileId)
         if (!source) return
 
@@ -853,7 +864,9 @@ export const useConnectionStore = defineStore('connection', () => {
                     h3Port: localInfo?.h3Port,
                     certHash: localInfo?.certHash,
                     isRelay: true,
-                    status: 'ready'
+                    status: 'ready',
+                    from: selfPeerId,
+                    to: requesterId
                 }
             })
         }
@@ -1217,10 +1230,11 @@ export const useConnectionStore = defineStore('connection', () => {
                     break
 
                 case 'p2p_relay_request':
-                    handleP2PRelayRequest(msg.payload.id)
+                    handleP2PRelayRequest(msg.payload.id, msg.payload.requesterId || msg.payload.from)
                     break
 
                 case 'p2p_relay_ready':
+                    if (msg.payload?.to && msg.payload.to !== selfPeerId) break
                     if (onP2PEvent.value) onP2PEvent.value('relay_ready', msg.payload)
                     break
             }
@@ -1288,8 +1302,29 @@ export const useConnectionStore = defineStore('connection', () => {
         const wt = new WebTransport(`https://${ip}:${h3Port}/wt`, {
             serverCertificateHashes: [{ algorithm: 'sha-256', value: hashBytes.buffer }]
         })
-        await wt.ready
+        await waitWTReady(wt, `https://${ip}:${h3Port}/wt`)
         return wt
+    }
+
+    async function waitWTReady(wt: any, url: string, timeoutMs = LAN_WT_READY_TIMEOUT_MS): Promise<void> {
+        let timer: number | undefined
+        try {
+            await Promise.race([
+                wt.ready,
+                new Promise((_, reject) => {
+                    timer = window.setTimeout(() => reject(new Error(`WT ready timeout (${timeoutMs}ms): ${url}`)), timeoutMs)
+                })
+            ])
+        } catch (e) {
+            try {
+                wt.close?.()
+            } catch {
+                // ignore close errors
+            }
+            throw e
+        } finally {
+            if (timer) window.clearTimeout(timer)
+        }
     }
 
     async function saveWTDownloadToFile(
@@ -1381,9 +1416,10 @@ export const useConnectionStore = defineStore('connection', () => {
         const targetCertHash = certHashValue || server?.certHash
         if (!targetIp || !targetH3Port || !targetCertHash) return false
 
+        let wt: any = null
         try {
             startTransferTelemetry('lan-wt-relay', 'download', fileName, 0, 'LAN WT relay')
-            const wt = await createLanWTByAddress(targetIp, targetH3Port, targetCertHash)
+            wt = await createLanWTByAddress(targetIp, targetH3Port, targetCertHash)
             const stream = await wt.createBidirectionalStream()
             const writer = stream.writable.getWriter()
             const reader = stream.readable.getReader()
@@ -1394,13 +1430,18 @@ export const useConnectionStore = defineStore('connection', () => {
             await writer.close()
 
             const ok = await saveWTDownloadToFile(reader, fileName, (bytes) => bumpTransferTelemetry(bytes))
-            wt.close()
             finishTransferTelemetry(ok ? 'done' : 'error', ok ? '' : 'WT relay download failed')
             return ok
         } catch (e) {
             console.error('WT relay download failed', e)
             finishTransferTelemetry('error', 'WT relay download failed')
             return false
+        } finally {
+            try {
+                wt?.close?.()
+            } catch {
+                // ignore close errors
+            }
         }
     }
 

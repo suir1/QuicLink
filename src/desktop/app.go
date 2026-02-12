@@ -636,8 +636,15 @@ func (a *App) downloadToLocal(downloadURL, fallbackName string) (string, error) 
 	if err != nil {
 		return "", err
 	}
+	transport := &http.Transport{
+		DisableCompression: true,
+		MaxIdleConns:       64,
+		MaxConnsPerHost:    32,
+		IdleConnTimeout:    90 * time.Second,
+	}
 	client := &http.Client{
-		Timeout: 0, // Large files: stream until completion.
+		Transport: transport,
+		Timeout:   0, // Large files: stream until completion.
 	}
 
 	resp, err := client.Do(req)
@@ -679,7 +686,8 @@ func (a *App) downloadToLocal(downloadURL, fallbackName string) (string, error) 
 	}
 	defer dst.Close()
 
-	written, err := io.Copy(dst, resp.Body)
+	buf := make([]byte, 1024*1024)
+	written, err := io.CopyBuffer(dst, resp.Body, buf)
 	if err != nil {
 		return "", err
 	}

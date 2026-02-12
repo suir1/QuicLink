@@ -280,6 +280,11 @@ async function handleDownload(file: P2PFile, fromRelayReady = false) {
   if (file.fromSelf) return
 
   if (file.isRelay) {
+      if (!fromRelayReady && file.relayStatus === 'requesting') {
+          ElMessage.info('正在请求发送方准备中转，请稍候...')
+          return
+      }
+
       const browserCompatMode = !conn.isDesktop && !conn.isSpeedDownloadMode()
       if (browserCompatMode && !fromRelayReady) {
           file.relayStatus = 'requesting'

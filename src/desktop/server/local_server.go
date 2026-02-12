@@ -12,7 +12,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -76,7 +75,17 @@ type RelaySession struct {
 	Type   string
 }
 
-const wtStreamReadBufferSize = 256 * 1024
+const (
+	wtStreamReadBufferSize = 1024 * 1024
+	relayCopyBufferSize    = 1024 * 1024
+	lanMaxUploadBytes      = 10 << 30
+)
+
+var relayCopyBufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, relayCopyBufferSize)
+	},
+}
 
 func NewLocalServer() *LocalServer {
 	// Use ~/Downloads/QuicLink for uploads
@@ -415,10 +424,11 @@ func (s *LocalServer) handleWTStream(stream *webtransport.Stream) {
 
 	if err := json.Unmarshal(line, &cmd); err != nil {
 		log.Printf("❌ WT Stream decode error: %v", err)
+		_ = json.NewEncoder(stream).Encode(map[string]string{"error": "invalid command"})
 		return
 	}
 
-	switch cmd.Action {
+	switch strings.TrimSpace(cmd.Action) {
 	case "list":
 		s.wtHandleList(stream)
 	case "download":
@@ -430,6 +440,8 @@ func (s *LocalServer) handleWTStream(stream *webtransport.Stream) {
 		s.wtHandleRelayUpload(stream, bufReader, cmd.RelayID, cmd.Name, cmd.Persist)
 	case "relay_download":
 		s.wtHandleRelayDownload(stream, cmd.RelayID)
+	default:
+		_ = json.NewEncoder(stream).Encode(map[string]string{"error": "unknown action"})
 	}
 }
 
@@ -468,23 +480,32 @@ func (s *LocalServer) wtHandleDownload(stream *webtransport.Stream, fileID strin
 	// Stream file content
 	file, err := os.Open(fileInfo.Path)
 	if err != nil {
+		_ = json.NewEncoder(stream).Encode(map[string]string{"error": "failed to open file"})
 		return
 	}
 	defer file.Close()
 
-	io.Copy(stream, file)
+	if _, err := copyRelayStream(stream, file); err != nil {
+		log.Printf("❌ WT Download stream error (%s): %v", fileID, err)
+	}
 }
 
 func (s *LocalServer) wtHandleUpload(stream *webtransport.Stream, bufReader *bufio.Reader, name string, size int64) {
+	if size > lanMaxUploadBytes {
+		json.NewEncoder(stream).Encode(map[string]string{"error": "file too large"})
+		return
+	}
 	if size < 0 {
 		json.NewEncoder(stream).Encode(map[string]string{"error": "invalid file size"})
 		return
 	}
 
+	name = sanitizeUploadFileName(name)
 	id := uuid.New().String()
 	savePath := filepath.Join(s.uploadDir, id+"_"+name)
+	tempPath := savePath + ".part"
 
-	dst, err := os.Create(savePath)
+	dst, err := os.Create(tempPath)
 	if err != nil {
 		json.NewEncoder(stream).Encode(map[string]string{"error": "failed to create file"})
 		return
@@ -492,21 +513,30 @@ func (s *LocalServer) wtHandleUpload(stream *webtransport.Stream, bufReader *buf
 	defer dst.Close()
 
 	// Read file content from bufReader (which contains any buffered data + remaining stream)
-	written, err := io.CopyN(dst, bufReader, size)
+	written, err := copyExactRelayStream(dst, bufReader, size)
 	if err != nil {
-		if errors.Is(err, io.EOF) && written < size {
-			log.Printf("❌ WT Upload truncated: expected=%d, written=%d", size, written)
-			json.NewEncoder(stream).Encode(map[string]string{"error": "incomplete upload"})
-			return
-		}
 		log.Printf("❌ WT Upload error: %v", err)
+		_ = os.Remove(tempPath)
 		json.NewEncoder(stream).Encode(map[string]string{"error": "upload failed"})
 		return
 	}
 
 	if written != size {
 		log.Printf("❌ WT Upload size mismatch: expected=%d, written=%d", size, written)
+		_ = os.Remove(tempPath)
 		json.NewEncoder(stream).Encode(map[string]string{"error": "upload size mismatch"})
+		return
+	}
+	if err := dst.Close(); err != nil {
+		log.Printf("❌ WT Upload close error: %v", err)
+		_ = os.Remove(tempPath)
+		json.NewEncoder(stream).Encode(map[string]string{"error": "upload failed"})
+		return
+	}
+	if err := os.Rename(tempPath, savePath); err != nil {
+		log.Printf("❌ WT Upload finalize error: %v", err)
+		_ = os.Remove(tempPath)
+		json.NewEncoder(stream).Encode(map[string]string{"error": "upload failed"})
 		return
 	}
 
@@ -590,7 +620,7 @@ func (s *LocalServer) wtHandleRelayUpload(stream *webtransport.Stream, bufReader
 		relayWriter = io.MultiWriter(pw, dst)
 	}
 
-	written, err := io.Copy(relayWriter, bufReader)
+	written, err := copyRelayStream(relayWriter, bufReader)
 	if err != nil {
 		log.Printf("❌ WT Relay Upload Error (%s): %v", relayID, err)
 		if persist {
@@ -650,7 +680,7 @@ func (s *LocalServer) wtHandleRelayDownload(stream *webtransport.Stream, relayID
 		"status": "ok",
 		"name":   session.Name,
 	})
-	if _, err := io.Copy(stream, session.Reader); err != nil {
+	if _, err := copyRelayStream(stream, session.Reader); err != nil {
 		log.Printf("❌ WT Relay Download Error (%s): %v", relayID, err)
 	}
 }
@@ -820,7 +850,7 @@ func (s *LocalServer) handleRelayUpload(w http.ResponseWriter, r *http.Request) 
 		relayWriter = io.MultiWriter(pw, dst)
 	}
 
-	written, err := io.Copy(relayWriter, r.Body)
+	written, err := copyRelayStream(relayWriter, r.Body)
 	if err != nil {
 		log.Printf("❌ Relay Pipe Error (Upload side): %v", err)
 		if persist {
@@ -887,7 +917,7 @@ func (s *LocalServer) handleRelayDownload(w http.ResponseWriter, r *http.Request
 
 	// Stream from Pipe Reader
 	// This UNBLOCKs the writer
-	_, err = io.Copy(w, session.Reader)
+	_, err = copyRelayStream(w, session.Reader)
 	if err != nil {
 		log.Printf("❌ Relay Download Error: %v", err)
 	}
@@ -911,6 +941,36 @@ func (s *LocalServer) waitRelaySession(id string, timeoutDur time.Duration) (*Re
 			}
 		}
 	}
+}
+
+func copyRelayStream(dst io.Writer, src io.Reader) (int64, error) {
+	buf := relayCopyBufferPool.Get().([]byte)
+	defer relayCopyBufferPool.Put(buf)
+	return io.CopyBuffer(dst, src, buf)
+}
+
+func copyExactRelayStream(dst io.Writer, src io.Reader, size int64) (int64, error) {
+	if size < 0 {
+		return 0, fmt.Errorf("invalid size: %d", size)
+	}
+	limited := io.LimitReader(src, size)
+	written, err := copyRelayStream(dst, limited)
+	if err != nil {
+		return written, err
+	}
+	if written != size {
+		return written, io.ErrUnexpectedEOF
+	}
+	return written, nil
+}
+
+func sanitizeUploadFileName(name string) string {
+	name = strings.TrimSpace(name)
+	name = filepath.Base(name)
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		return "upload.bin"
+	}
+	return name
 }
 
 func isTruthy(raw string) bool {
@@ -1050,7 +1110,7 @@ func (s *LocalServer) StartRelayFromFile(relayID, filePath, displayName string, 
 			relayWriter = io.MultiWriter(pw, dst)
 		}
 
-		written, copyErr := io.Copy(relayWriter, src)
+		written, copyErr := copyRelayStream(relayWriter, src)
 		if copyErr != nil {
 			log.Printf("❌ Native Relay Copy Error (%s): %v", relayID, copyErr)
 			if persist {

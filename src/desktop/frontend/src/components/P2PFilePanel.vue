@@ -327,6 +327,11 @@ async function handleDownload(file: P2PFile) {
   if (file.fromSelf) return
 
   if (file.isRelay) {
+    if (file.relayStatus === 'requesting') {
+      ElMessage.info('正在请求发送方准备中转，请稍候...')
+      return
+    }
+
     if (!file.lanFileId || file.relayStatus !== 'ready') {
       file.relayStatus = 'requesting'
       conn.requestP2PRelayFile(file.id)

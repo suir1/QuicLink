@@ -98,6 +98,19 @@ export const useConnectionStore = defineStore('connection', () => {
     const DEFAULT_RELAY_MAX_SIZE_BYTES = 10 * 1024 * 1024
     const relayMaxSizeBytes = ref(DEFAULT_RELAY_MAX_SIZE_BYTES)
     const applyingAnswers = ref<Set<string>>(new Set())
+    const forceRelayPeers = ref<Set<string>>(new Set())
+    const peerRetryAttempts = ref<Map<string, number>>(new Map())
+    const peerLastRetryAt = ref<Map<string, number>>(new Map())
+    const peerRetryTimers = ref<Map<string, number>>(new Map())
+    const P2P_CHUNK_SIZE = 64 * 1024
+    const P2P_MAX_BUFFERED_BYTES = 4 * 1024 * 1024
+    const P2P_BUFFER_POLL_MS = 8
+    const P2P_BUFFER_LOW_THRESHOLD = 1 * 1024 * 1024
+    const P2P_MAX_RETRY_ATTEMPTS = 2
+    const P2P_RETRY_DEBOUNCE_MS = 1500
+    const P2P_DISCONNECTED_GRACE_MS = 1200
+    const LAN_WT_READY_TIMEOUT_MS = 8000
+    const TRANSFER_UI_UPDATE_INTERVAL_MS = 80
     const transferTelemetry = ref<{
         path: TransferPath
         status: TransferStatus
@@ -161,11 +174,16 @@ export const useConnectionStore = defineStore('connection', () => {
 
         session.bytes += deltaBytes
         const now = Date.now()
+        const prev = transferTelemetry.value
+        const reachedTotal = typeof total === 'number' && total > 0 && session.bytes >= total
+        if (!reachedTotal && now-prev.updatedAt < TRANSFER_UI_UPDATE_INTERVAL_MS) {
+            return
+        }
         const elapsedSec = Math.max(0.001, (now - session.startedAt) / 1000)
         transferTelemetry.value = {
-            ...transferTelemetry.value,
+            ...prev,
             bytes: session.bytes,
-            total: typeof total === 'number' && total > 0 ? total : transferTelemetry.value.total,
+            total: typeof total === 'number' && total > 0 ? total : prev.total,
             speedBps: session.bytes / elapsedSec,
             updatedAt: now
         }
@@ -249,6 +267,39 @@ export const useConnectionStore = defineStore('connection', () => {
         }
 
         return defaults
+    }
+
+    function getIceServerUrls(server: RTCIceServer): string[] {
+        const urls = server.urls
+        if (Array.isArray(urls)) return urls.map((v) => String(v || ''))
+        return [String(urls || '')]
+    }
+
+    function hasTurnServer(iceServers: RTCIceServer[]): boolean {
+        return iceServers.some((server) =>
+            getIceServerUrls(server).some((url) => {
+                const normalized = url.trim().toLowerCase()
+                return normalized.startsWith('turn:') || normalized.startsWith('turns:')
+            })
+        )
+    }
+
+    function shouldPreferRelayByNetwork(): boolean {
+        const nav = navigator as any
+        const net = nav?.connection || nav?.mozConnection || nav?.webkitConnection
+        if (!net) return false
+
+        const effectiveType = String(net.effectiveType || '').toLowerCase()
+        const connectionType = String(net.type || '').toLowerCase()
+        const saveData = !!net.saveData
+
+        return (
+            saveData ||
+            connectionType === 'cellular' ||
+            effectiveType === 'slow-2g' ||
+            effectiveType === '2g' ||
+            effectiveType === '3g'
+        )
     }
 
     // --- Auto-Detect Protocol ---
@@ -410,6 +461,9 @@ export const useConnectionStore = defineStore('connection', () => {
     function handleClose() {
         isConnected.value = false
         hostOnline.value = false
+        for (const timerId of peerRetryTimers.value.values()) {
+            window.clearTimeout(timerId)
+        }
         for (const pc of peerConnections.value.values()) {
             pc.close()
         }
@@ -421,14 +475,17 @@ export const useConnectionStore = defineStore('connection', () => {
         incomingFilesById.value.clear()
         activeIncomingFileByPeer.value.clear()
         applyingAnswers.value.clear()
+        forceRelayPeers.value.clear()
+        peerRetryAttempts.value.clear()
+        peerLastRetryAt.value.clear()
+        peerRetryTimers.value.clear()
         resetTransferTelemetry()
         isP2PConnected.value = false
     }
 
     // --- WebRTC Logic ---
-    const rtcConfig: RTCConfiguration = {
-        iceServers: parseIceServersFromEnv()
-    }
+    const rtcIceServers = parseIceServersFromEnv()
+    const supportsTurnRelay = hasTurnServer(rtcIceServers)
 
     function updateP2PConnectedState() {
         isP2PConnected.value = Array.from(dataChannels.value.values())
@@ -439,11 +496,98 @@ export const useConnectionStore = defineStore('connection', () => {
         return selfPeerId < peerId
     }
 
+    function getPeerRTCConfig(peerId: string): RTCConfiguration {
+        const forceRelay = supportsTurnRelay && (forceRelayPeers.value.has(peerId) || shouldPreferRelayByNetwork())
+        return {
+            iceServers: rtcIceServers,
+            iceCandidatePoolSize: 8,
+            iceTransportPolicy: forceRelay ? 'relay' : 'all'
+        }
+    }
+
+    function clearPeerRetryTimer(peerId: string) {
+        const timerId = peerRetryTimers.value.get(peerId)
+        if (timerId) {
+            window.clearTimeout(timerId)
+            peerRetryTimers.value.delete(peerId)
+        }
+    }
+
+    function cleanupPeerConnection(peerId: string, closePc = false) {
+        clearPeerRetryTimer(peerId)
+        if (closePc) {
+            const pc = peerConnections.value.get(peerId)
+            if (pc && pc.connectionState !== 'closed') {
+                try {
+                    pc.close()
+                } catch (e) {
+                    console.warn(`RTC[${peerId}] close failed`, e)
+                }
+            }
+        }
+        dataChannels.value.delete(peerId)
+        peerConnections.value.delete(peerId)
+        pendingIceCandidates.value.delete(peerId)
+        updateP2PConnectedState()
+    }
+
+    function resetPeerRetryState(peerId: string) {
+        clearPeerRetryTimer(peerId)
+        peerRetryAttempts.value.delete(peerId)
+        peerLastRetryAt.value.delete(peerId)
+    }
+
+    function schedulePeerRetry(peerId: string, reason: string, delayMs: number) {
+        clearPeerRetryTimer(peerId)
+        const timer = window.setTimeout(() => {
+            peerRetryTimers.value.delete(peerId)
+            void retryPeerConnection(peerId, reason)
+        }, Math.max(0, delayMs))
+        peerRetryTimers.value.set(peerId, timer)
+    }
+
+    async function retryPeerConnection(peerId: string, reason: string) {
+        const now = Date.now()
+        const lastRetryAt = peerLastRetryAt.value.get(peerId) || 0
+        if (now-lastRetryAt < P2P_RETRY_DEBOUNCE_MS) return
+        peerLastRetryAt.value.set(peerId, now)
+
+        const currentAttempt = peerRetryAttempts.value.get(peerId) || 0
+        if (currentAttempt >= P2P_MAX_RETRY_ATTEMPTS) {
+            console.warn(`RTC[${peerId}] retries exhausted (${reason})`)
+            cleanupPeerConnection(peerId, true)
+            return
+        }
+        peerRetryAttempts.value.set(peerId, currentAttempt + 1)
+
+        const useRelay = supportsTurnRelay && (currentAttempt >= 1 || shouldPreferRelayByNetwork())
+        if (useRelay) {
+            forceRelayPeers.value.add(peerId)
+        }
+
+        console.warn(
+            `RTC[${peerId}] retry #${currentAttempt + 1} (${reason}) policy=${forceRelayPeers.value.has(peerId) ? 'relay' : 'all'}`
+        )
+
+        cleanupPeerConnection(peerId, true)
+        if (shouldInitiateToPeer(peerId)) {
+            try {
+                await startP2P(peerId)
+            } catch (e) {
+                console.warn(`RTC[${peerId}] restart failed`, e)
+            }
+            return
+        }
+
+        // Prompt remote initiator to negotiate again.
+        sendMessage({ type: 'p2p_hello', payload: { peerId: selfPeerId } })
+    }
+
     function setupPeerConnection(peerId: string): RTCPeerConnection {
         const existing = peerConnections.value.get(peerId)
         if (existing) return existing
 
-        const pc = new RTCPeerConnection(rtcConfig)
+        const pc = new RTCPeerConnection(getPeerRTCConfig(peerId))
 
         pc.onicecandidate = (event) => {
             if (event.candidate) {
@@ -460,13 +604,35 @@ export const useConnectionStore = defineStore('connection', () => {
 
         pc.onconnectionstatechange = () => {
             console.log(`RTC[${peerId}] State:`, pc.connectionState)
-            if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
-                dataChannels.value.delete(peerId)
-                peerConnections.value.delete(peerId)
-                updateP2PConnectedState()
-            }
             if (pc.connectionState === 'connected') {
+                resetPeerRetryState(peerId)
                 ElMessage.success(`⚡ P2P 连接已建立: ${peerId.slice(0, 8)}`)
+            }
+            if (pc.connectionState === 'disconnected') {
+                schedulePeerRetry(peerId, 'connection_disconnected', P2P_DISCONNECTED_GRACE_MS)
+            }
+            if (pc.connectionState === 'failed') {
+                void retryPeerConnection(peerId, 'connection_failed')
+            }
+            if (pc.connectionState === 'closed') {
+                cleanupPeerConnection(peerId, false)
+                resetPeerRetryState(peerId)
+            }
+        }
+
+        pc.oniceconnectionstatechange = () => {
+            const state = pc.iceConnectionState
+            console.log(`RTC[${peerId}] ICE State:`, state)
+            if (state === 'connected' || state === 'completed') {
+                resetPeerRetryState(peerId)
+                return
+            }
+            if (state === 'disconnected') {
+                schedulePeerRetry(peerId, 'ice_disconnected', P2P_DISCONNECTED_GRACE_MS)
+                return
+            }
+            if (state === 'failed') {
+                void retryPeerConnection(peerId, 'ice_failed')
             }
         }
 
@@ -479,6 +645,9 @@ export const useConnectionStore = defineStore('connection', () => {
     }
 
     function setupDataChannel(dc: RTCDataChannel, peerId: string) {
+        dc.binaryType = 'arraybuffer'
+        dc.bufferedAmountLowThreshold = P2P_BUFFER_LOW_THRESHOLD
+
         dc.onopen = () => {
             console.log(`RTC DataChannel OPEN -> ${peerId}`)
             dataChannels.value.set(peerId, dc)
@@ -508,7 +677,7 @@ export const useConnectionStore = defineStore('connection', () => {
         }
         let dc = dataChannels.value.get(peerId)
         if (!dc || dc.readyState === 'closed') {
-            dc = pc.createDataChannel("file-transfer")
+            dc = pc.createDataChannel("file-transfer", { ordered: true })
             setupDataChannel(dc, peerId)
         }
 
@@ -700,23 +869,47 @@ export const useConnectionStore = defineStore('connection', () => {
                 channel.send(meta)
             }
 
-            const CHUNK_SIZE = 16 * 1024
-            const total = Math.ceil(file.size / CHUNK_SIZE)
+            const reader = file.stream().getReader()
+            try {
+                while (true) {
+                    const { value, done } = await reader.read()
+                    if (done) break
+                    if (!value || value.byteLength === 0) continue
+                    if (!channels.some((ch) => ch.readyState === 'open')) {
+                        throw new Error('No open Data Channel')
+                    }
 
-            for (let i = 0; i < total; i++) {
-                const start = i * CHUNK_SIZE
-                const end = Math.min(start + CHUNK_SIZE, file.size)
-                const chunk = file.slice(start, end)
-                const buffer = await chunk.arrayBuffer()
+                    while (channels.some((ch) => ch.readyState === 'open' && ch.bufferedAmount > P2P_MAX_BUFFERED_BYTES)) {
+                        await new Promise((r) => setTimeout(r, P2P_BUFFER_POLL_MS))
+                    }
 
-                while (channels.some(ch => ch.bufferedAmount > 10 * 1024 * 1024)) {
-                    await new Promise(r => setTimeout(r, 50))
+                    const payload = value.byteLength <= P2P_CHUNK_SIZE ? value : value.slice(0, P2P_CHUNK_SIZE)
+                    for (const channel of channels) {
+                        if (channel.readyState === 'open') {
+                            channel.send(payload)
+                        }
+                    }
+                    bumpTransferTelemetry(payload.byteLength, file.size)
+
+                    if (value.byteLength > P2P_CHUNK_SIZE) {
+                        let offset = P2P_CHUNK_SIZE
+                        while (offset < value.byteLength) {
+                            while (channels.some((ch) => ch.readyState === 'open' && ch.bufferedAmount > P2P_MAX_BUFFERED_BYTES)) {
+                                await new Promise((r) => setTimeout(r, P2P_BUFFER_POLL_MS))
+                            }
+                            const next = value.slice(offset, Math.min(offset + P2P_CHUNK_SIZE, value.byteLength))
+                            for (const channel of channels) {
+                                if (channel.readyState === 'open') {
+                                    channel.send(next)
+                                }
+                            }
+                            bumpTransferTelemetry(next.byteLength, file.size)
+                            offset += P2P_CHUNK_SIZE
+                        }
+                    }
                 }
-
-                for (const channel of channels) {
-                    channel.send(buffer)
-                }
-                bumpTransferTelemetry(buffer.byteLength, file.size)
+            } finally {
+                reader.releaseLock()
             }
 
             finishTransferTelemetry('done')
@@ -1730,8 +1923,29 @@ export const useConnectionStore = defineStore('connection', () => {
         const wt = new WebTransport(url, {
             serverCertificateHashes: [{ algorithm: 'sha-256', value: hashBytes.buffer }]
         })
-        await wt.ready
+        await waitWTReady(wt, url)
         return wt
+    }
+
+    async function waitWTReady(wt: any, url: string, timeoutMs = LAN_WT_READY_TIMEOUT_MS): Promise<void> {
+        let timer: number | undefined
+        try {
+            await Promise.race([
+                wt.ready,
+                new Promise((_, reject) => {
+                    timer = window.setTimeout(() => reject(new Error(`WT ready timeout (${timeoutMs}ms): ${url}`)), timeoutMs)
+                })
+            ])
+        } catch (e) {
+            try {
+                wt.close?.()
+            } catch {
+                // ignore close errors
+            }
+            throw e
+        } finally {
+            if (timer) window.clearTimeout(timer)
+        }
     }
 
     function appendBytes(
@@ -1927,8 +2141,9 @@ export const useConnectionStore = defineStore('connection', () => {
         if (!server?.httpPort) throw new Error('No LAN server')
 
         if (server.h3Port && server.certHash) {
+            let wt: any = null
             try {
-                const wt = await createLanWT(server)
+                wt = await createLanWT(server)
                 const stream = await wt.createBidirectionalStream()
                 const writer = stream.writable.getWriter()
                 const reader = stream.readable.getReader()
@@ -1939,10 +2154,15 @@ export const useConnectionStore = defineStore('connection', () => {
                 await writer.close()
 
                 const resp = await readJsonResponse(reader)
-                wt.close()
                 if (resp && resp.status === 'ok') return resp.file
             } catch (e) {
                 console.warn('LAN WT upload failed, falling back to HTTP', e)
+            } finally {
+                try {
+                    wt?.close?.()
+                } catch {
+                    // ignore close errors
+                }
             }
         } else {
             console.warn('LAN WT unavailable, falling back to HTTP upload')
@@ -1967,10 +2187,11 @@ export const useConnectionStore = defineStore('connection', () => {
         const server = getActiveLanServer()
         if (!server?.h3Port || !server?.certHash) return false
 
+        let wt: any = null
         try {
             startTransferTelemetry('lan-wt-direct', 'download', fileName, 0, 'LAN WT direct')
             setTransferRoute('lan-wt-direct')
-            const wt = await createLanWT(server)
+            wt = await createLanWT(server)
             const stream = await wt.createBidirectionalStream()
             const writer = stream.writable.getWriter()
             const reader = stream.readable.getReader()
@@ -1980,13 +2201,18 @@ export const useConnectionStore = defineStore('connection', () => {
             ))
             await writer.close()
             const ok = await saveWTDownloadToFile(reader, fileName, (bytes) => bumpTransferTelemetry(bytes))
-            wt.close()
             finishTransferTelemetry(ok ? 'done' : 'error', ok ? '' : 'WT download failed')
             return ok
         } catch (e) {
             console.error('WT download failed', e)
             finishTransferTelemetry('error', 'WT download failed')
             return false
+        } finally {
+            try {
+                wt?.close?.()
+            } catch {
+                // ignore close errors
+            }
         }
     }
 
@@ -2005,10 +2231,11 @@ export const useConnectionStore = defineStore('connection', () => {
         const targetCertHash = certHashVal || activeServer?.certHash
         if (!targetIp || !targetH3Port || !targetCertHash) return false
 
+        let wt: any = null
         try {
             startTransferTelemetry('lan-wt-relay', 'download', fileName, 0, 'LAN WT relay')
             setTransferRoute('lan-wt-relay')
-            const wt = await createLanWTByAddress(targetIp, targetH3Port, targetCertHash)
+            wt = await createLanWTByAddress(targetIp, targetH3Port, targetCertHash)
             const stream = await wt.createBidirectionalStream()
             const writer = stream.writable.getWriter()
             const reader = stream.readable.getReader()
@@ -2019,39 +2246,33 @@ export const useConnectionStore = defineStore('connection', () => {
             await writer.close()
 
             const ok = await saveWTDownloadToFile(reader, fileName, (bytes) => bumpTransferTelemetry(bytes))
-            wt.close()
             finishTransferTelemetry(ok ? 'done' : 'error', ok ? '' : 'WT relay download failed')
             return ok
         } catch (e) {
             console.error('WT relay download failed', e)
             finishTransferTelemetry('error', 'WT relay download failed')
             return false
+        } finally {
+            try {
+                wt?.close?.()
+            } catch {
+                // ignore close errors
+            }
         }
     }
 
     // Relay-first send chain for P2PFilePanel (no LAN host disk persistence).
     async function smartRelaySendFile(file: File) {
         const activeLanServer = getActiveLanServer()
+        shareP2PRelayFile(file)
         if (activeLanServer) {
-            shareP2PRelayFile(file)
             ElMessage.success('📡 已发布 LAN 中转任务，等待对方下载')
             return
         }
 
-        if (await waitForP2PReady()) {
-            await sendFileP2P(file)
-            ElMessage.success('⚡ 已通过 WebRTC P2P 发送')
-            return
-        }
-
-        if (isRelaySizeAllowed(file.size)) {
-            await shareViaVpsRelay(file)
-            ElMessage.info('已切换 VPS Relay 中转')
-            return
-        }
-
-        ElMessage.error('当前仅支持中转不落盘：请先确保 LAN 主机在线或降低文件大小')
-        throw new Error('No relay-only path available')
+        // No desktop LAN host: keep relay offer pending.
+        // Actual transfer starts only after receiver clicks download and sends p2p_relay_request.
+        ElMessage.info('📡 已发布待下载任务（无桌面端）；对方点击下载后将自动切 WebRTC/VPS')
     }
 
     // Phase 2: Smart Send (LAN WebTransport -> HTTP -> P2P -> VPS)
@@ -2146,41 +2367,30 @@ export const useConnectionStore = defineStore('connection', () => {
 
     // Send file via LAN WebTransport (HTTP/3)
     async function sendViaLanWebTransport(file: File, server: LanServerInfo): Promise<boolean> {
-        const url = `https://${server.ip}:${server.h3Port}/wt`
+        let wt: any = null
+        try {
+            wt = await createLanWT(server)
+            console.log("✅ LAN WebTransport connected")
 
-        // Decode base64 cert hash to ArrayBuffer
-        const hashBytes = decodeCertHashBase64(server.certHash!)
+            const stream = await wt.createBidirectionalStream()
+            const writer = stream.writable.getWriter()
+            const reader = stream.readable.getReader()
 
-        const wt = new WebTransport(url, {
-            serverCertificateHashes: [{
-                algorithm: 'sha-256',
-                value: hashBytes.buffer
-            }]
-        })
+            // Send command
+            const cmd = JSON.stringify({
+                action: 'upload',
+                name: file.name,
+                size: file.size
+            }) + '\n'
+            await writer.write(new TextEncoder().encode(cmd))
 
-        await wt.ready
-        console.log("✅ LAN WebTransport connected")
+            // Send file content
+            await streamFileToWriter(file, writer)
+            await writer.close()
 
-        const stream = await wt.createBidirectionalStream()
-        const writer = stream.writable.getWriter()
-        const reader = stream.readable.getReader()
-
-        // Send command
-        const cmd = JSON.stringify({
-            action: 'upload',
-            name: file.name,
-            size: file.size
-        }) + '\n'
-        await writer.write(new TextEncoder().encode(cmd))
-
-        // Send file content
-        await streamFileToWriter(file, writer)
-        await writer.close()
-
-        // Read response
-        const response = await readJsonResponse(reader)
-        if (response) {
-            if (response.status === 'ok') {
+            // Read response
+            const response = await readJsonResponse(reader)
+            if (response?.status === 'ok') {
                 // Broadcast to room
                 sendMessage({
                     type: 'lan_file_shared',
@@ -2192,13 +2402,16 @@ export const useConnectionStore = defineStore('connection', () => {
                         baseUrl: `http://${server.ip}:${server.httpPort}` // HTTP download fallback
                     }
                 })
-                wt.close()
                 return true
             }
+            return false
+        } finally {
+            try {
+                wt?.close?.()
+            } catch {
+                // ignore close errors
+            }
         }
-
-        wt.close()
-        return false
     }
 
     async function requestFile(fileId: string) {
