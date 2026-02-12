@@ -65,8 +65,46 @@ export const useConnectionStore = defineStore('connection', () => {
     const onClipboardHistory = ref<((items: any[]) => void) | null>(null)
     const onClipboardDelete = ref<((id: number | string) => void) | null>(null) // New Callback
     const onNotepadEvent = ref<((type: string, data: any) => void) | null>(null)
+    const pendingNotepadInit = ref<any[] | null>(null)
+    const pendingNotepadEvents = ref<Array<{ type: string, payload: any }>>([])
+    const MAX_PENDING_NOTEPAD_EVENTS = 100
     const onP2PEvent = ref<((type: string, data: any) => void) | null>(null)
     const onLanEvent = ref<((type: string, data: any) => void) | null>(null)
+
+    function dispatchNotepadEvent(type: string, payload: any) {
+        if (onNotepadEvent.value) {
+            onNotepadEvent.value(type, payload)
+            return
+        }
+
+        if (type === 'init') {
+            pendingNotepadInit.value = Array.isArray(payload) ? payload : []
+            pendingNotepadEvents.value = []
+            return
+        }
+
+        pendingNotepadEvents.value.push({ type, payload })
+        if (pendingNotepadEvents.value.length > MAX_PENDING_NOTEPAD_EVENTS) {
+            pendingNotepadEvents.value.shift()
+        }
+    }
+
+    function replayPendingNotepadEvents() {
+        if (!onNotepadEvent.value) return
+
+        if (pendingNotepadInit.value) {
+            onNotepadEvent.value('init', pendingNotepadInit.value)
+            pendingNotepadInit.value = null
+        }
+
+        if (pendingNotepadEvents.value.length === 0) return
+
+        const buffered = [...pendingNotepadEvents.value]
+        pendingNotepadEvents.value = []
+        for (const evt of buffered) {
+            onNotepadEvent.value(evt.type, evt.payload)
+        }
+    }
 
     // P2P State
     const localFiles = ref<Map<string, File>>(new Map())
@@ -98,6 +136,7 @@ export const useConnectionStore = defineStore('connection', () => {
     const DEFAULT_RELAY_MAX_SIZE_BYTES = 10 * 1024 * 1024
     const relayMaxSizeBytes = ref(DEFAULT_RELAY_MAX_SIZE_BYTES)
     const applyingAnswers = ref<Set<string>>(new Set())
+    const makingOffers = ref<Set<string>>(new Set())
     const forceRelayPeers = ref<Set<string>>(new Set())
     const peerRetryAttempts = ref<Map<string, number>>(new Map())
     const peerLastRetryAt = ref<Map<string, number>>(new Map())
@@ -110,6 +149,7 @@ export const useConnectionStore = defineStore('connection', () => {
     const P2P_RETRY_DEBOUNCE_MS = 1500
     const P2P_DISCONNECTED_GRACE_MS = 1200
     const LAN_WT_READY_TIMEOUT_MS = 8000
+    const WT_WRITE_BATCH_BYTES = 512 * 1024
     const TRANSFER_UI_UPDATE_INTERVAL_MS = 80
     const transferTelemetry = ref<{
         path: TransferPath
@@ -475,6 +515,7 @@ export const useConnectionStore = defineStore('connection', () => {
         incomingFilesById.value.clear()
         activeIncomingFileByPeer.value.clear()
         applyingAnswers.value.clear()
+        makingOffers.value.clear()
         forceRelayPeers.value.clear()
         peerRetryAttempts.value.clear()
         peerLastRetryAt.value.clear()
@@ -667,6 +708,10 @@ export const useConnectionStore = defineStore('connection', () => {
 
     async function startP2P(peerId: string) {
         if (peerId === selfPeerId) return
+        if (makingOffers.value.has(peerId)) {
+            console.warn(`Skip startP2P for ${peerId}: offer already in progress`)
+            return
+        }
 
         console.log(`⚡ Starting P2P Handshake -> ${peerId}`)
         const pc = setupPeerConnection(peerId)
@@ -675,22 +720,27 @@ export const useConnectionStore = defineStore('connection', () => {
             console.warn(`Skip startP2P for ${peerId}: signalingState=${pc.signalingState}`)
             return
         }
-        let dc = dataChannels.value.get(peerId)
-        if (!dc || dc.readyState === 'closed') {
-            dc = pc.createDataChannel("file-transfer", { ordered: true })
-            setupDataChannel(dc, peerId)
-        }
-
-        const offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-        sendMessage({
-            type: 'offer',
-            payload: {
-                from: selfPeerId,
-                to: peerId,
-                sdp: offer
+        makingOffers.value.add(peerId)
+        try {
+            let dc = dataChannels.value.get(peerId)
+            if (!dc || dc.readyState === 'closed') {
+                dc = pc.createDataChannel("file-transfer", { ordered: true })
+                setupDataChannel(dc, peerId)
             }
-        })
+
+            const offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+            sendMessage({
+                type: 'offer',
+                payload: {
+                    from: selfPeerId,
+                    to: peerId,
+                    sdp: offer
+                }
+            })
+        } finally {
+            makingOffers.value.delete(peerId)
+        }
     }
 
     async function flushPendingCandidates(peerId: string) {
@@ -733,7 +783,12 @@ export const useConnectionStore = defineStore('connection', () => {
             }
         }
 
-        await pc.setRemoteDescription(new RTCSessionDescription(offer))
+        try {
+            await pc.setRemoteDescription(new RTCSessionDescription(offer))
+        } catch (e) {
+            console.warn(`setRemoteDescription(offer) failed for ${fromPeerId}`, e)
+            return
+        }
         await flushPendingCandidates(fromPeerId)
 
         const answer = await pc.createAnswer()
@@ -1996,15 +2051,41 @@ export const useConnectionStore = defineStore('connection', () => {
         onChunk?: (bytes: number) => void
     ): Promise<void> {
         const reader = file.stream().getReader()
+        let bufferedChunks: Uint8Array<ArrayBuffer>[] = []
+        let bufferedBytes = 0
+
+        const flushBuffered = async () => {
+            if (bufferedBytes <= 0) return
+            let payload: Uint8Array<ArrayBuffer>
+            if (bufferedChunks.length === 1 && bufferedChunks[0]) {
+                payload = bufferedChunks[0]
+            } else {
+                payload = new Uint8Array(new ArrayBuffer(bufferedBytes))
+                let offset = 0
+                for (const part of bufferedChunks) {
+                    payload.set(part, offset)
+                    offset += part.byteLength
+                }
+            }
+            await writer.write(payload)
+            if (onChunk) onChunk(bufferedBytes)
+            bufferedChunks = []
+            bufferedBytes = 0
+        }
+
         try {
             while (true) {
                 const { value, done } = await reader.read()
                 if (done) break
                 if (!value) continue
                 const chunk = toArrayBufferBytes(value)
-                await writer.write(chunk)
-                if (onChunk) onChunk(chunk.byteLength)
+                bufferedChunks.push(chunk)
+                bufferedBytes += chunk.byteLength
+                if (bufferedBytes >= WT_WRITE_BATCH_BYTES) {
+                    await flushBuffered()
+                }
             }
+            await flushBuffered()
         } finally {
             reader.releaseLock()
         }
@@ -2020,6 +2101,28 @@ export const useConnectionStore = defineStore('connection', () => {
         let name = fallbackName
         let metaBuffer: Uint8Array<ArrayBuffer> = new Uint8Array(new ArrayBuffer(0))
         let streamSaver: any = null
+        let saverChunks: Uint8Array<ArrayBuffer>[] = []
+        let saverBytes = 0
+
+        const flushSaverChunks = async (force = false) => {
+            if (!streamSaver || saverBytes <= 0) return
+            if (!force && saverBytes < WT_WRITE_BATCH_BYTES) return
+            let payload: Uint8Array<ArrayBuffer>
+            if (saverChunks.length === 1 && saverChunks[0]) {
+                payload = saverChunks[0]
+            } else {
+                payload = new Uint8Array(new ArrayBuffer(saverBytes))
+                let offset = 0
+                for (const part of saverChunks) {
+                    payload.set(part, offset)
+                    offset += part.byteLength
+                }
+            }
+            await streamSaver.write(payload)
+            if (onChunk) onChunk(saverBytes)
+            saverChunks = []
+            saverBytes = 0
+        }
 
         while (true) {
             const { value, done } = await reader.read()
@@ -2053,11 +2156,13 @@ export const useConnectionStore = defineStore('connection', () => {
                     const rest = metaBuffer.slice(nlIdx + 1)
                     if (rest.length > 0) {
                         if (streamSaver) {
-                            await streamSaver.write(rest)
+                            saverChunks.push(rest)
+                            saverBytes += rest.byteLength
+                            await flushSaverChunks()
                         } else {
                             chunks.push(rest)
+                            if (onChunk) onChunk(rest.byteLength)
                         }
-                        if (onChunk) onChunk(rest.byteLength)
                     }
 
                     metaReceived = true
@@ -2068,11 +2173,13 @@ export const useConnectionStore = defineStore('connection', () => {
                 }
             } else {
                 if (streamSaver) {
-                    await streamSaver.write(chunk)
+                    saverChunks.push(chunk)
+                    saverBytes += chunk.byteLength
+                    await flushSaverChunks()
                 } else {
                     chunks.push(chunk)
+                    if (onChunk) onChunk(chunk.byteLength)
                 }
-                if (onChunk) onChunk(chunk.byteLength)
             }
         }
 
@@ -2082,6 +2189,7 @@ export const useConnectionStore = defineStore('connection', () => {
         }
 
         if (streamSaver) {
+            await flushSaverChunks(true)
             await streamSaver.close()
             return true
         }
@@ -2262,17 +2370,18 @@ export const useConnectionStore = defineStore('connection', () => {
     }
 
     // Relay-first send chain for P2PFilePanel (no LAN host disk persistence).
-    async function smartRelaySendFile(file: File) {
+    async function smartRelaySendFile(file: File): Promise<string> {
         const activeLanServer = getActiveLanServer()
-        shareP2PRelayFile(file)
+        const offerId = shareP2PRelayFile(file)
         if (activeLanServer) {
             ElMessage.success('📡 已发布 LAN 中转任务，等待对方下载')
-            return
+            return offerId
         }
 
         // No desktop LAN host: keep relay offer pending.
         // Actual transfer starts only after receiver clicks download and sends p2p_relay_request.
         ElMessage.info('📡 已发布待下载任务（无桌面端）；对方点击下载后将自动切 WebRTC/VPS')
+        return offerId
     }
 
     // Phase 2: Smart Send (LAN WebTransport -> HTTP -> P2P -> VPS)
@@ -2516,8 +2625,8 @@ export const useConnectionStore = defineStore('connection', () => {
                         if (msg.type === 'register_host') ElMessage.success(`主机 [${info.ip}] 上线`)
                     }
                     if (msg.type === 'init') {
-                        if (msg.payload.notes && onNotepadEvent.value) {
-                            onNotepadEvent.value('init', msg.payload.notes)
+                        if (msg.payload.notes) {
+                            dispatchNotepadEvent('init', msg.payload.notes)
                         }
                         if (msg.payload.clipboardHistory && onClipboardHistory.value) {
                             console.log('📜 Init: History received', msg.payload.clipboardHistory)
@@ -2529,13 +2638,11 @@ export const useConnectionStore = defineStore('connection', () => {
                     break
 
                 case 'notepad_update':
+                case 'notepad_ack':
+                case 'notepad_conflict':
                 case 'notepad_delete':
                     console.log(`📝 Store handling ${msg.type}`, msg.payload)
-                    if (onNotepadEvent.value) {
-                        onNotepadEvent.value(msg.type, msg.payload)
-                    } else {
-                        console.warn('⚠️ No notepad event handler registered!')
-                    }
+                    dispatchNotepadEvent(msg.type, msg.payload)
                     break
 
                 case 'clipboard_data':
@@ -2559,13 +2666,19 @@ export const useConnectionStore = defineStore('connection', () => {
                     break
 
                 case 'offer':
-                    void handleOffer(msg.payload)
+                    void handleOffer(msg.payload).catch((e) => {
+                        console.warn('handleOffer failed', e)
+                    })
                     break
                 case 'answer':
-                    void handleAnswer(msg.payload)
+                    void handleAnswer(msg.payload).catch((e) => {
+                        console.warn('handleAnswer failed', e)
+                    })
                     break
                 case 'candidate':
-                    void handleCandidate(msg.payload)
+                    void handleCandidate(msg.payload).catch((e) => {
+                        console.warn('handleCandidate failed', e)
+                    })
                     break
 
                 // --- P2P File Handling ---
@@ -2847,6 +2960,7 @@ export const useConnectionStore = defineStore('connection', () => {
         onClipboardHistory,
         onClipboardDelete, // Export new callback
         onNotepadEvent,
+        replayPendingNotepadEvents,
         onP2PEvent,
         onLanEvent, // Export
         shareFile,

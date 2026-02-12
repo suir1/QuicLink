@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"log"
 	"quiclink-server/store"
 	"strconv"
@@ -23,12 +24,25 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 			id, _ := payload["id"].(string)
 			title, _ := payload["title"].(string)
 			content, _ := payload["content"].(string)
+			baseUpdatedAt := parseInt64(payload["baseUpdatedAt"])
 
 			if id != "" {
-				// log.Printf("📝 Notepad update recv: %s", id)
-				room.UpdateNote(id, title, content)
-				// Broadcast the original message to others
-				room.Broadcast(msg, conn)
+				updated, applied := room.UpdateNote(id, title, content, baseUpdatedAt)
+				if applied {
+					_ = conn.WriteJSON(Message{
+						Type:    "notepad_ack",
+						Payload: updated,
+					})
+					room.Broadcast(Message{
+						Type:    "notepad_update",
+						Payload: updated,
+					}, conn)
+				} else {
+					_ = conn.WriteJSON(Message{
+						Type:    "notepad_conflict",
+						Payload: updated,
+					})
+				}
 			}
 		}
 
@@ -94,14 +108,18 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 		// Host 响应了剪切板内容 -> 广播给 Web
 		room.Broadcast(msg, conn)
 
-	// --- 剪切板删除 ---
+		// --- 剪切板删除 ---
 	case "clipboard_delete":
 		if payload, ok := msg.Payload.(map[string]interface{}); ok {
-			// ID is now string to avoid precision loss
-			if id, ok := payload["id"].(string); ok {
+			if id, ok := parseStringID(payload["id"]); ok {
 				room.DeleteClipboardItem(id)
-				room.Broadcast(msg, conn) // Broadcast to sync deletion
-				log.Printf("🗑️ Deleted clipboard item: %s. Remaining: %d", id, len(room.ClipboardHistory))
+				room.Broadcast(Message{
+					Type: "clipboard_delete",
+					Payload: map[string]interface{}{
+						"id": id,
+					},
+				}, nil) // Broadcast to all (including sender) as delete ACK
+				log.Printf("🗑️ Deleted clipboard item: %s", id)
 			}
 		}
 
@@ -134,6 +152,55 @@ func ProcessMessage(room *store.Room, conn store.Connection, msg Message) bool {
 	}
 
 	return true
+}
+
+func parseInt64(raw interface{}) int64 {
+	switch v := raw.(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	case json.Number:
+		i, err := v.Int64()
+		if err == nil {
+			return i
+		}
+	case string:
+		if v == "" {
+			return 0
+		}
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err == nil {
+			return i
+		}
+	}
+	return 0
+}
+
+func parseStringID(raw interface{}) (string, bool) {
+	switch v := raw.(type) {
+	case string:
+		if v == "" {
+			return "", false
+		}
+		return v, true
+	case int:
+		return strconv.FormatInt(int64(v), 10), true
+	case int64:
+		return strconv.FormatInt(v, 10), true
+	case float64:
+		return strconv.FormatInt(int64(v), 10), true
+	case json.Number:
+		i, err := v.Int64()
+		if err != nil {
+			return "", false
+		}
+		return strconv.FormatInt(i, 10), true
+	default:
+		return "", false
+	}
 }
 
 // SendInitState 发送房间初始化状态

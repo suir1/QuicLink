@@ -860,6 +860,17 @@ func (a *App) handleIncomingMessage(msgType string, payload map[string]interface
 			}
 			wailsRuntime.EventsEmit(a.ctx, "clipboard:remote", payload)
 		}
+	case "clipboard_pull":
+		content, sig := a.readClipboardSnapshot()
+		if content == "" || sig == "" {
+			log.Printf("📋 clipboard_pull: local clipboard empty")
+			return
+		}
+		a.tryMarkClipboardSeen(sig, content)
+		id := fmt.Sprintf("%d-%s", time.Now().UnixMilli(), uuid.NewString()[:8])
+		if !a.sendClipboardPush(content, id) {
+			a.setPendingClipboard(content, id)
+		}
 	case "file_offer":
 		// Forward to frontend for display
 		wailsRuntime.EventsEmit(a.ctx, "p2p:offer", payload)

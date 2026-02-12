@@ -100,8 +100,19 @@ const openLanDownload = (file: any) => {
 // --- Cloud Drive Logic ---
 const cloudFileList = ref<any[]>([])
 
-const VPS_HOST = import.meta.env.VITE_VPS_HOST || 'localhost:3100'
-const HTTP_URL = `http://${VPS_HOST}`
+function resolveCloudBaseURL(): string {
+    const savedHost = String(localStorage.getItem('custom_server_host') || '').trim()
+    const fallbackHost = String(import.meta.env.VITE_VPS_HOST || 'localhost:3100').trim()
+    const host = savedHost || fallbackHost
+    if (!host) return 'http://localhost:3100'
+    if (/^https?:\/\//i.test(host)) {
+        return host.replace(/\/+$/, '')
+    }
+    if (host.includes('localhost') || /^\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?$/.test(host)) {
+        return `http://${host}`
+    }
+    return `https://${host}`
+}
 
 const uploadCloudNative = async () => {
     const app = wailsApp()
@@ -131,12 +142,13 @@ const uploadCloudNative = async () => {
 
 const fetchCloudFiles = async () => {
     try {
-        const res = await fetch(`${HTTP_URL}/api/files`)
+        const baseUrl = resolveCloudBaseURL()
+        const res = await fetch(`${baseUrl}/api/files`)
         if (res.ok) {
             const files = await res.json()
             cloudFileList.value = files.map((f: any) => ({
                 name: f.name,
-                url: `${HTTP_URL}${f.url}`,
+                url: String(f.url || '').startsWith('http') ? String(f.url) : `${baseUrl}${f.url}`,
                 status: 'success',
                 uid: f.id,
                 size: f.size

@@ -79,6 +79,15 @@ const (
 	wtStreamReadBufferSize = 1024 * 1024
 	relayCopyBufferSize    = 1024 * 1024
 	lanMaxUploadBytes      = 10 << 30
+	lanUDPSocketBufferSize = 32 << 20
+
+	// QUIC flow-control windows tuned for LAN large-file streaming.
+	lanQUICInitialStreamReceiveWindow = 16 << 20
+	lanQUICMaxStreamReceiveWindow     = 128 << 20
+	lanQUICInitialConnReceiveWindow   = 32 << 20
+	lanQUICMaxConnReceiveWindow       = 256 << 20
+	lanQUICMaxIncomingStreams         = 4096
+	lanQUICMaxIncomingUniStreams      = 4096
 )
 
 var relayCopyBufferPool = sync.Pool{
@@ -182,8 +191,12 @@ func (s *LocalServer) Start() (*ServerInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen UDP for HTTP/3: %w", err)
 	}
-	_ = h3Conn.SetReadBuffer(8 << 20)
-	_ = h3Conn.SetWriteBuffer(8 << 20)
+	if err := h3Conn.SetReadBuffer(lanUDPSocketBufferSize); err != nil {
+		log.Printf("⚠️ Set UDP read buffer failed (%d): %v", lanUDPSocketBufferSize, err)
+	}
+	if err := h3Conn.SetWriteBuffer(lanUDPSocketBufferSize); err != nil {
+		log.Printf("⚠️ Set UDP write buffer failed (%d): %v", lanUDPSocketBufferSize, err)
+	}
 	s.h3Conn = h3Conn
 	s.h3Port = h3Conn.LocalAddr().(*net.UDPAddr).Port
 
@@ -199,12 +212,12 @@ func (s *LocalServer) Start() (*ServerInfo, error) {
 	}
 
 	quicConfig := &quic.Config{
-		InitialStreamReceiveWindow:     8 << 20,
-		MaxStreamReceiveWindow:         32 << 20,
-		InitialConnectionReceiveWindow: 16 << 20,
-		MaxConnectionReceiveWindow:     64 << 20,
-		MaxIncomingStreams:             1024,
-		MaxIncomingUniStreams:          1024,
+		InitialStreamReceiveWindow:     lanQUICInitialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         lanQUICMaxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: lanQUICInitialConnReceiveWindow,
+		MaxConnectionReceiveWindow:     lanQUICMaxConnReceiveWindow,
+		MaxIncomingStreams:             lanQUICMaxIncomingStreams,
+		MaxIncomingUniStreams:          lanQUICMaxIncomingUniStreams,
 	}
 
 	s.h3Server = &http3.Server{
@@ -234,6 +247,16 @@ func (s *LocalServer) Start() (*ServerInfo, error) {
 
 	go func() {
 		log.Printf("🚀 LAN HTTP/3 + WebTransport Server started on UDP port :%d", s.h3Port)
+		log.Printf(
+			"⚙️ QUIC tuned: udpBuf=%d streamWin=%d/%d connWin=%d/%d streams=%d/%d",
+			lanUDPSocketBufferSize,
+			lanQUICInitialStreamReceiveWindow,
+			lanQUICMaxStreamReceiveWindow,
+			lanQUICInitialConnReceiveWindow,
+			lanQUICMaxConnReceiveWindow,
+			lanQUICMaxIncomingStreams,
+			lanQUICMaxIncomingUniStreams,
+		)
 		if err := s.wtServer.Serve(s.h3Conn); err != nil && err != http.ErrServerClosed {
 			log.Printf("❌ HTTP/3 Server error: %v", err)
 		}

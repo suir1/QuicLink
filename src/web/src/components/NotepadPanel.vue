@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { Plus } from '@element-plus/icons-vue'
-import { ElMessageBox } from 'element-plus'
-import { onMounted, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 
 interface Note {
   id: string
   title: string
   content: string
+  updatedAt?: number
   version?: number
 }
 
@@ -15,9 +16,56 @@ const conn = useConnectionStore()
 const activeTab = ref('default')
 const notes = ref<Note[]>([])
 const saveStatus = ref('已同步')
+const NOTE_ACK_TIMEOUT_MS = 10_000
 
 // 防抖定时器映射 (id -> timer)
 const timers: Record<string, number> = {}
+let notepadHandler: ((type: string, payload: any) => void) | null = null
+const noteSyncState = new Map<string, { inFlight: boolean; pending: boolean; timer?: number }>()
+
+function normalizeUpdatedAt(input: unknown): number {
+  const n = Number(input)
+  return Number.isFinite(n) ? n : 0
+}
+
+function normalizeNote(payload: any): Note | null {
+  const id = String(payload?.id || '').trim()
+  if (!id) return null
+  return {
+    id,
+    title: String(payload?.title ?? ''),
+    content: String(payload?.content ?? ''),
+    updatedAt: normalizeUpdatedAt(payload?.updatedAt),
+    version: 0
+  }
+}
+
+function applyRemoteNote(payload: any) {
+  const incoming = normalizeNote(payload)
+  if (!incoming) return
+
+  const idx = notes.value.findIndex(n => n.id === incoming.id)
+  if (idx === -1) {
+    notes.value.push(incoming)
+    return
+  }
+
+  const current = notes.value[idx]
+  if (!current) return
+  const currentTs = normalizeUpdatedAt(current.updatedAt)
+  const incomingTs = normalizeUpdatedAt(incoming.updatedAt)
+
+  if (incomingTs > 0 && currentTs > 0 && incomingTs < currentTs) {
+    return
+  }
+
+  if (current.content !== incoming.content) {
+    current.content = incoming.content
+    current.version = (current.version || 0) + 1
+  }
+  if (current.title !== incoming.title) current.title = incoming.title
+  current.updatedAt = incomingTs
+}
 
 function clearNoteTimer(noteId: string) {
   if (!noteId) return
@@ -27,40 +75,85 @@ function clearNoteTimer(noteId: string) {
   }
 }
 
+function getNoteSyncState(noteId: string) {
+  const existing = noteSyncState.get(noteId)
+  if (existing) return existing
+  const created = { inFlight: false, pending: false, timer: undefined as number | undefined }
+  noteSyncState.set(noteId, created)
+  return created
+}
+
+function clearNoteSyncTimer(noteId: string) {
+  const state = noteSyncState.get(noteId)
+  if (!state?.timer) return
+  window.clearTimeout(state.timer)
+  state.timer = undefined
+}
+
+function clearNoteSyncState(noteId: string) {
+  clearNoteSyncTimer(noteId)
+  noteSyncState.delete(noteId)
+}
+
+function queueSend(note: Note) {
+  const noteId = String(note.id || '')
+  if (!noteId) return
+  const state = getNoteSyncState(noteId)
+  if (state.inFlight) {
+    state.pending = true
+    return
+  }
+  sendUpdate(note)
+}
+
+function onNoteSyncSettled(noteId: string) {
+  const state = noteSyncState.get(noteId)
+  if (!state) return
+  clearNoteSyncTimer(noteId)
+  state.inFlight = false
+  if (!state.pending) return
+  state.pending = false
+  const latest = notes.value.find(n => n.id === noteId)
+  if (!latest) return
+  queueSend(latest)
+}
+
 // 初始化
 onMounted(() => {
   // 注册事件监听
-  conn.onNotepadEvent = (type, payload) => {
+  notepadHandler = (type, payload) => {
     console.log(`📝 NotepadPanel received: ${type}`, payload)
     if (type === 'init') {
-      // payload 是 Note[] 列表
-      notes.value = payload
+      for (const [id] of noteSyncState) {
+        clearNoteSyncState(id)
+      }
+      const initNotes = Array.isArray(payload)
+        ? payload.map(normalizeNote).filter((n): n is Note => !!n)
+        : []
+      notes.value = initNotes
       // 如果当前没有选中的或者选中的不存在了，默认选第一个
       if (!notes.value.some(n => n.id === activeTab.value)) {
         const first = notes.value[0]
         if (first) activeTab.value = first.id
       }
     } else if (type === 'notepad_update') {
-      // payload: { id, title, content }
-      const idx = notes.value.findIndex(n => n.id === payload.id)
-      if (idx !== -1) {
-        // 更新现有
-        const note = notes.value[idx]
-        if (note) {
-          if (note.content !== payload.content) {
-            note.content = payload.content
-            note.version = (note.version || 0) + 1
-          }
-          if (note.title !== payload.title) note.title = payload.title
-        }
-      } else {
-        // 新增
-        notes.value.push(payload)
-      }
+      applyRemoteNote(payload)
       saveStatus.value = '收到更新'
+    } else if (type === 'notepad_ack') {
+      applyRemoteNote(payload)
+      saveStatus.value = '已同步至云端'
+      const ackId = String(payload?.id || '')
+      if (ackId) onNoteSyncSettled(ackId)
+    } else if (type === 'notepad_conflict') {
+      applyRemoteNote(payload)
+      saveStatus.value = '检测到并发修改，已回滚到远端版本'
+      ElMessage.warning('记事本发生并发编辑，已同步为最新远端版本')
+      const conflictId = String(payload?.id || '')
+      if (conflictId) onNoteSyncSettled(conflictId)
     } else if (type === 'notepad_delete') {
       // payload: { id }
       clearNoteTimer(payload.id)
+      clearNoteSyncState(String(payload?.id || ''))
       const idx = notes.value.findIndex(n => n.id === payload.id)
       if (idx !== -1) {
         notes.value.splice(idx, 1)
@@ -69,6 +162,21 @@ onMounted(() => {
         }
       }
     }
+  }
+
+  conn.onNotepadEvent = notepadHandler
+  conn.replayPendingNotepadEvents()
+})
+
+onBeforeUnmount(() => {
+  for (const key of Object.keys(timers)) {
+    clearNoteTimer(key)
+  }
+  for (const [id] of noteSyncState) {
+    clearNoteSyncState(id)
+  }
+  if (conn.onNotepadEvent === notepadHandler) {
+    conn.onNotepadEvent = null
   }
 })
 
@@ -83,31 +191,49 @@ function onContentChange(note: Note) {
     delete timers[noteId]
     const latest = notes.value.find(n => n.id === noteId)
     if (!latest) return
-    sendUpdate(latest)
+    queueSend(latest)
   }, 1000)
 }
 
 function sendUpdate(note: Note) {
+  const noteId = String(note.id || '')
+  if (!noteId) return
+  const state = getNoteSyncState(noteId)
+  state.inFlight = true
+  state.pending = false
+  clearNoteSyncTimer(noteId)
+  state.timer = window.setTimeout(() => {
+    const current = noteSyncState.get(noteId)
+    if (!current || !current.inFlight) return
+    current.inFlight = false
+    saveStatus.value = '同步超时，稍后重试'
+    if (current.pending) {
+      current.pending = false
+      const latest = notes.value.find(n => n.id === noteId)
+      if (latest) queueSend(latest)
+    }
+  }, NOTE_ACK_TIMEOUT_MS)
+  saveStatus.value = '同步中...'
   conn.sendMessage({
     type: 'notepad_update',
     payload: {
       id: note.id,
       title: note.title,
-      content: note.content
+      content: note.content,
+      baseUpdatedAt: normalizeUpdatedAt(note.updatedAt)
     }
   })
-  saveStatus.value = '已同步至云端'
 }
 
 // 添加新笔记
 function handleTabsEdit(targetName: string | undefined, action: 'remove' | 'add') {
   if (action === 'add') {
     const newId = `note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    const newNote = { id: newId, title: '新笔记', content: '' }
+    const newNote: Note = { id: newId, title: '新笔记', content: '', updatedAt: 0 }
     notes.value.push(newNote)
     activeTab.value = newId
     // 立即告诉服务器创建
-    sendUpdate(newNote)
+    queueSend(newNote)
   } else if (action === 'remove') {
     const noteId = targetName as string
     ElMessageBox.confirm('确定要删除这个笔记吗？删除后无法恢复。', '删除确认', {
@@ -116,6 +242,7 @@ function handleTabsEdit(targetName: string | undefined, action: 'remove' | 'add'
       type: 'warning'
     }).then(() => {
       clearNoteTimer(noteId)
+      clearNoteSyncState(noteId)
       // 本地先删
       const idx = notes.value.findIndex(n => n.id === noteId)
       if (idx !== -1) notes.value.splice(idx, 1)

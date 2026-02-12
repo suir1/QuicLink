@@ -31,14 +31,7 @@ const clipboardRef = ref()
 const notepadRef = ref()
 
 onMounted(async () => {
-  // 1. 注册 Store 的回调函数 -> 绑定到子组件的方法上
-  // 当 Store 收到消息时，会调用这些函数更新 UI
-  conn.onClipboardData = (text) => {
-    clipboardRef.value?.updateText(text)
-  }
-
-
-  // 2. 检查服务器模式并加入
+  // 1. 检查服务器模式并加入
   try {
     const mode = await conn.checkMode()
     if (mode === 'public') {

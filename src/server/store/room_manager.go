@@ -2,6 +2,7 @@ package store
 
 import (
 	"log"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -85,7 +86,7 @@ func GetOrCreateRoom(roomId string) *Room {
 		ID:        "default",
 		Title:     "默认笔记",
 		Content:   "",
-		UpdatedAt: time.Now().Unix(),
+		UpdatedAt: time.Now().UnixMilli(),
 	}
 	newRoom.Notes[defaultNote.ID] = defaultNote
 
@@ -142,8 +143,9 @@ func (r *Room) SetHost(conn Connection, info interface{}) {
 	log.Printf("🖥️ Host registered in room [%s]", r.ID)
 }
 
-// UpdateNote 更新或创建笔记
-func (r *Room) UpdateNote(id, title, content string) *Note {
+// UpdateNote updates/creates a note with optimistic concurrency control.
+// If baseUpdatedAt > 0 and doesn't match current note timestamp, update is rejected.
+func (r *Room) UpdateNote(id, title, content string, baseUpdatedAt int64) (Note, bool) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -153,14 +155,21 @@ func (r *Room) UpdateNote(id, title, content string) *Note {
 		r.Notes[id] = note
 	}
 
-	// 只更新非空字段 (前端可能只发局部更新，但这里简化为全量覆盖，需前端配合)
-	// 实际应用中，前端应该保证发送完整数据或我们在协议里细分
+	if exists && baseUpdatedAt > 0 && note.UpdatedAt != baseUpdatedAt {
+		return *note, false
+	}
+
+	now := time.Now().UnixMilli()
+	if now <= note.UpdatedAt {
+		now = note.UpdatedAt + 1
+	}
+
 	note.Title = title
 	note.Content = content
-	note.UpdatedAt = time.Now().Unix()
+	note.UpdatedAt = now
 
 	r.LastUpdate = time.Now()
-	return note
+	return *note, true
 }
 
 // DeleteNote 删除笔记
@@ -184,6 +193,12 @@ func (r *Room) SnapshotNotes() []*Note {
 		copied := *n
 		notes = append(notes, &copied)
 	}
+	sort.Slice(notes, func(i, j int) bool {
+		if notes[i].UpdatedAt == notes[j].UpdatedAt {
+			return notes[i].ID < notes[j].ID
+		}
+		return notes[i].UpdatedAt < notes[j].UpdatedAt
+	})
 	return notes
 }
 

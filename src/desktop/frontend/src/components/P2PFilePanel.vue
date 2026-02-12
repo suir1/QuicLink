@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Close, Document, UploadFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 
 const conn = useConnectionStore()
@@ -35,7 +35,14 @@ const fileList = ref<P2PFile[]>([])
 const dismissedOfferIds = ref<Set<string>>(new Set())
 const dismissedTempSignatures = ref<Map<string, number>>(new Map())
 const TEMP_SIGNATURE_TTL_MS = 30_000
+const sendThrottleBySignature = ref<Map<string, number>>(new Map())
+const SEND_THROTTLE_MS = 1500
 const transfer = computed(() => conn.transferTelemetry)
+let p2pHandler: ((type: string, payload: any) => void) | null = null
+
+function makeLocalTempId(): string {
+  return `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+}
 
 const transferPathLabel = computed(() => {
   const path = transfer.value?.path
@@ -102,13 +109,13 @@ function handleDrop(e: DragEvent) {
   e.preventDefault()
   const files = e.dataTransfer?.files
   if (!files || files.length === 0) return
-  processFiles(files, 'drop')
+  void processFiles(files, 'drop')
 }
 
 function handleFileSelect(e: Event) {
   const input = e.target as HTMLInputElement
   if (input.files && input.files.length > 0) {
-    processFiles(input.files, 'input')
+    void processFiles(input.files, 'input')
   }
   input.value = '' // reset
 }
@@ -117,18 +124,39 @@ async function triggerUpload() {
   if (conn.isDesktop && conn.pickNativeRelayFiles) {
     const picked = await conn.pickNativeRelayFiles()
     if (picked.length > 0) {
-      processNativeFiles(picked)
+      void processNativeFiles(picked)
       return
     }
   }
   document.getElementById('p2p-file-input')?.click()
 }
 
-function processFiles(files: FileList, source: 'drop' | 'input' = 'input') {
+function pruneSendThrottle(now = Date.now()) {
+  for (const [key, ts] of sendThrottleBySignature.value.entries()) {
+    if (now - ts > SEND_THROTTLE_MS) {
+      sendThrottleBySignature.value.delete(key)
+    }
+  }
+}
+
+function shouldThrottleSend(name: string, size: number): boolean {
+  const now = Date.now()
+  pruneSendThrottle(now)
+  const sig = fileSignature(name, size)
+  const last = sendThrottleBySignature.value.get(sig)
+  if (last && now - last < SEND_THROTTLE_MS) return true
+  sendThrottleBySignature.value.set(sig, now)
+  return false
+}
+
+async function processFiles(files: FileList, source: 'drop' | 'input' = 'input') {
   let skippedNoPath = 0
   for (let i = 0; i < files.length; i++) {
     const file = files[i]
     if (!file) continue
+    if (shouldThrottleSend(file.name, file.size)) {
+      continue
+    }
 
     const nativePath = (file as any)?.path
     if (conn.isDesktop && (!nativePath || typeof nativePath !== 'string')) {
@@ -136,17 +164,22 @@ function processFiles(files: FileList, source: 'drop' | 'input' = 'input') {
       continue
     }
 
-    conn.smartRelaySendFile(file, typeof nativePath === 'string' && nativePath ? nativePath : undefined).catch((e: any) => {
+    try {
+      const offerId = await conn.smartRelaySendFile(
+        file,
+        typeof nativePath === 'string' && nativePath ? nativePath : undefined
+      )
+      addFileToList({
+        id: offerId || makeLocalTempId(),
+        name: file.name,
+        size: file.size,
+        type: file.type,
+        fromSelf: true,
+        createdAt: Date.now()
+      })
+    } catch (e: any) {
       console.error('Relay-only send failed', e)
-    })
-    addFileToList({
-      id: 'local-' + Date.now(),
-      name: file.name,
-      size: file.size,
-      type: file.type,
-      fromSelf: true,
-      createdAt: Date.now()
-    })
+    }
   }
 
   if (conn.isDesktop && skippedNoPath > 0) {
@@ -157,24 +190,39 @@ function processFiles(files: FileList, source: 'drop' | 'input' = 'input') {
   }
 }
 
-function processNativeFiles(files: Array<{ path: string; name: string; size: number; type?: string }>) {
+async function processNativeFiles(files: Array<{ path: string; name: string; size: number; type?: string }>) {
   for (const file of files) {
-    conn.smartRelaySendNativeFile(file).catch((e: any) => {
+    if (shouldThrottleSend(file.name, file.size)) {
+      continue
+    }
+    try {
+      const offerId = await conn.smartRelaySendNativeFile(file)
+      addFileToList({
+        id: offerId || makeLocalTempId(),
+        name: file.name,
+        size: file.size,
+        type: file.type || 'application/octet-stream',
+        fromSelf: true,
+        createdAt: Date.now()
+      })
+    } catch (e: any) {
       console.error('Native relay send failed', e)
-    })
-    addFileToList({
-      id: 'local-' + Date.now(),
-      name: file.name,
-      size: file.size,
-      type: file.type || 'application/octet-stream',
-      fromSelf: true,
-      createdAt: Date.now()
-    })
+    }
   }
 }
 
 function addFileToList(file: P2PFile) {
   if (!file.createdAt) file.createdAt = Date.now()
+  const existingIndex = fileList.value.findIndex((it) => it.id === file.id)
+  if (existingIndex >= 0) {
+    const existing = fileList.value[existingIndex]
+    if (!existing) return
+    fileList.value[existingIndex] = {
+      ...existing,
+      ...file
+    }
+    return
+  }
   fileList.value.push(file)
   // 自动滚动到底部
   setTimeout(() => {
@@ -238,6 +286,7 @@ function upsertOfferFile(payload: any) {
     if (offerId && f.id === offerId) return true
     if (relayId && (f.id === relayId || f.relayId === relayId)) return true
     if (originalId && f.id === originalId) return true
+    if (payload?.lanFileId && f.lanFileId === payload.lanFileId) return true
     return false
   })
 
@@ -412,11 +461,16 @@ onMounted(() => {
   if (conn.onP2PEvent) console.warn('onP2PEvent already bound?')
 
   // 绑定 Store 事件
-  conn.onP2PEvent = (type: string, payload: any) => {
+  p2pHandler = (type: string, payload: any) => {
     if (type === 'offer') {
       upsertOfferFile(payload)
     } else if (type === 'relay_ready') {
-      const item = fileList.value.find(f => f.id === payload.originalId)
+      const originalId = String(payload?.originalId || '')
+      const lanFileId = String(payload?.lanFileId || '')
+      const item = fileList.value.find(f =>
+        (originalId && (f.id === originalId || f.originalId === originalId || f.relayId === originalId)) ||
+        (lanFileId && f.lanFileId === lanFileId)
+      )
       if (item) {
         const autoDownload = item.relayStatus === 'requesting'
         item.relayStatus = 'ready'
@@ -444,6 +498,13 @@ onMounted(() => {
         item.progress = 100
       }
     }
+  }
+  conn.onP2PEvent = p2pHandler
+})
+
+onBeforeUnmount(() => {
+  if (conn.onP2PEvent === p2pHandler) {
+    conn.onP2PEvent = null
   }
 })
 

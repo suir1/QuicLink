@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Cloudy, Delete, Download, Folder, FolderOpened, Monitor, Share, Upload, UploadFilled } from '@element-plus/icons-vue'
 import { ElMessage, type UploadProps } from 'element-plus'
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 
 const conn = useConnectionStore()
@@ -109,9 +109,15 @@ interface LanSharedFile {
     source: 'local' | 'remote'  // local=我共享的 remote=别人共享的
 }
 
+type DownloadResult = {
+    ok: boolean
+    handoff: boolean
+}
+
 const lanFileList = ref<any[]>([])                    // Files already on desktop's LAN server
 const sharedFiles = ref<Map<string, LanSharedFile>>(new Map())  // Lazy shared files
 const isLanAvailable = computed(() => !!conn.lanServerUrl)
+const LAN_UPLOAD_REQUEST_TIMEOUT_MS = 25_000
 
 const lanServerList = computed(() => Array.from(conn.lanServers.values()))
 const currentHostId = computed({
@@ -205,17 +211,22 @@ const handleLanEvent = (type: string, data: any) => {
         if (autoDownload && existing) {
             void requestDownload(existing)
         }
+        if (data?.originalId) {
+            clearLanRequestTimeout(data.originalId)
+        }
         fetchLanFiles()
     } else if (type === 'lan_consumed') {
         const originalId = data?.originalId
         if (originalId && sharedFiles.value.has(originalId)) {
             sharedFiles.value.delete(originalId)
             downloadingFiles.value.delete(originalId)
+            conn.removeSharedOffer(originalId)
         } else if (data?.lanFileId) {
             for (const [id, f] of sharedFiles.value.entries()) {
                 if (f.lanFileId === data.lanFileId) {
                     sharedFiles.value.delete(id)
                     downloadingFiles.value.delete(id)
+                    conn.removeSharedOffer(id)
                 }
             }
         }
@@ -228,6 +239,7 @@ const handleLanEvent = (type: string, data: any) => {
                 existing.lanFileId = undefined
             }
             downloadingFiles.value.delete(originalId)
+            clearLanRequestTimeout(originalId)
         }
         ElMessage.error(`中转失败: ${data?.reason || 'unknown'}`)
     } else if (type === 'lan_list') {
@@ -237,6 +249,31 @@ const handleLanEvent = (type: string, data: any) => {
 
 // --- Download logic ---
 const downloadingFiles = ref<Set<string>>(new Set())
+const lanRequestTimers = ref<Map<string, number>>(new Map())
+
+const clearLanRequestTimeout = (id: string) => {
+    const timer = lanRequestTimers.value.get(id)
+    if (timer) {
+        window.clearTimeout(timer)
+        lanRequestTimers.value.delete(id)
+    }
+}
+
+const scheduleLanRequestTimeout = (file: LanSharedFile) => {
+    clearLanRequestTimeout(file.id)
+    const timer = window.setTimeout(() => {
+        lanRequestTimers.value.delete(file.id)
+        const current = sharedFiles.value.get(file.id)
+        if (!current || current.source !== 'remote') return
+        if (current.status === 'uploading') {
+            current.status = 'pending'
+            current.lanFileId = undefined
+            downloadingFiles.value.delete(file.id)
+            ElMessage.warning(`等待超时，请重试下载: ${current.name}`)
+        }
+    }, LAN_UPLOAD_REQUEST_TIMEOUT_MS)
+    lanRequestTimers.value.set(file.id, timer)
+}
 
 // --- Robust Download (WT -> HTTP Fallback) ---
 const downloadLanFile = async (
@@ -248,7 +285,7 @@ const downloadLanFile = async (
     h3Port?: number,
     certHash?: string,
     autoTriggered = false
-): Promise<boolean> => {
+): Promise<DownloadResult> => {
     // Phase 9: Relay Download (Direct HTTP Stream)
     if (isRelay) {
         const server = conn.getActiveLanServer()
@@ -268,10 +305,10 @@ const downloadLanFile = async (
             )
             if (via) {
                 ElMessage.success(`📥 ${name} 开始下载 (${via.toUpperCase()})`)
-                return true
+                return { ok: true, handoff: true }
             }
             ElMessage.error('无法获取中转地址')
-            return false
+            return { ok: false, handoff: false }
         }
 
         try {
@@ -284,7 +321,7 @@ const downloadLanFile = async (
             )
             if (ok) {
                 ElMessage.success(`📥 ${name} 下载完成 (WT Relay)`)
-                return true
+                return { ok: true, handoff: false }
             }
         } catch (e) {
             console.warn('WT relay download failed, falling back to HTTP', e)
@@ -292,7 +329,7 @@ const downloadLanFile = async (
 
         if (autoTriggered && !conn.isSpeedDownloadMode()) {
             ElMessage.warning(`自动下载失败，请点击再次下载: ${name}`)
-            return false
+            return { ok: false, handoff: false }
         }
 
         const via = await conn.openLanDownloadURL(
@@ -305,10 +342,10 @@ const downloadLanFile = async (
         )
         if (via) {
             ElMessage.success(`📥 ${name} 开始中转下载 (${via.toUpperCase()})`)
-            return true
+            return { ok: true, handoff: true }
         } else {
             ElMessage.error('无法获取中转地址')
-            return false
+            return { ok: false, handoff: false }
         }
     }
 
@@ -328,10 +365,10 @@ const downloadLanFile = async (
         )
         if (via) {
             ElMessage.success(`📥 ${name} 开始下载 (${via.toUpperCase()})`)
-            return true
+            return { ok: true, handoff: true }
         }
         ElMessage.error('无法获取下载地址')
-        return false
+        return { ok: false, handoff: false }
     }
 
     // 1. Try WebTransport first
@@ -339,7 +376,7 @@ const downloadLanFile = async (
         const ok = await conn.downloadLanFileWT(lanFileId, name)
         if (ok) {
             ElMessage.success(`📥 ${name} 下载完成 (WT)`)
-            return true
+            return { ok: true, handoff: false }
         }
     } catch (e) {
         console.warn('WT download failed, falling back to HTTP', e)
@@ -356,10 +393,10 @@ const downloadLanFile = async (
     )
     if (via) {
         ElMessage.success(`📥 ${name} 开始下载 (${via.toUpperCase()})`)
-        return true
+        return { ok: true, handoff: true }
     } else {
         ElMessage.error('无法获取下载地址')
-        return false
+        return { ok: false, handoff: false }
     }
 }
 
@@ -367,9 +404,13 @@ const requestDownload = async (file: LanSharedFile) => {
     if (file.status === 'ready' && file.lanFileId) {
         const autoTriggered = downloadingFiles.value.has(file.id)
         downloadingFiles.value.add(file.id)
-        const ok = await downloadLanFile(file.lanFileId, file.name, file.ip, file.httpPort, file.isRelay, file.h3Port, file.certHash, autoTriggered)
-        if (ok && file.source === 'remote') {
+        const result = await downloadLanFile(file.lanFileId, file.name, file.ip, file.httpPort, file.isRelay, file.h3Port, file.certHash, autoTriggered)
+        if (result.ok && file.source === 'remote') {
+            // URL handoff has no reliable completion callback, so treat successful handoff
+            // as user-consumed intent and let lan_consumed event drive final cleanup.
             conn.notifyLanFileConsumed(file.id, file.lanFileId)
+        }
+        if (result.ok && file.source === 'remote' && !result.handoff) {
             sharedFiles.value.delete(file.id)
         }
         downloadingFiles.value.delete(file.id)
@@ -377,6 +418,7 @@ const requestDownload = async (file: LanSharedFile) => {
         downloadingFiles.value.add(file.id)
         file.status = 'uploading'
         conn.requestLanFile(file.id)
+        scheduleLanRequestTimeout(file)
         ElMessage.info(`⏳ 正在请求 ${file.name}，等待上传到主机...`)
     }
 }
@@ -431,6 +473,16 @@ onMounted(() => {
     // Listen for LAN events
     // Listen for LAN events
     conn.onLanEvent = handleLanEvent
+})
+
+onBeforeUnmount(() => {
+    for (const timer of lanRequestTimers.value.values()) {
+        window.clearTimeout(timer)
+    }
+    lanRequestTimers.value.clear()
+    if (conn.onLanEvent === handleLanEvent) {
+        conn.onLanEvent = null
+    }
 })
 
 // Shared files list (remote only)

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Close, Promotion, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { nextTick, ref } from 'vue'
+import { nextTick, onBeforeUnmount, ref } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 
 interface ClipboardItem {
@@ -12,6 +12,10 @@ interface ClipboardItem {
 
 const conn = useConnectionStore()
 const clipboardList = ref<ClipboardItem[]>([])
+const CLIPBOARD_DELETE_ACK_TIMEOUT_MS = 3000
+const CLIPBOARD_INCOMING_DEDUP_WINDOW_MS = 1500
+const pendingDeletes = new Map<string, { item: ClipboardItem; index: number; timerId: number }>()
+const recentIncoming = new Map<string, number>()
 
 function makeLocalId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -67,6 +71,39 @@ function upsertClipboardItem(item: ClipboardItem, moveToTail = true): void {
   }
 }
 
+function makeContentFingerprint(text: string): string {
+  const t = String(text || '')
+  if (!t) return 'content:empty'
+  if (t.length <= 256) return `content:${t}`
+  return `content:${t.length}:${t.slice(0, 128)}:${t.slice(-128)}`
+}
+
+function pruneRecentIncoming(now: number): void {
+  for (const [key, ts] of recentIncoming.entries()) {
+    if (now-ts > CLIPBOARD_INCOMING_DEDUP_WINDOW_MS) {
+      recentIncoming.delete(key)
+    }
+  }
+}
+
+function isDuplicateIncoming(item: ClipboardItem): boolean {
+  const now = Date.now()
+  pruneRecentIncoming(now)
+
+  const keys = [makeContentFingerprint(item.text)]
+  if (item.id) keys.push(`id:${item.id}`)
+
+  const duplicated = keys.some((key) => {
+    const ts = recentIncoming.get(key)
+    return typeof ts === 'number' && now-ts <= CLIPBOARD_INCOMING_DEDUP_WINDOW_MS
+  })
+
+  for (const key of keys) {
+    recentIncoming.set(key, now)
+  }
+  return duplicated
+}
+
 // 监听远程历史记录
 conn.onClipboardHistory = (history: any[]) => {
   const incoming = Array.isArray(history) ? history : []
@@ -85,28 +122,32 @@ conn.onClipboardHistory = (history: any[]) => {
 conn.onClipboardData = (data: any) => {
   const item = normalizeIncomingClipboard(data)
   if (!item) return
+  if (isDuplicateIncoming(item)) return
   upsertClipboardItem(item, true)
   scrollToBottom()
 }
 
-// 监听实时删除
-conn.onClipboardDelete = (id: number | string) => {
-  console.log(`🗑️ Received delete request for ID: ${id} (Type: ${typeof id})`)
-
-  // 兼容旧版 number ID
-  const index = clipboardList.value.findIndex((item, idx) => {
-      // String comparison is safest
-      const match = item.id.toString() === id.toString()
-      if (match) console.log(`✅ Found match at index ${idx}:`, item)
-      return match
-  })
-
+function removeItemById(id: string): boolean {
+  const index = clipboardList.value.findIndex(item => item.id.toString() === id)
   if (index !== -1) {
     clipboardList.value.splice(index, 1)
-    console.log(`🗑️ Synced delete success: ${id}`)
-  } else {
-    console.warn(`⚠️ Delete failed: Item ${id} not found in local list.`, clipboardList.value.map(i => i.id))
+    return true
   }
+  return false
+}
+
+function clearPendingDelete(id: string): void {
+  const pending = pendingDeletes.get(id)
+  if (!pending) return
+  clearTimeout(pending.timerId)
+  pendingDeletes.delete(id)
+}
+
+// 监听实时删除 (也作为本端删除 ACK)
+conn.onClipboardDelete = (id: number | string) => {
+  const normalizedId = String(id)
+  clearPendingDelete(normalizedId)
+  removeItemById(normalizedId)
 }
 
 const inputContent = ref('')
@@ -298,22 +339,49 @@ async function copyItem(item: ClipboardItem) {
 
 // 删除单个 Bullet
 function deleteItem(index: number, item: ClipboardItem) {
-  console.log(`🗑️ Sending delete request for Item:`, item)
+  if (!item?.id) return
+  const id = String(item.id)
+  if (pendingDeletes.has(id)) return
 
   // 乐观更新 (Local Optimistic Update)
   clipboardList.value.splice(index, 1)
 
+  const timerId = window.setTimeout(() => {
+    const pending = pendingDeletes.get(id)
+    if (!pending) return
+    pendingDeletes.delete(id)
+    const restoreIndex = Math.max(0, Math.min(pending.index, clipboardList.value.length))
+    clipboardList.value.splice(restoreIndex, 0, pending.item)
+    ElMessage.warning('删除同步超时，已恢复该条记录')
+  }, CLIPBOARD_DELETE_ACK_TIMEOUT_MS)
+  pendingDeletes.set(id, {
+    item: { ...item },
+    index,
+    timerId
+  })
+
   // Send delete request to server
   conn.sendMessage({
     type: 'clipboard_delete',
-    payload: { id: item.id }
+    payload: { id }
   })
 }
 
+onBeforeUnmount(() => {
+  for (const pending of pendingDeletes.values()) {
+    clearTimeout(pending.timerId)
+  }
+  pendingDeletes.clear()
+})
+
 // 暴露给父组件
 defineExpose({
-  updateText: (text: string) => {
-    addBullet(text, true)
+  updateText: (data: any) => {
+    const item = normalizeIncomingClipboard(data)
+    if (!item) return
+    if (isDuplicateIncoming(item)) return
+    upsertClipboardItem(item, true)
+    scrollToBottom()
   }
 })
 </script>
